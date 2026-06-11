@@ -1,0 +1,48 @@
+[project]
+name = "extended-einsum"
+version = "0.1.0"
+description = "Engine for evaluating extended einsum expressions."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jax>=0.10.1",
+    "numpy>=2.1.6",
+    "optax>=0.2.8",
+    "torch>=2.12.0",
+    "sesum>=0.4.0",
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
+]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda13]>=0.10.1", "jax-triton>=0.3.1"]
+
+[project.scripts]
+exteinsum = "extended_einsum:main"
+
+[build-system]
+requires = ["uv_build>=0.10.11,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+demo = [
+    "einsum-benchmark>=0.1.7",
+    "ipykernel>=7.2.0",
+    "libcirkit>=0.2.1",
+    "pandas>=2.3.3",
+    "tabulate>=0.10.0",
+    "torchvision>=0.27.0",
+]
+dev = ["ruff>=0.6.0"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
