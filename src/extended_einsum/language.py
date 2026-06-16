@@ -4,8 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-UnaryOperator = Literal["sin", "cos", "tan", "exp", "log", "sqrt", "1/"]
-BinaryOperator = Literal["+", "-", "*", "/", "**"]
+UnaryOperator = Literal["exp", "log"]
+BinaryOperator = Literal["+", "-", "*", "/"]
 EinsumOperator = Literal["einsum"]
 ScaledEinsumOperator = Literal["scaled_einsum_sum", "scaled_einsum_max"]
 StackOperator = Literal["stack"]
@@ -118,6 +118,10 @@ def get_format_string_einsum(instruction: Instruction) -> str:
 
 def get_output_axis_scaled_einsum(instruction: tuple[Any, ...]) -> int:
     return get_instruction_specific_arguments(instruction)[1]
+
+
+def get_axis_stack(instruction: Instruction) -> int:
+    return get_instruction_specific_arguments(instruction)[0]
 
 
 def get_axis_take(instruction: Instruction) -> int:
