@@ -1,6 +1,13 @@
-from typing import Protocol, TypeVar
+from collections.abc import Sequence
+from typing import Callable, Literal, Protocol, TypeVar
 
+import jax
+import numpy as np
 import torch
+
+from extended_einsum.language import Program
+
+Backend = Literal["torch", "numpy", "jax"]
 
 
 class Array(Protocol):
@@ -11,7 +18,7 @@ class Array(Protocol):
 TArray = TypeVar("TArray", bound=Array)
 
 
-class BackendTranslation(Protocol[TArray]):
+class BackendFunctions(Protocol[TArray]):
     @staticmethod
     def exp(array: TArray) -> TArray: ...
 
@@ -38,3 +45,21 @@ class BackendTranslation(Protocol[TArray]):
 
     @staticmethod
     def einsum(format_string: str, *operands: TArray) -> TArray: ...
+
+
+class BackendCompiler(Protocol[TArray]):
+    @staticmethod
+    def compile(
+        program: Program, arguments: Sequence[TArray]
+    ) -> Callable[[Sequence[TArray]], TArray]: ...
+
+
+def get_backend_of_array(array: Array) -> Backend:
+    if isinstance(array, torch.Tensor):
+        return "torch"
+    elif isinstance(array, np.ndarray):
+        return "numpy"
+    elif isinstance(array, jax.Array):
+        return "jax"
+    else:
+        raise ValueError(f"Unsupported array type: {type(array)}")

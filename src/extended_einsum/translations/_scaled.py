@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from extended_einsum.backend import BackendTranslation
+from extended_einsum.backend import BackendFunctions
 from extended_einsum.language import (
     SCALED_EINSUM_MAX_OPERATOR,
     SCALED_EINSUM_SUM_OPERATOR,
@@ -13,7 +13,7 @@ from extended_einsum.scale import ScaledTensor, normalize_axis
 from extended_einsum.utils import parse_format_string
 
 
-def stack_values(values: Sequence[Any], ops: BackendTranslation) -> Any:
+def stack_values(values: Sequence[Any], ops: BackendFunctions) -> Any:
     if not values:
         raise ValueError("cannot stack an empty input list")
     scaled_flags = [isinstance(value, ScaledTensor) for value in values]
@@ -33,7 +33,7 @@ def stack_values(values: Sequence[Any], ops: BackendTranslation) -> Any:
     )
 
 
-def take_value(source: Any, index: Any, axis: int, ops: BackendOps) -> Any:
+def take_value(source: Any, index: Any, axis: int, ops: BackendFunctions) -> Any:
     if not isinstance(source, ScaledTensor):
         return ops.take(source, index, axis)
     take_axis = normalize_axis(axis, len(source.shape))
