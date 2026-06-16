@@ -93,33 +93,10 @@ class TensorExpression(Generic[TArray]):
     ) -> TensorExpression[TArray]:
         return TensorExpression("/", [self, other])
 
-    def __pow__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
-        return TensorExpression("**", [self, other])
-
     def __matmul__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
         return einsum("ik, kj -> ij", self, other)
-
-
-def sin(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
-    return TensorExpression("sin", [a])
-
-
-def cos(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
-    return TensorExpression("cos", [a])
-
-
-def tan(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
-    return TensorExpression("tan", [a])
 
 
 def exp(
@@ -132,12 +109,6 @@ def log(
     a: TensorExpression[TArray] | TArray,
 ) -> TensorExpression[TArray]:
     return TensorExpression("log", [a])
-
-
-def sqrt(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
-    return TensorExpression("sqrt", [a])
 
 
 def einsum(

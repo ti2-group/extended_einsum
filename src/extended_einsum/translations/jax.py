@@ -1,28 +1,13 @@
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Any, cast, override
+from typing import Any, override
 
 import jax
 import jax.numpy as jnp
 
 from extended_einsum.backend import BackendCompiler, BackendFunctions
-from extended_einsum.language import (
-    EINSUM_OPERATOR,
-    SCALED_EINSUM_OPERATORS,
-    SLICE_OPERATOR,
-    SOFTMAX_OPERATOR,
-    STACK_OPERATOR,
-    TAKE_OPERATOR,
-    BinaryOperator,
-    Program,
-    UnaryOperator,
-    get_arguments,
-    get_operator,
-    slice_axis,
-    slice_start,
-    slice_stop,
-    softmax_axis,
-)
+from extended_einsum.language import Program
+from extended_einsum.runtime import run_program
 from extended_einsum.scale import ScaledTensor
 from extended_einsum.utils import normalize_axis
 
@@ -31,25 +16,6 @@ jax.tree_util.register_dataclass(
     data_fields=["value", "log_scale"],
     meta_fields=["scale_axis"],
 )
-
-UNARY_OPERATOR_TO_JAX: dict[UnaryOperator, Callable[[jax.Array], jax.Array]] = {
-    "sin": jnp.sin,
-    "cos": jnp.cos,
-    "tan": jnp.tan,
-    "exp": jnp.exp,
-    "log": jnp.log,
-    "sqrt": jnp.sqrt,
-}
-
-BINARY_OPERATOR_TO_JAX: dict[
-    BinaryOperator, Callable[[jax.Array, jax.Array], jax.Array]
-] = {
-    "+": jnp.add,
-    "-": jnp.subtract,
-    "*": jnp.multiply,
-    "/": jnp.divide,
-    "**": jnp.pow,
-}
 
 
 class JaxTranslation(BackendFunctions[jax.Array]):
@@ -75,8 +41,8 @@ class JaxTranslation(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def stack(arrays: list[jax.Array], axis: int = 0) -> jax.Array:
-        return jnp.stack(list(arrays), axis=axis)
+    def stack(arrays: Sequence[jax.Array], axis: int = 0) -> jax.Array:
+        return jnp.stack(arrays, axis=axis)
 
     @override
     @staticmethod
@@ -100,6 +66,26 @@ class JaxTranslation(BackendFunctions[jax.Array]):
     @staticmethod
     def einsum(format_string: str, *operands: jax.Array) -> jax.Array:
         return jnp.einsum(format_string, *operands)
+
+    @override
+    @staticmethod
+    def add(summand_array_1: jax.Array, summand_array_2: jax.Array) -> jax.Array:
+        return summand_array_1 + summand_array_2
+
+    @override
+    @staticmethod
+    def subtract(minuend_array: jax.Array, subtrahend_array: jax.Array) -> jax.Array:
+        return minuend_array - subtrahend_array
+
+    @override
+    @staticmethod
+    def multiply(factor_array_1: jax.Array, factor_array_2: jax.Array) -> jax.Array:
+        return factor_array_1 * factor_array_2
+
+    @override
+    @staticmethod
+    def divide(dividend_array: jax.Array, divisor_array: jax.Array) -> jax.Array:
+        return dividend_array / divisor_array
 
 
 class JaxScaledTranslation(BackendFunctions[ScaledTensor[jax.Array]]):
@@ -130,7 +116,7 @@ class JaxScaledTranslation(BackendFunctions[ScaledTensor[jax.Array]]):
     @override
     @staticmethod
     def stack(
-        arrays: list[ScaledTensor[jax.Array]], axis: int = 0
+        arrays: Sequence[ScaledTensor[jax.Array]], axis: int = 0
     ) -> ScaledTensor[jax.Array]:
         raise NotImplementedError()
 
@@ -162,80 +148,35 @@ class JaxScaledTranslation(BackendFunctions[ScaledTensor[jax.Array]]):
     ) -> ScaledTensor[jax.Array]:
         raise NotImplementedError()
 
+    @override
+    @staticmethod
+    def add(
+        summand_array_1: ScaledTensor[jax.Array],
+        summand_array_2: ScaledTensor[jax.Array],
+    ) -> ScaledTensor[jax.Array]:
+        raise NotImplementedError()
 
-def execute_program_jax(program: Program, inputs: Sequence[Any]) -> Any:
-    tensors: list[Any] = list(inputs)
-    for instruction in program.instructions:
-        operator = get_operator(instruction)
-        arguments = get_arguments(instruction)
-        if operator == STACK_OPERATOR:
-            result = stack_values(
-                [tensors[argument] for argument in arguments], JAX_OPS
-            )
-        elif operator == TAKE_OPERATOR:
-            result = take_value(
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                take_axis(instruction),
-                JAX_OPS,
-            )
-        elif operator == SLICE_OPERATOR:
-            result = slice_value(
-                tensors[arguments[0]],
-                slice_axis(instruction),
-                slice_start(instruction),
-                slice_stop(instruction),
-                JAX_OPS,
-            )
-        elif operator == SOFTMAX_OPERATOR:
-            result = softmax_value(
-                tensors[arguments[0]],
-                softmax_axis(instruction),
-                JAX_OPS,
-            )
-        elif operator in UNARY_OPERATOR_TO_JAX:
-            result = unary_value(
-                operator,
-                tensors[arguments[0]],
-                UNARY_OPERATOR_TO_JAX[cast(UnaryOperator, operator)],
-                JAX_OPS,
-            )
-        elif operator in BINARY_OPERATOR_TO_JAX:
-            result = binary_value(
-                operator,
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                BINARY_OPERATOR_TO_JAX[cast(BinaryOperator, operator)],
-            )
-        elif operator == EINSUM_OPERATOR:
-            result = normal_einsum(
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                JAX_OPS,
-            )
-        elif operator in SCALED_EINSUM_OPERATORS:
-            result = scaled_einsum(
-                cast(Any, operator),
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                scaled_einsum_output_axis(instruction),
-                JAX_OPS,
-            )
-        else:
-            raise ValueError(f"unsupported instruction operator: {operator!r}")
-        tensors.append(result)
-    return tensors[-1]
+    @override
+    @staticmethod
+    def subtract(
+        minuend_array: ScaledTensor[jax.Array],
+        subtrahend_array: ScaledTensor[jax.Array],
+    ) -> ScaledTensor[jax.Array]:
+        raise NotImplementedError()
 
+    @override
+    @staticmethod
+    def multiply(
+        factor_array_1: ScaledTensor[jax.Array], factor_array_2: ScaledTensor[jax.Array]
+    ) -> ScaledTensor[jax.Array]:
+        raise NotImplementedError()
 
-def compile_program_jax(
-    program: Program,
-    argument_signatures: Sequence[jax.ShapeDtypeStruct | ScaledTensor[Any]]
-    | None = None,
-) -> Callable[[Sequence[Any]], Any]:
-    jit_prepared = jax.jit(partial(execute_program_jax, program))
-    if argument_signatures is None:
-        return jit_prepared
-    return jit_prepared.trace(argument_signatures).lower().compile()
+    @override
+    @staticmethod
+    def divide(
+        dividend_array: ScaledTensor[jax.Array], divisor_array: ScaledTensor[jax.Array]
+    ) -> ScaledTensor[jax.Array]:
+        raise NotImplementedError()
 
 
 def extract_signature(array: jax.Array | ScaledTensor[jax.Array]) -> Any:
@@ -248,11 +189,6 @@ def extract_signature(array: jax.Array | ScaledTensor[jax.Array]) -> Any:
     return jax.ShapeDtypeStruct(array.shape, array.dtype)
 
 
-def execute_program_sliced_jax(
-    program: Program, inputs: Sequence[jax.Array], sliced_indices: list[str]
-) -> jax.Array: ...
-
-
 class JaxCompiler(BackendCompiler[jax.Array]):
     @override
     @staticmethod
@@ -260,4 +196,7 @@ class JaxCompiler(BackendCompiler[jax.Array]):
         program: Program, arguments: Sequence[jax.Array]
     ) -> Callable[[Sequence[jax.Array]], jax.Array]:
         argument_signatures = [extract_signature(argument) for argument in arguments]
-        return compile_program_jax(program, argument_signatures)
+        jit_prepared = jax.jit(
+            partial(run_program, program, backend_functions=JaxTranslation())
+        )
+        return jit_prepared.trace(argument_signatures).lower().compile()
