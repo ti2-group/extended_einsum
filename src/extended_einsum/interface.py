@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Generic
 
-from extended_einsum.backend import TArray
+from extended_einsum.backend import BackendCompiler, TArray, get_backend_of_array
 from extended_einsum.language import (
     EINSUM_OPERATOR,
     SCALED_EINSUM_MAX_OPERATOR,
@@ -22,6 +22,7 @@ from extended_einsum.language import (
     map_instruction_arguments,
 )
 from extended_einsum.scale import ScaledTensor
+from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 from extended_einsum.utils import normalize_axis, parse_format_string, propagate_shapes
 
 
@@ -52,10 +53,25 @@ class TensorExpression(Generic[TArray]):
             slice_start=slice_start,
             slice_stop=slice_stop,
         )
+        # check that the backends are consistent
+        if len(arguments) == 0:
+            raise ValueError("Tensor expression must have at least one argument.")
+        self.backend = get_backend_of_argument(arguments[0])
+        for argument in arguments[1:]:
+            if get_backend_of_argument(argument) != self.backend:
+                raise ValueError(
+                    f"Tensor expression has arguments with different backends: {self.backend} and {get_backend_of_argument(argument)}."
+                )
 
     @property
     def shape(self) -> tuple[int, ...]:
         return self._shape
+
+    def materialize(self) -> TArray:
+        program, arguments = compile(self)
+        compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
+        backend_code = compiler.compile(program, arguments)
+        return backend_code(arguments)
 
     def __add__(
         self, other: TensorExpression[TArray] | TArray
@@ -236,6 +252,16 @@ def actual_value(value: Any) -> Any:
     import numpy as np
 
     return value.value * np.exp(value.log_scale)
+
+
+def get_backend_of_argument(
+    argument: TensorExpression[TArray] | ScaledTensor[TArray] | TArray,
+) -> str:
+    if isinstance(argument, TensorExpression):
+        return argument.backend
+    if isinstance(argument, ScaledTensor):
+        return get_backend_of_array(argument.value)
+    return get_backend_of_array(argument)
 
 
 def _compile_recursive(

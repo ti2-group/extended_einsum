@@ -5,7 +5,7 @@ from typing import Any, cast, override
 import jax
 import jax.numpy as jnp
 
-from extended_einsum.backend import BackendTranslation
+from extended_einsum.backend import BackendCompiler, BackendFunctions
 from extended_einsum.language import (
     EINSUM_OPERATOR,
     SCALED_EINSUM_OPERATORS,
@@ -16,23 +16,14 @@ from extended_einsum.language import (
     BinaryOperator,
     Program,
     UnaryOperator,
+    get_arguments,
+    get_operator,
     slice_axis,
     slice_start,
     slice_stop,
     softmax_axis,
 )
 from extended_einsum.scale import ScaledTensor
-
-# from extended_einsum.translations._scaled import (
-#     binary_value,
-#     normal_einsum,
-#     scaled_einsum,
-#     slice_value,
-#     softmax_value,
-#     stack_values,
-#     take_value,
-#     unary_value,
-# )
 from extended_einsum.utils import normalize_axis
 
 jax.tree_util.register_dataclass(
@@ -61,7 +52,7 @@ BINARY_OPERATOR_TO_JAX: dict[
 }
 
 
-class JaxTranslation(BackendTranslation[jax.Array]):
+class JaxTranslation(BackendFunctions[jax.Array]):
     @override
     @staticmethod
     def exp(array: jax.Array) -> jax.Array:
@@ -111,7 +102,7 @@ class JaxTranslation(BackendTranslation[jax.Array]):
         return jnp.einsum(format_string, *operands)
 
 
-class JaxScaledTranslation(BackendTranslation[ScaledTensor[jax.Array]]):
+class JaxScaledTranslation(BackendFunctions[ScaledTensor[jax.Array]]):
     @override
     @staticmethod
     def exp(array: ScaledTensor[jax.Array]) -> ScaledTensor[jax.Array]:
@@ -175,8 +166,8 @@ class JaxScaledTranslation(BackendTranslation[ScaledTensor[jax.Array]]):
 def execute_program_jax(program: Program, inputs: Sequence[Any]) -> Any:
     tensors: list[Any] = list(inputs)
     for instruction in program.instructions:
-        operator = instruction_operator(instruction)
-        arguments = instruction_arguments(instruction)
+        operator = get_operator(instruction)
+        arguments = get_arguments(instruction)
         if operator == STACK_OPERATOR:
             result = stack_values(
                 [tensors[argument] for argument in arguments], JAX_OPS
@@ -260,3 +251,13 @@ def extract_signature(array: jax.Array | ScaledTensor[jax.Array]) -> Any:
 def execute_program_sliced_jax(
     program: Program, inputs: Sequence[jax.Array], sliced_indices: list[str]
 ) -> jax.Array: ...
+
+
+class JaxCompiler(BackendCompiler[jax.Array]):
+    @override
+    @staticmethod
+    def compile(
+        program: Program, arguments: Sequence[jax.Array]
+    ) -> Callable[[Sequence[jax.Array]], jax.Array]:
+        argument_signatures = [extract_signature(argument) for argument in arguments]
+        return compile_program_jax(program, argument_signatures)

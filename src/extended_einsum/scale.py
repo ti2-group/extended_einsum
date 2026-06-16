@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Generic
 
-from extended_einsum.backend import BackendTranslation, TArray
+from extended_einsum.backend import BackendFunctions, TArray
 from extended_einsum.utils import normalize_axis
 
 
@@ -22,5 +22,5 @@ class ScaledTensor(Generic[TArray]):
     def shape(self) -> tuple[int, ...]:
         return self.value.shape
 
-    def actual_value(self, translation: BackendTranslation) -> TArray:
+    def actual_value(self, translation: BackendFunctions) -> TArray:
         return self.value * translation.exp(self.log_scale)
