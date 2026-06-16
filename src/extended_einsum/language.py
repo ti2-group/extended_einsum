@@ -7,18 +7,12 @@ from typing import Any, Literal
 UnaryOperator = Literal["exp", "log"]
 BinaryOperator = Literal["+", "-", "*", "/"]
 EinsumOperator = Literal["einsum"]
-ScaledEinsumOperator = Literal["scaled_einsum_sum", "scaled_einsum_max"]
 StackOperator = Literal["stack"]
 TakeOperator = Literal["take"]
 SliceOperator = Literal["slice"]
 SoftmaxOperator = Literal["softmax"]
 
 EINSUM_OPERATOR: EinsumOperator = "einsum"
-SCALED_EINSUM_SUM_OPERATOR: ScaledEinsumOperator = "scaled_einsum_sum"
-SCALED_EINSUM_MAX_OPERATOR: ScaledEinsumOperator = "scaled_einsum_max"
-SCALED_EINSUM_OPERATORS: frozenset[ScaledEinsumOperator] = frozenset(
-    (SCALED_EINSUM_SUM_OPERATOR, SCALED_EINSUM_MAX_OPERATOR)
-)
 STACK_OPERATOR: StackOperator = "stack"
 TAKE_OPERATOR: TakeOperator = "take"
 SLICE_OPERATOR: SliceOperator = "slice"
@@ -32,7 +26,6 @@ Operator = (
     | SliceOperator
     | SoftmaxOperator
     | EinsumOperator
-    | ScaledEinsumOperator
 )
 
 # operator, operand_ids, instruction specific arguments
@@ -64,16 +57,6 @@ def make_einsum_instruction(
     return (EINSUM_OPERATOR, tuple(argument_ids), (format_string,))
 
 
-def make_scaled_einsum_instruction(
-    operator: ScaledEinsumOperator,
-    format_string: str,
-    lhs_id: int,
-    rhs_id: int,
-    output_scale_axis: int,
-) -> Instruction:
-    return (operator, (lhs_id, rhs_id), (format_string, output_scale_axis))
-
-
 def get_operator(instruction: Instruction) -> Operator:
     return instruction[0]
 
@@ -95,20 +78,6 @@ def map_instruction_arguments(
         operator,
         tuple(mapper(argument) for argument in arguments),
         instruction_specific_arguments,
-    )
-
-
-def is_normal_einsum_instruction(instruction: tuple[Any, ...]) -> bool:
-    return get_operator(instruction) == EINSUM_OPERATOR
-
-
-def is_scaled_einsum_instruction(instruction: tuple[Any, ...]) -> bool:
-    return get_operator(instruction) in SCALED_EINSUM_OPERATORS
-
-
-def is_einsum_instruction(instruction: tuple[Any, ...]) -> bool:
-    return is_normal_einsum_instruction(instruction) or is_scaled_einsum_instruction(
-        instruction
     )
 
 
@@ -144,10 +113,17 @@ def softmax_axis(instruction: tuple[Any, ...]) -> int:
     return get_instruction_specific_arguments(instruction)[0]
 
 
-@dataclass
+@dataclass(frozen=True)
 class Program:
     instructions: list[Instruction]
     n_inputs: int
+    # ssa_id_to_tensor_format: list[TensorFormat]
+
+    # def __post_init__(self):
+    #     if len(self.ssa_id_to_tensor_format) != len(self.instructions) + self.n_inputs:
+    #         raise ValueError(
+    #             f"Number of tensor formats ({len(self.ssa_id_to_tensor_format)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
+    #         )
 
     @property
     def output_ssa(self) -> int:

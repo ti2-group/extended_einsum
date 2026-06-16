@@ -1,0 +1,9 @@
+from .functions import einsum as einsum
+from .functions import exp as exp
+from .functions import log as log
+from .functions import slice as slice
+from .functions import softmax as softmax
+from .functions import stack as stack
+from .functions import take as take
+from .tensor_expression import TensorExpression as TensorExpression
+from .tensor_expression import compile as compile
