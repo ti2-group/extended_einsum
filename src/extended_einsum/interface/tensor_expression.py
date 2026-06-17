@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Generic
 
-from extended_einsum.backend import BackendCompiler, TArray, get_backend_of_array
+from extended_einsum.backend import BackendCompiler, TBackendArray, get_backend_of_array
 from extended_einsum.interface.operator import (
     InterfaceBinaryOperator,
     InterfaceEinsumOperator,
@@ -38,11 +38,12 @@ from extended_einsum.shapes import (
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 
 
-class TensorExpression(Generic[TArray]):
+class TensorExpression(Generic[TBackendArray]):
+    # TODO: make TBackendArray or TArray possible
     def __init__(
         self,
         interface_operator: InterfaceOperator,
-        arguments: list[TensorExpression[TArray] | TArray],
+        arguments: list[TensorExpression[TBackendArray] | TBackendArray],
         keyword_arguments: InterfaceOperator | None = None,
     ) -> None:
         self.interface_operator = interface_operator
@@ -66,40 +67,42 @@ class TensorExpression(Generic[TArray]):
     def shape(self) -> tuple[int, ...]:
         return self._shape
 
-    def materialize(self) -> TArray:
+    def materialize(self) -> TBackendArray:
         program, arguments = compile(self)
-        compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
+        compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[self.backend]
         backend_code = compiler.compile(program, arguments)
         return backend_code(arguments)
 
     def __add__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+        self, other: TensorExpression[TBackendArray] | TBackendArray
+    ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("+"), [self, other])
 
     def __sub__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+        self, other: TensorExpression[TBackendArray] | TBackendArray
+    ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("-"), [self, other])
 
     def __mul__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+        self, other: TensorExpression[TBackendArray] | TBackendArray
+    ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("*"), [self, other])
 
     def __truediv__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+        self, other: TensorExpression[TBackendArray] | TBackendArray
+    ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("/"), [self, other])
 
     def __matmul__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+        self, other: TensorExpression[TBackendArray] | TBackendArray
+    ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceEinsumOperator("ik, kj -> ij"), [self, other])
 
 
 def get_backend_of_argument(
-    argument: TensorExpression[TArray] | ScaledTensor[TArray] | TArray,
+    argument: TensorExpression[TBackendArray]
+    | ScaledTensor[TBackendArray]
+    | TBackendArray,
 ) -> str:
     if isinstance(argument, TensorExpression):
         return argument.backend
@@ -109,7 +112,7 @@ def get_backend_of_argument(
 
 
 def _compile_recursive(
-    tensor_expression: TensorExpression[TArray] | TArray,
+    tensor_expression: TensorExpression[TBackendArray] | TBackendArray,
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[Instruction],
@@ -181,7 +184,7 @@ def _compile_recursive(
 
 
 def compile(
-    tensor_expression: TensorExpression[TArray],
+    tensor_expression: TensorExpression[TBackendArray],
 ) -> tuple[Program, list[Any]]:
     """Compiles a tensor expression into a program and a list of arguments."""
 

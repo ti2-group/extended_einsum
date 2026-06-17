@@ -130,13 +130,6 @@ def get_softmax_axis(instruction: tuple[Any, ...]) -> int:
 class Program:
     instructions: list[Instruction]
     n_inputs: int
-    # ssa_id_to_tensor_format: list[TensorFormat]
-
-    # def __post_init__(self):
-    #     if len(self.ssa_id_to_tensor_format) != len(self.instructions) + self.n_inputs:
-    #         raise ValueError(
-    #             f"Number of tensor formats ({len(self.ssa_id_to_tensor_format)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-    #         )
 
     @property
     def output_ssa(self) -> int:
