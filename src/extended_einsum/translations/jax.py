@@ -5,7 +5,7 @@ from typing import Any, override
 import jax
 import jax.numpy as jnp
 
-from extended_einsum.backend import BackendCompiler, BackendFunctions
+from extended_einsum.backend import BackendFunctions
 from extended_einsum.language import Program
 from extended_einsum.runtime import run_program
 from extended_einsum.scale import ScaledTensor

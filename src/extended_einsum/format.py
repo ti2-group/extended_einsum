@@ -1,3 +1,19 @@
-from typing import Literal
+from dataclasses import dataclass
 
-TensorFormat = Literal["dense", "dense_logspace", "dense_scaled", "sparse"]
+
+@dataclass(frozen=True)
+class DenseFormat:
+    pass
+
+
+@dataclass(frozen=True)
+class DenseLogspaceFormat:
+    pass
+
+
+@dataclass(frozen=True)
+class DenseScaledFormat:
+    axis: int
+
+
+TensorFormat = DenseFormat | DenseLogspaceFormat | DenseScaledFormat

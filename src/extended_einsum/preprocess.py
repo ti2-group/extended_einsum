@@ -8,6 +8,18 @@ from typing import Any
 
 import numpy as np
 
+from extended_einsum.backend import (
+    BackendFunctions,
+    MultiFormatBackendFunctions,
+    SingleFormatBackendFunctions,
+    TBackendArray,
+)
+from extended_einsum.format import (
+    DenseFormat,
+    DenseLogspaceFormat,
+    DenseScaledFormat,
+    TensorFormat,
+)
 from extended_einsum.language import (
     BINARY_OPERATORS,
     EINSUM_OPERATOR,
@@ -50,6 +62,67 @@ _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _MAX_REPLAN_PATH_ATTEMPTS = 3
 
 AxisVar = tuple[str, int, int]
+
+
+def choose_single_format_backend_functions(
+    argument_tensor_format: TensorFormat,
+    backend_functions: BackendFunctions[TBackendArray],
+) -> SingleFormatBackendFunctions:
+    match argument_tensor_format:
+        case DenseFormat():
+            return backend_functions.unary_dense_only
+        case DenseLogspaceFormat():
+            return backend_functions.unary_logspace_only
+        case DenseScaledFormat():
+            return backend_functions.unary_scaled_only
+        case _:
+            raise NotImplementedError()
+
+
+def choose_multi_format_backend_functions(
+    tensor_format_1: TensorFormat,
+    tensor_format_2: TensorFormat,
+    backend_functions: BackendFunctions[TBackendArray],
+) -> MultiFormatBackendFunctions:
+    match (tensor_format_1, tensor_format_2):
+        case (DenseFormat(), DenseFormat()):
+            return backend_functions.binary_dense_only
+        case (DenseLogspaceFormat(), DenseLogspaceFormat()):
+            return backend_functions.binary_logspace_only
+        case (DenseScaledFormat(), DenseScaledFormat()):
+            return backend_functions.binary_scaled_only
+        case (DenseFormat(), DenseScaledFormat()):
+            return backend_functions.binary_dense_scaled
+        case (DenseScaledFormat(), DenseFormat()):
+            return backend_functions.binary_scaled_dense
+        case (DenseLogspaceFormat(), DenseFormat()):
+            return backend_functions.binary_logspace_dense
+        case (DenseFormat(), DenseLogspaceFormat()):
+            return backend_functions.binary_dense_logspace
+        case _:
+            raise NotImplementedError()
+
+
+@dataclass(frozen=True)
+class RichProgram(Program):
+    instructions: list[Instruction]
+    n_inputs: int
+
+    shapes: list[Shape]
+    tensor_formats: list[TensorFormat]
+    parameter_indices: list[int]
+
+    def __post_init__(self) -> None:
+        n_ssa_ids = self.n_inputs + len(self.instructions)
+
+        if len(self.shapes) != n_ssa_ids:
+            raise ValueError(
+                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
+            )
+        if len(self.tensor_formats) != n_ssa_ids:
+            raise ValueError(
+                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
+            )
 
 
 class PreparedInputs(tuple[Any, ...]):
@@ -211,14 +284,14 @@ class _TakeRef:
 _TensorValueRef = _TensorRef | _SliceRef | _SliceRangeRef | _TakeRef
 
 
-class _UnionFind:
+class _UnionFind[T]:
     def __init__(self) -> None:
-        self._parents: dict[AxisVar, AxisVar] = {}
+        self._parents: dict[T, T] = {}
 
-    def add(self, item: AxisVar) -> None:
+    def add(self, item: T) -> None:
         self._parents.setdefault(item, item)
 
-    def find(self, item: AxisVar) -> AxisVar:
+    def find(self, item: T) -> T:
         self.add(item)
         parent = self._parents[item]
         if parent != item:
@@ -226,7 +299,7 @@ class _UnionFind:
             self._parents[item] = parent
         return parent
 
-    def union(self, first: AxisVar, second: AxisVar) -> None:
+    def union(self, first: T, second: T) -> None:
         first_root = self.find(first)
         second_root = self.find(second)
         if first_root != second_root:
@@ -245,25 +318,11 @@ def preprocess_einsum_path(
     optimize_stacking: bool = True,
     dynamic_input_ids: Sequence[int] = (),
     return_dynamic_input_transforms: bool = False,
-) -> PreprocessedProgram | PreprocessedProgramWithDynamicInputTransforms:
+) -> RichProgram:
     """Lower an einsum path and return a rewritten program plus prepared inputs."""
     input_tuple = tuple(inputs)
     input_shapes = _input_shapes(input_tuple)
     parsed = _parse_einsum(expression)
-    if parsed is None:
-        program = Program(
-            instructions=[
-                make_einsum_instruction(expression, *range(len(input_shapes)))
-            ],
-            n_inputs=len(input_shapes),
-        )
-        if return_dynamic_input_transforms:
-            return PreprocessedProgramWithDynamicInputTransforms(
-                program,
-                PreparedInputs(input_tuple),
-                (),
-            )
-        return program, PreparedInputs(input_tuple)
 
     if path is None:
         from sesum import sr
@@ -322,7 +381,7 @@ def fold_independent_einsums(
     optimize_stacking: bool = True,
     dynamic_input_ids: Sequence[int] = (),
     return_dynamic_input_transforms: bool = False,
-) -> PreprocessedProgram | PreprocessedProgramWithDynamicInputTransforms:
+) -> RichProgram:
     """Fold independent einsums and return a rewritten program plus prepared inputs."""
     input_tuple = tuple(inputs)
     if program.n_inputs != len(input_tuple):
@@ -1180,7 +1239,7 @@ def _prepare_program_inputs(
     hoist_static_stacks: bool,
     dynamic_input_ids: Sequence[int],
     extract_dynamic_input_transforms: bool,
-) -> PreprocessedProgram | PreprocessedProgramWithDynamicInputTransforms:
+) -> RichProgram:
     if program.n_inputs != len(original_inputs) + len(index_inputs):
         raise ValueError("program input count does not match prepared inputs")
 
@@ -1305,10 +1364,9 @@ def _prepare_program_inputs(
         for transform in pending_transforms
         if transform.input_id in input_id_map
     )
-    return PreprocessedProgramWithDynamicInputTransforms(
-        program=compacted_program,
-        inputs=compacted_inputs,
-        dynamic_input_transforms=transforms,
+    return RichProgram(
+        instructions=compacted_program.instructions,
+        n_inputs=compacted_program.n_inputs,
     )
 
 
@@ -1534,7 +1592,7 @@ def _plan_dynamic_input_take_rewrites(
         int(dimension) for dimension in getattr(inputs[input_id], "shape", ())
     )
     if not source_shape:
-        return None
+        raise Value
 
     axis: int | None = None
     permutation: list[int] = []
@@ -3151,7 +3209,7 @@ def _infer_instruction_tensor_format(
     return None
 
 
-def _parse_einsum(expression: str) -> ParsedEinsum | None:
+def _parse_einsum(expression: str) -> ParsedEinsum:
     index_strings, output_string = parse_format_string(expression)
     return ParsedEinsum(tuple(index_strings), output_string)
 
