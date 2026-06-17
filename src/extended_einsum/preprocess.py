@@ -4,67 +4,51 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import permutations
-from typing import Any, get_args
+from typing import Any
 
 import numpy as np
 
 from extended_einsum.language import (
+    BINARY_OPERATORS,
     EINSUM_OPERATOR,
-    LSE_SUM_EINSUM_OPERATOR,
-    SCALED_EINSUM_OPERATORS,
     SELECT_OPERATOR,
     SLICE_OPERATOR,
     SOFTMAX_OPERATOR,
     STACK_OPERATOR,
     TAKE_OPERATOR,
-    BinaryOperator,
+    UNARY_OPERATORS,
     Instruction,
     Program,
-    ScaledTensor,
-    UnaryOperator,
-    einsum_format,
     get_arguments,
     get_einsum_format_string,
     get_operator,
+    get_select_axis,
+    get_select_index,
     get_slice_axis,
     get_slice_start,
     get_slice_stop,
+    get_softmax_axis,
+    get_stack_axis,
     get_take_axis,
-    instruction_arguments,
-    instruction_operator,
-    is_einsum_instruction,
-    is_logspace_einsum_instruction,
-    is_normal_einsum_instruction,
-    is_scaled_einsum_instruction,
     make_einsum_instruction,
-    make_logspace_einsum_instruction,
-    make_scaled_einsum_instruction,
     map_instruction_arguments,
-    normalize_axis,
-    scaled_einsum_output_axis,
-    select_axis,
-    select_index,
-    slice_axis,
-    slice_start,
-    slice_stop,
-    softmax_axis,
-    take_axis,
 )
 from extended_einsum.shapes import (
+    Shape,
     infer_binary_shape,
     infer_einsum_shape,
     infer_select_shape,
     infer_slice_shape,
     infer_softmax_shape,
+    infer_stack_shape,
+    infer_take_shape,
     infer_unary_shape,
 )
+from extended_einsum.utils import parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-_UNARY_OPERATORS: set[UnaryOperator] = set(get_args(UnaryOperator))
-_BINARY_OPERATORS: set[BinaryOperator] = set(get_args(BinaryOperator))
 _MAX_REPLAN_PATH_ATTEMPTS = 3
 
-Shape = tuple[int, ...]
 AxisVar = tuple[str, int, int]
 
 
@@ -137,8 +121,8 @@ class CanonicalEinsum:
     inputs: tuple[str, ...]
     output: str
     permutation: tuple[int, ...]
-    operand_shapes: tuple[Shape, ...]
-    operand_scale_states: tuple[ScaleState, ...]
+    operand_shapes: list[Shape]
+    operand_scale_states: list[ScaleState]
     output_shape: Shape
     output_scale_axis: int | None
 
@@ -368,8 +352,8 @@ def fold_independent_einsums(
 
 def _fold_independent_einsums_by_shape(
     program: Program,
-    input_shapes: tuple[Shape, ...],
-    input_scale_states: tuple[ScaleState, ...],
+    input_shapes: list[Shape],
+    input_scale_states: list[ScaleState],
     *,
     min_group_size: int,
     fold_softmax_operations: bool,
@@ -387,7 +371,7 @@ def _fold_independent_einsums_by_shape(
     try:
         _shapes, _dependencies, _first_consumers, candidates = _analyze_program(
             program,
-            tuple(tuple(shape) for shape in input_shapes),
+            input_shapes,
             input_scale_states,
             fold_softmax_operations=fold_softmax_operations,
             reorder_inputs=reorder_inputs,
@@ -553,42 +537,37 @@ def _fold_independent_einsums_by_shape(
 
         op_index = event
         instruction = program.instructions[op_index]
-        arguments = instruction_arguments(instruction)
-        if instruction_operator(instruction) == TAKE_OPERATOR:
+        arguments = get_arguments(instruction)
+        if get_operator(instruction) == TAKE_OPERATOR:
             source, index = arguments
             index_value = known_input_indices.get(index)
             if index_value is not None:
                 source_argument = materialize_ref(tensor_map[source])
                 source_shape = raw_shapes[source_argument]
-                axis = normalize_axis(take_axis(instruction), len(source_shape))
+                axis = get_take_axis(instruction)
                 tensor_map[input_count + op_index] = _TakeRef(
                     source_argument,
                     axis,
                     index_value,
                 )
                 continue
-        if instruction_operator(instruction) == SELECT_OPERATOR:
+        if get_operator(instruction) == SELECT_OPERATOR:
             (source,) = arguments
             source_argument = materialize_ref(tensor_map[source])
-            source_shape = raw_shapes[source_argument]
-            axis = normalize_axis(select_axis(instruction), len(source_shape))
+            axis = get_select_axis(instruction)
+            index = get_select_index(instruction)
             tensor_map[input_count + op_index] = _TakeRef(
                 source_argument,
                 axis,
-                select_index(instruction),
+                index,
             )
             continue
-        if instruction_operator(instruction) == SLICE_OPERATOR:
+        if get_operator(instruction) == SLICE_OPERATOR:
             (source,) = arguments
             source_argument = materialize_ref(tensor_map[source])
-            source_shape = raw_shapes[source_argument]
-            axis = normalize_axis(slice_axis(instruction), len(source_shape))
-            start, stop, step = slice(
-                slice_start(instruction),
-                slice_stop(instruction),
-            ).indices(source_shape[axis])
-            if step != 1:
-                raise ValueError("slice operator only supports step 1")
+            axis = get_slice_axis(instruction)
+            start = get_slice_start(instruction)
+            stop = get_slice_stop(instruction)
             tensor_map[input_count + op_index] = _SliceRangeRef(
                 source_argument,
                 axis,
@@ -596,10 +575,7 @@ def _fold_independent_einsums_by_shape(
                 stop,
             )
             continue
-        if (
-            instruction_operator(instruction) == STACK_OPERATOR
-            and not optimize_stacking
-        ):
+        if get_operator(instruction) == STACK_OPERATOR and not optimize_stacking:
             stacked_argument = materialize_batch(
                 tuple(tensor_map[argument] for argument in arguments)
             )
@@ -634,13 +610,13 @@ def _fold_independent_einsums_by_shape(
 
 def _merge_replan_einsums_by_shape(
     program: Program,
-    input_shapes: tuple[Shape, ...],
-    input_scale_states: tuple[ScaleState, ...],
+    input_shapes: list[Shape],
+    input_scale_states: list[ScaleState],
     *,
     minimize: str,
 ) -> Program:
     try:
-        shapes, scale_states = _infer_program_shapes(
+        shapes, scale_states = _infer_tensor_info(
             program,
             input_shapes,
             input_scale_states,
@@ -668,21 +644,21 @@ def _merge_replan_einsums_by_shape(
     return _rewrite_replanned_blocks(program, accepted_blocks)
 
 
-def _infer_program_shapes(
+def _infer_tensor_info(
     program: Program,
-    input_shapes: tuple[Shape, ...],
-    input_scale_states: tuple[ScaleState, ...],
+    input_shapes: list[Shape],
+    input_scale_states: list[ScaleState],
 ) -> tuple[tuple[Shape, ...], tuple[ScaleState, ...]]:
-    shapes = list(input_shapes)
+    shapes = input_shapes.copy()
     scale_states = list(input_scale_states)
     for instruction in program.instructions:
-        arguments = instruction_arguments(instruction)
-        argument_shapes = tuple(shapes[argument] for argument in arguments)
-        argument_scale_states = tuple(scale_states[argument] for argument in arguments)
+        arguments = get_arguments(instruction)
+        argument_shapes = [shapes[argument] for argument in arguments]
+        argument_scale_states = [scale_states[argument] for argument in arguments]
         output_shape = _infer_instruction_shape(instruction, argument_shapes)
         shapes.append(output_shape)
         scale_states.append(
-            _infer_instruction_scale_state(
+            _infer_instruction_tensor_format(
                 instruction,
                 argument_scale_states,
                 output_shape,
@@ -699,13 +675,14 @@ def _valid_einsum_ops(
 ) -> dict[int, _EinsumOp]:
     valid: dict[int, _EinsumOp] = {}
     for op_index, instruction in enumerate(program.instructions):
-        if not is_einsum_instruction(instruction):
+        operator = get_operator(instruction)
+        if operator != "einsum":
             continue
-        operator = instruction_operator(instruction)
-        parsed = _parse_einsum(einsum_format(instruction))
-        arguments = instruction_arguments(instruction)
-        if parsed is None or len(parsed.inputs) != len(arguments):
+        try:
+            parsed = _parse_einsum(get_einsum_format_string(instruction))
+        except Exception:
             continue
+        arguments = get_arguments(instruction)
         if is_scaled_einsum_instruction(instruction) and not parsed.output:
             continue
         if (
@@ -824,7 +801,7 @@ def _build_replanned_block(
     block_ops: set[int],
     sink_op_index: int,
     *,
-    minimize: str,
+    minimize: str = "flops",
 ) -> _ReplannedBlock | None:
     merged = _build_merged_einsum(program, shapes, einsum_ops, block_ops, sink_op_index)
     if merged is None:
@@ -841,10 +818,11 @@ def _build_replanned_block(
         try:
             from sesum import sr
 
-            path, _flops_log10, planned_size_log2 = sr.compute_path(
+            path: list[tuple[int, int]]
+            path, _flops_log10, planned_size_log2 = sr.compute_path(  # pyright: ignore[reportAssignmentType]
                 merged_expression,
                 *boundary_shapes,
-                minimize="flops",
+                minimize=minimize,
                 is_linear=False,
                 max_repeats=128,
                 skops_alpha=10,
@@ -900,9 +878,9 @@ def _build_replanned_block(
 def _program_einsum_depths(program: Program) -> tuple[int, ...]:
     depths = [0] * program.n_inputs
     for instruction in program.instructions:
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         argument_depth = max((depths[argument] for argument in arguments), default=0)
-        depths.append(argument_depth + int(is_einsum_instruction(instruction)))
+        depths.append(argument_depth + int(get_operator(instruction) == "einsum"))
     return tuple(depths)
 
 
@@ -913,12 +891,12 @@ def _planned_einsum_output_depth(
 ) -> int:
     local_depths = [source_depths[argument] for argument in boundary_arguments]
     for instruction in instructions:
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         argument_depth = max(
             (local_depths[argument] for argument in arguments),
             default=0,
         )
-        local_depths.append(argument_depth + int(is_einsum_instruction(instruction)))
+        local_depths.append(argument_depth + int(get_operator(instruction) == "einsum"))
     return local_depths[-1]
 
 
@@ -985,7 +963,7 @@ def _build_merged_einsum(
 
     for op_index in sorted(block_ops):
         parsed = einsum_ops[op_index].parsed
-        arguments = instruction_arguments(program.instructions[op_index])
+        arguments = get_arguments(program.instructions[op_index])
         if len(parsed.inputs) != len(arguments):
             return None
 
@@ -1117,7 +1095,7 @@ def _rewrite_replanned_blocks(
         return result_id
 
     for op_index, instruction in enumerate(program.instructions):
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         block = accepted_by_sink.get(op_index)
         result_id = program.n_inputs + op_index
 
@@ -1127,7 +1105,7 @@ def _rewrite_replanned_blocks(
                 for local_id, argument in enumerate(block.boundary_arguments)
             }
             for step_index, planned_instruction in enumerate(block.instructions):
-                planned_arguments = instruction_arguments(planned_instruction)
+                planned_arguments = get_arguments(planned_instruction)
                 mapped_arguments = tuple(
                     local_tensor_map[argument] for argument in planned_arguments
                 )
@@ -1157,21 +1135,21 @@ def _rewrite_replanned_blocks(
     return Program(instructions=instructions, n_inputs=program.n_inputs)
 
 
-def _input_shapes(inputs: tuple[Any, ...]) -> tuple[Shape, ...]:
+def _input_shapes(inputs: tuple[Any, ...]) -> list[Shape]:
     shapes: list[Shape] = []
     for input_index, value in enumerate(inputs):
         shape = getattr(value, "shape", None)
         if shape is None:
             raise ValueError(f"input {input_index} does not expose a shape")
         shapes.append(tuple(int(dimension) for dimension in shape))
-    return tuple(shapes)
+    return shapes
 
 
-def _input_scale_states(inputs: tuple[Any, ...]) -> tuple[ScaleState, ...]:
-    return tuple(
+def _input_scale_states(inputs: tuple[Any, ...]) -> list[ScaleState]:
+    return [
         _ScaleState(value.scale_axis) if isinstance(value, ScaledTensor) else None
         for value in inputs
-    )
+    ]
 
 
 def _input_index_values(inputs: tuple[Any, ...]) -> dict[int, int]:
@@ -1225,8 +1203,8 @@ def _prepare_program_inputs(
     hoisted_stack_input_by_result: dict[int, int] = {}
 
     for instruction_index, instruction in enumerate(program.instructions):
-        operator = instruction_operator(instruction)
-        arguments = instruction_arguments(instruction)
+        operator = get_operator(instruction)
+        arguments = get_arguments(instruction)
         result_id = program.n_inputs + instruction_index
 
         if (
@@ -1255,7 +1233,7 @@ def _prepare_program_inputs(
 
     instructions: list[Instruction] = []
     for instruction_index, instruction in enumerate(program.instructions):
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         result_id = program.n_inputs + instruction_index
         if result_id in hoisted_stack_input_by_result:
             continue
@@ -1485,15 +1463,16 @@ def _rewrite_dynamic_input_takes_as_slices(
     rewrites: dict[int, _DynamicTakeRewrite] = {}
 
     for input_id in sorted(dynamic_input_ids):
-        planned = _plan_dynamic_input_take_rewrites(
-            program,
-            inputs,
-            input_id,
-            output_id,
-            live_instruction_indices,
-            all_dynamic_input_ids,
-        )
-        if planned is None:
+        try:
+            planned = _plan_dynamic_input_take_rewrites(
+                program,
+                inputs,
+                input_id,
+                output_id,
+                live_instruction_indices,
+                all_dynamic_input_ids,
+            )
+        except Exception:
             continue
         axis, permutation, input_rewrites = planned
         index_input = _index_array_like(
@@ -1524,7 +1503,7 @@ def _rewrite_dynamic_input_takes_as_slices(
     instructions = list(program.instructions)
     for instruction_index, rewrite in rewrites.items():
         instruction = instructions[instruction_index]
-        source, _index = instruction_arguments(instruction)
+        source, _index = get_arguments(instruction)
         instructions[instruction_index] = (
             SLICE_OPERATOR,
             (source,),
@@ -1547,9 +1526,9 @@ def _plan_dynamic_input_take_rewrites(
     output_id: int,
     live_instruction_indices: set[int],
     dynamic_input_ids: frozenset[int],
-) -> tuple[int, tuple[int, ...], dict[int, _DynamicTakeRewrite]] | None:
+) -> tuple[int, tuple[int, ...], dict[int, _DynamicTakeRewrite]]:
     if output_id == input_id:
-        return None
+        raise RuntimeError("TODO: idk why this results in a runtime error")
 
     source_shape = tuple(
         int(dimension) for dimension in getattr(inputs[input_id], "shape", ())
@@ -1563,10 +1542,10 @@ def _plan_dynamic_input_take_rewrites(
 
     for instruction_index in sorted(live_instruction_indices):
         instruction = program.instructions[instruction_index]
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         if input_id not in arguments:
             continue
-        if instruction_operator(instruction) != TAKE_OPERATOR or len(arguments) != 2:
+        if get_operator(instruction) != TAKE_OPERATOR or len(arguments) != 2:
             return None
         source, index = arguments
         if (
@@ -1628,7 +1607,7 @@ def _transformable_nodes_by_dynamic(
     }
 
     for instruction_index, instruction in enumerate(program.instructions):
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         dependencies = frozenset().union(
             *(dynamic_dependencies[argument] for argument in arguments)
         )
@@ -1665,7 +1644,7 @@ def _is_transformable_dynamic_instruction(
     dynamic_dependencies: dict[int, frozenset[int]],
     transformable_nodes: set[int],
 ) -> bool:
-    operator = instruction_operator(instruction)
+    operator = get_operator(instruction)
     if operator == SLICE_OPERATOR:
         if len(arguments) != 1:
             return False
@@ -1710,7 +1689,7 @@ def _transform_subgraph_nodes(
             continue
         result_ids.add(tensor_id)
         instruction = program.instructions[tensor_id - program.n_inputs]
-        for argument in instruction_arguments(instruction):
+        for argument in get_arguments(instruction):
             if argument >= program.n_inputs or argument == input_id:
                 pending.append(argument)
     return frozenset(result_ids)
@@ -1725,7 +1704,7 @@ def _dynamic_input_has_external_raw_consumers(
     for instruction_index, instruction in enumerate(program.instructions):
         if instruction_index not in live_instruction_indices:
             continue
-        if input_id not in instruction_arguments(instruction):
+        if input_id not in get_arguments(instruction):
             continue
         if program.n_inputs + instruction_index not in transform_node_ids:
             return True
@@ -1762,7 +1741,7 @@ def _build_dynamic_input_transform(
             {
                 argument
                 for result_id in transform_node_ids
-                for argument in instruction_arguments(
+                for argument in get_arguments(
                     program.instructions[result_id - program.n_inputs]
                 )
                 if argument < program.n_inputs and argument != input_id
@@ -1781,7 +1760,7 @@ def _build_dynamic_input_transform(
 
     for result_id in sorted(transform_node_ids):
         instruction = program.instructions[result_id - program.n_inputs]
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         argument_map = {
             argument: (
                 result_id_map[argument]
@@ -1829,7 +1808,7 @@ def _remove_extracted_transform_nodes(
         if old_result_id in extracted_nodes:
             continue
 
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         mapped_arguments = tuple(tensor_map[argument] for argument in arguments)
         argument_map = dict(zip(arguments, mapped_arguments, strict=True))
         tensor_map[old_result_id] = program.n_inputs + len(instructions)
@@ -1862,7 +1841,7 @@ def _compact_program_inputs_with_input_map(
     live_instruction_indices = _live_instruction_indices(program, output_id)
 
     for instruction_index in live_instruction_indices:
-        for argument in instruction_arguments(program.instructions[instruction_index]):
+        for argument in get_arguments(program.instructions[instruction_index]):
             if argument < program.n_inputs:
                 used_input_ids.add(argument)
 
@@ -1961,7 +1940,7 @@ def _live_instruction_indices(program: Program, output_id: int) -> set[int]:
         if instruction_index in live_instruction_indices:
             continue
         live_instruction_indices.add(instruction_index)
-        pending.extend(instruction_arguments(program.instructions[instruction_index]))
+        pending.extend(get_arguments(program.instructions[instruction_index]))
 
     return live_instruction_indices
 
@@ -1969,8 +1948,8 @@ def _live_instruction_indices(program: Program, output_id: int) -> set[int]:
 def _execute_take_stack_program(program: Program, inputs: PreparedInputs) -> Any:
     tensors = list(inputs)
     for instruction in program.instructions:
-        operator = instruction_operator(instruction)
-        arguments = instruction_arguments(instruction)
+        operator = get_operator(instruction)
+        arguments = get_arguments(instruction)
         if operator == STACK_OPERATOR:
             result = _stack_input_values(
                 tuple(tensors[argument] for argument in arguments)
@@ -2284,13 +2263,13 @@ def _to_ascii_einsum(expression: str) -> str:
 
 def _analyze_program(
     program: Program,
-    input_shapes: tuple[Shape, ...],
-    input_scale_states: tuple[ScaleState, ...],
+    input_shapes: list[Shape],
+    input_scale_states: list[ScaleState],
     *,
     fold_softmax_operations: bool,
     reorder_inputs: bool,
 ) -> tuple[list[Shape], dict[int, frozenset[int]], dict[int, int], list[_Candidate]]:
-    shapes = list(input_shapes)
+    shapes = input_shapes.copy()
     scale_states = list(input_scale_states)
     depths = [-1] * len(input_shapes)
     dependencies: dict[int, frozenset[int]] = {
@@ -2300,7 +2279,7 @@ def _analyze_program(
     candidates: list[_Candidate] = []
 
     for op_index, instruction in enumerate(program.instructions):
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         for argument in arguments:
             if argument >= len(input_shapes):
                 first_consumers.setdefault(argument, op_index)
@@ -2315,10 +2294,10 @@ def _analyze_program(
         dependencies[result_id] = frozenset(dependency_set)
 
         argument_shapes = [shapes[argument] for argument in arguments]
-        argument_scale_states = tuple(scale_states[argument] for argument in arguments)
+        argument_scale_states = [scale_states[argument] for argument in arguments]
         output_shape = _infer_instruction_shape(instruction, argument_shapes)
         shapes.append(output_shape)
-        output_scale_state = _infer_instruction_scale_state(
+        output_scale_state = _infer_instruction_tensor_format(
             instruction,
             argument_scale_states,
             output_shape,
@@ -2374,7 +2353,7 @@ def _schedule_ready_events(
             for op_index in sorted(remaining)
             if all(
                 argument in available
-                for argument in instruction_arguments(program.instructions[op_index])
+                for argument in get_arguments(program.instructions[op_index])
             )
         ]
         if not ready:
@@ -2502,7 +2481,7 @@ def _result_consumers(
 ) -> dict[int, list[tuple[int, int]]]:
     consumers: dict[int, list[tuple[int, int]]] = {}
     for op_index, instruction in enumerate(program.instructions):
-        arguments = instruction_arguments(instruction)
+        arguments = get_arguments(instruction)
         for argument_position, argument in enumerate(arguments):
             if argument >= input_count:
                 consumers.setdefault(argument, []).append((op_index, argument_position))
@@ -2571,12 +2550,12 @@ def _consumer_key(
 
 
 def _instruction_future_signature(instruction: Instruction) -> tuple[Any, ...]:
-    operator = instruction_operator(instruction)
+    operator = get_operator(instruction)
     if is_einsum_instruction(instruction):
         signature: tuple[Any, ...] = (
             operator,
             einsum_format(instruction),
-            len(instruction_arguments(instruction)),
+            len(get_arguments(instruction)),
         )
         if is_scaled_einsum_instruction(instruction):
             return (*signature, scaled_einsum_output_axis(instruction))
@@ -2595,8 +2574,8 @@ def _instruction_future_signature(instruction: Instruction) -> tuple[Any, ...]:
             slice_stop(instruction),
         )
     if operator == STACK_OPERATOR:
-        return (operator, len(instruction_arguments(instruction)))
-    return (operator, len(instruction_arguments(instruction)))
+        return (operator, len(get_arguments(instruction)))
+    return (operator, len(get_arguments(instruction)))
 
 
 def _candidate_future_order_key(
@@ -2784,9 +2763,9 @@ def _commute_take_batch_through_softmax(
     if not isinstance(take_ref.source, _ResultArgument):
         return None
     source_instruction = raw_instructions[take_ref.source.instruction_index]
-    if instruction_operator(source_instruction) != SOFTMAX_OPERATOR:
+    if get_operator(source_instruction) != SOFTMAX_OPERATOR:
         return None
-    (softmax_source,) = instruction_arguments(source_instruction)
+    (softmax_source,) = get_arguments(source_instruction)
     source_axis = softmax_axis(source_instruction)
     if take_ref.axis == source_axis:
         return None
@@ -2884,8 +2863,8 @@ def _make_batched_instruction(
 
 def _canonicalize_instruction(
     instruction: Instruction,
-    operand_shapes: tuple[Shape, ...],
-    operand_scale_states: tuple[ScaleState, ...],
+    operand_shapes: list[Shape],
+    operand_scale_states: list[ScaleState],
     output_shape: Shape,
     *,
     fold_softmax_operations: bool,
@@ -2912,15 +2891,15 @@ def _canonicalize_instruction(
 
 def _canonicalize_instruction_einsum(
     instruction: Instruction,
-    operand_shapes: tuple[Shape, ...],
-    operand_scale_states: tuple[ScaleState, ...],
+    operand_shapes: list[Shape],
+    operand_scale_states: list[ScaleState],
     output_shape: Shape,
     *,
     reorder_inputs: bool,
 ) -> CanonicalEinsum | None:
     if not is_einsum_instruction(instruction):
         return None
-    operator = instruction_operator(instruction)
+    operator = get_operator(instruction)
     parsed = _parse_einsum(einsum_format(instruction))
     if parsed is None or len(parsed.inputs) != len(operand_shapes):
         return None
@@ -2989,11 +2968,11 @@ def _canonicalize_instruction_einsum(
 
 def _canonicalize_instruction_softmax(
     instruction: Instruction,
-    operand_shapes: tuple[Shape, ...],
-    operand_scale_states: tuple[ScaleState, ...],
+    operand_shapes: list[Shape],
+    operand_scale_states: list[ScaleState],
     output_shape: Shape,
 ) -> CanonicalEinsum | None:
-    if instruction_operator(instruction) != SOFTMAX_OPERATOR:
+    if get_operator(instruction) != SOFTMAX_OPERATOR:
         return None
     if len(operand_shapes) != 1 or len(operand_scale_states) != 1:
         return None
@@ -3002,7 +2981,7 @@ def _canonicalize_instruction_softmax(
     if not operand_shapes[0] or output_shape != operand_shapes[0]:
         return None
 
-    axis = normalize_axis(softmax_axis(instruction), len(operand_shapes[0]))
+    axis = get_softmax_axis(instruction)
     return CanonicalEinsum(
         signature=(
             SOFTMAX_OPERATOR,
@@ -3061,73 +3040,47 @@ def _infer_instruction_shape(
     operand_shapes: list[Shape],
 ) -> Shape:
     operator = get_operator(instruction)
-    if operator == "einsum":
-        format_string = get_einsum_format_string(instruction)
-        return infer_einsum_shape(format_string, operand_shapes)
-
-    if operator in _UNARY_OPERATORS:
-        if len(operand_shapes) != 1:
-            raise ValueError(
-                f"The {operator} operator takes exactly one argument, but {len(operand_shapes)} were given."
-            )
-        return infer_unary_shape(operand_shapes[0])
-
-    if operator in _BINARY_OPERATORS:
-        return infer_binary_shape(*operand_shapes)
-
-    if operator == STACK_OPERATOR:
-        if not operand_shapes:
-            raise ValueError("stack operator requires at least one operand")
-        if any(shape != operand_shapes[0] for shape in operand_shapes):
-            raise ValueError("stack operator requires matching operand shapes")
-        return (len(operand_shapes), *operand_shapes[0])
-    if operator == TAKE_OPERATOR:
-        if len(operand_shapes) != 2:
-            raise ValueError(
-                "take operator requires an array operand and an indices operand"
-            )
-        if not operand_shapes[0]:
-            raise ValueError("take operator requires an operand with a leading axis")
-        axis = get_take_axis(instruction)
-        return (
-            *operand_shapes[0][:axis],
-            *operand_shapes[1],
-            *operand_shapes[0][axis + 1 :],
-        )
-    if operator == SOFTMAX_OPERATOR:
-        if len(operand_shapes) != 1:
-            raise ValueError("softmax operator requires one operand")
-        return infer_softmax_shape(operand_shapes[0])
-
-    if operator == SELECT_OPERATOR:
-        if len(operand_shapes) != 1:
-            raise ValueError("select operator requires an array operand")
-        return infer_select_shape(operand_shapes[0], select_axis(instruction))
-
-    if operator == SLICE_OPERATOR:
-        if len(operand_shapes) != 1:
-            raise ValueError("slice operator requires one operand")
-        start = get_slice_start(instruction)
-        stop = get_slice_stop(instruction)
-        axis = get_slice_axis(instruction)
-        return infer_slice_shape(operand_shapes[0], start, stop, axis)
-
-    raise ValueError(f"unsupported operator for shape inference: {operator!r}")
+    match operator:
+        case "einsum":
+            format_string = get_einsum_format_string(instruction)
+            return infer_einsum_shape(format_string, operand_shapes)
+        case "stack":
+            axis = get_stack_axis(instruction)
+            return infer_stack_shape(operand_shapes, axis)
+        case "take":
+            axis = get_take_axis(instruction)
+            return infer_take_shape(operand_shapes[0], operand_shapes[1], axis)
+        case "softmax":
+            return infer_softmax_shape(operand_shapes[0])
+        case "select":
+            axis = get_select_axis(instruction)
+            return infer_select_shape(operand_shapes[0], axis)
+        case "slice":
+            start = get_slice_start(instruction)
+            stop = get_slice_stop(instruction)
+            axis = get_slice_axis(instruction)
+            return infer_slice_shape(operand_shapes[0], start, stop, axis)
+        case operator if operator in UNARY_OPERATORS:
+            return infer_unary_shape(operand_shapes[0])
+        case operator if operator in BINARY_OPERATORS:
+            return infer_binary_shape(*operand_shapes)
+        case _:
+            raise ValueError(f"unsupported operator for shape inference: {operator!r}")
 
 
-def _infer_instruction_scale_state(
+def _infer_instruction_tensor_format(
     instruction: Instruction,
-    operand_scale_states: tuple[ScaleState, ...],
+    operand_tensor_formats: list[ScaleState],
     output_shape: Shape,
-    operand_shapes: tuple[Shape, ...],
+    operand_shapes: list[Shape],
 ) -> ScaleState:
-    operator = instruction_operator(instruction)
+    operator = get_operator(instruction)
     if is_normal_einsum_instruction(instruction):
-        if any(scale_state is not None for scale_state in operand_scale_states):
+        if any(scale_state is not None for scale_state in operand_tensor_formats):
             raise ValueError("normal einsum does not accept scaled inputs")
         return None
     if is_logspace_einsum_instruction(instruction):
-        if any(scale_state is not None for scale_state in operand_scale_states):
+        if any(scale_state is not None for scale_state in operand_tensor_formats):
             raise ValueError("logspace einsum does not accept scaled inputs")
         return None
     if is_scaled_einsum_instruction(instruction):
@@ -3136,18 +3089,18 @@ def _infer_instruction_scale_state(
         )
     if operator == "log":
         return None
-    if operator in _UNARY_OPERATORS:
-        if any(scale_state is not None for scale_state in operand_scale_states):
+    if operator in UNARY_OPERATORS:
+        if any(scale_state is not None for scale_state in operand_tensor_formats):
             raise ValueError(f"unary operator {operator!r} does not support scaling")
         return None
     if operator == SOFTMAX_OPERATOR:
-        if any(scale_state is not None for scale_state in operand_scale_states):
+        if any(scale_state is not None for scale_state in operand_tensor_formats):
             raise ValueError("softmax does not support scaled tensors")
         return None
-    if operator in _BINARY_OPERATORS:
+    if operator in BINARY_OPERATORS:
         scaled = [
             scale_state
-            for scale_state in operand_scale_states
+            for scale_state in operand_tensor_formats
             if scale_state is not None
         ]
         if not scaled:
@@ -3161,19 +3114,19 @@ def _infer_instruction_scale_state(
     if operator == STACK_OPERATOR:
         scaled = [
             scale_state
-            for scale_state in operand_scale_states
+            for scale_state in operand_tensor_formats
             if scale_state is not None
         ]
         if not scaled:
             return None
-        if len(scaled) != len(operand_scale_states):
+        if len(scaled) != len(operand_tensor_formats):
             raise ValueError("cannot stack mixed scaled and unscaled tensors")
         first_axis = scaled[0].axis
         if any(scale_state.axis != first_axis for scale_state in scaled):
             raise ValueError("cannot stack scaled tensors with different scale axes")
         return _ScaleState(first_axis + 1)
     if operator == TAKE_OPERATOR:
-        source_scale_state = operand_scale_states[0]
+        source_scale_state = operand_tensor_formats[0]
         if source_scale_state is None:
             return None
         axis = normalize_axis(take_axis(instruction), len(operand_shapes[0]))
@@ -3184,7 +3137,7 @@ def _infer_instruction_scale_state(
             return source_scale_state
         return _ScaleState(source_scale_state.axis - 1 + index_rank)
     if operator == SELECT_OPERATOR:
-        source_scale_state = operand_scale_states[0]
+        source_scale_state = operand_tensor_formats[0]
         if source_scale_state is None:
             return None
         axis = normalize_axis(select_axis(instruction), len(operand_shapes[0]))
@@ -3194,43 +3147,13 @@ def _infer_instruction_scale_state(
             return source_scale_state
         return _ScaleState(source_scale_state.axis - 1)
     if operator == SLICE_OPERATOR:
-        return operand_scale_states[0]
+        return operand_tensor_formats[0]
     return None
 
 
-def _infer_einsum_output_shape(
-    parsed: ParsedEinsum, operand_shapes: tuple[Shape, ...]
-) -> Shape | None:
-    if len(parsed.inputs) != len(operand_shapes):
-        return None
-    sizes: dict[str, int] = {}
-    for subscript, shape in zip(parsed.inputs, operand_shapes, strict=True):
-        if len(subscript) != len(shape):
-            return None
-        for label, size in zip(subscript, shape, strict=True):
-            previous_size = sizes.setdefault(label, size)
-            if previous_size != size:
-                return None
-    output_shape: list[int] = []
-    for label in parsed.output:
-        size = sizes.get(label)
-        if size is None:
-            return None
-        output_shape.append(size)
-    return tuple(output_shape)
-
-
 def _parse_einsum(expression: str) -> ParsedEinsum | None:
-    expression = expression.replace(" ", "")
-    if "..." in expression or "->" not in expression:
-        return None
-    left, output = expression.split("->", maxsplit=1)
-    if not left:
-        return None
-    inputs = tuple(left.split(","))
-    if any(not subscript for subscript in inputs):
-        return None
-    return ParsedEinsum(inputs, output)
+    index_strings, output_string = parse_format_string(expression)
+    return ParsedEinsum(tuple(index_strings), output_string)
 
 
 def _format_einsum(parsed: ParsedEinsum) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 UnaryOperator = Literal["exp", "log"]
 BinaryOperator = Literal["+", "-", "*", "/"]
@@ -13,6 +13,8 @@ SliceOperator = Literal["slice"]
 SoftmaxOperator = Literal["softmax"]
 SelectOperator = Literal["select"]
 
+UNARY_OPERATORS: frozenset[UnaryOperator] = frozenset(get_args(UnaryOperator))
+BINARY_OPERATORS: frozenset[BinaryOperator] = frozenset(get_args(BinaryOperator))
 EINSUM_OPERATOR: EinsumOperator = "einsum"
 STACK_OPERATOR: StackOperator = "stack"
 TAKE_OPERATOR: TakeOperator = "take"
