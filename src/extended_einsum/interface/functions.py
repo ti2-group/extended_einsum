@@ -1,4 +1,4 @@
-from extended_einsum.backend import DenseArray, TArray, TBackendArray
+from extended_einsum.backend import TArray, TBackendArray
 from extended_einsum.interface.operator import (
     InterfaceEinsumOperator,
     InterfaceSliceOperator,
@@ -7,12 +7,12 @@ from extended_einsum.interface.operator import (
     InterfaceTakeOperator,
     InterfaceUnaryOperator,
 )
-from extended_einsum.interface.tensor_expression import TensorExpression
+from extended_einsum.interface.tensor_expression import Parameter, TensorExpression
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 
-def array(a: TBackendArray, is_parameter: bool = False) -> DenseArray[TBackendArray]:
-    return DenseArray(a, is_parameter=is_parameter)
+def parameter(a: TBackendArray) -> Parameter[TBackendArray]:
+    return Parameter(a)
 
 
 def exp(
