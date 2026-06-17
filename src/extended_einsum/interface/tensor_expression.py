@@ -7,6 +7,7 @@ from extended_einsum.interface.operator import (
     InterfaceBinaryOperator,
     InterfaceEinsumOperator,
     InterfaceOperator,
+    InterfaceSelectOperator,
     InterfaceSliceOperator,
     InterfaceSoftmaxOperator,
     InterfaceStackOperator,
@@ -24,8 +25,17 @@ from extended_einsum.language import (
     map_instruction_arguments,
 )
 from extended_einsum.scale import ScaledTensor
+from extended_einsum.shapes import (
+    infer_binary_shape,
+    infer_einsum_shape,
+    infer_select_shape,
+    infer_slice_shape,
+    infer_softmax_shape,
+    infer_stack_shape,
+    infer_take_shape,
+    infer_unary_shape,
+)
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
-from extended_einsum.utils import get_axis_sizes, parse_format_string
 
 
 class TensorExpression(Generic[TArray]):
@@ -229,74 +239,45 @@ def _propagate_shapes(
                 raise ValueError(
                     f"The {operator} operator takes exactly one argument, but {len(argument_shapes)} were given."
                 )
-            return argument_shapes[0]
+            return infer_unary_shape(argument_shapes[0])
 
         case InterfaceBinaryOperator(operator):
             if len(argument_shapes) != 2:
                 raise ValueError(
                     f"The {operator} operator takes exactly two arguments, but {len(argument_shapes)} were given."
                 )
-            if argument_shapes[0] != argument_shapes[1]:
-                raise RuntimeError(
-                    f"The shapes of the tensors are incompatible with the {operator} operator: {argument_shapes[0]} and {argument_shapes[1]}."
-                )
-            return argument_shapes[0]
+            return infer_binary_shape(argument_shapes[0], argument_shapes[1])
 
         case InterfaceStackOperator(axis):
-            if len(argument_shapes) == 0:
-                raise ValueError("stack requires at least one argument")
-            non_stacked_shape = argument_shapes[0]
-            if any(shape != non_stacked_shape for shape in argument_shapes[1:]):
-                raise ValueError(
-                    "The stack operator requires all arguments to have the same shape along the stack axis."
-                )
-            return (
-                *non_stacked_shape[:axis],
-                len(argument_shapes),
-                *non_stacked_shape[axis + 1 :],
-            )
+            return infer_stack_shape(argument_shapes, axis)
 
         case InterfaceTakeOperator(axis):
             if len(argument_shapes) != 2:
                 raise ValueError(
                     f"The take operator takes exactly two arguments, but {len(argument_shapes)} were given."
                 )
-            return (
-                *argument_shapes[0][:axis],
-                *argument_shapes[1],
-                *argument_shapes[0][axis + 1 :],
-            )
+            return infer_take_shape(argument_shapes[0], argument_shapes[1], axis)
 
-        case InterfaceSoftmaxOperator():
+        case InterfaceSoftmaxOperator(_):
             if len(argument_shapes) != 1:
                 raise ValueError(
                     f"The softmax operator takes exactly one argument, but {len(argument_shapes)} were given."
                 )
-            return argument_shapes[0]
+            return infer_softmax_shape(argument_shapes[0])
 
         case InterfaceSliceOperator(start, stop, axis):
             if len(argument_shapes) != 1:
                 raise ValueError(
                     f"The slice operator takes exactly one argument, but {len(argument_shapes)} were given."
                 )
-            return (
-                *argument_shapes[0][:axis],
-                stop - start,
-                *argument_shapes[0][axis + 1 :],
-            )
+            return infer_slice_shape(argument_shapes[0], start, stop, axis)
 
         case InterfaceEinsumOperator(format_string):
-            # parse the format string and check that the number of arguments matches the number of index strings
-            index_strings, output_string = parse_format_string(format_string)
-            if len(index_strings) != len(argument_shapes):
+            return infer_einsum_shape(format_string, argument_shapes)
+
+        case InterfaceSelectOperator(axis, _):
+            if len(argument_shapes) != 1:
                 raise ValueError(
-                    f"The number of indices in the einsum format string ({len(index_strings)}) does not match the number of arguments ({len(argument_shapes)})."
+                    f"The select operator takes exactly one argument, but {len(argument_shapes)} were given."
                 )
-            # find the shape of the output tensor
-            axis_sizes = get_axis_sizes(index_strings, argument_shapes)
-            for index in output_string:
-                if index not in axis_sizes:
-                    raise ValueError(
-                        f"Einsum format string error: the output index {index} is not present in the input index strings."
-                    )
-            return tuple(axis_sizes[index] for index in output_string)
+            return infer_select_shape(argument_shapes[0], axis)
