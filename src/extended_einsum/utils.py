@@ -66,21 +66,6 @@ def parse_format_string(format_string: str) -> tuple[list[str], str]:
     return index_strings, output_string
 
 
-def get_axis_sizes(
-    index_strings: list[str], tensor_shapes: list[tuple[int, ...]]
-) -> dict[str, int]:
-    axis_sizes: dict[str, int] = {}
-    for index_string, tensor_shape in zip(index_strings, tensor_shapes):
-        for index in index_string:
-            if index not in axis_sizes:
-                axis_sizes[index] = tensor_shape[index_string.index(index)]
-            elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
-                raise RuntimeError(
-                    f"Incompatible shapes for index {index_string}: {tensor_shape} and {axis_sizes[index]}."
-                )
-    return axis_sizes
-
-
 def normalize_axis(axis: int, rank: int) -> int:
     if rank <= 0:
         raise ValueError("axis normalization requires a positive rank")

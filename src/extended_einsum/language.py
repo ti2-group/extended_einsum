@@ -11,18 +11,21 @@ StackOperator = Literal["stack"]
 TakeOperator = Literal["take"]
 SliceOperator = Literal["slice"]
 SoftmaxOperator = Literal["softmax"]
+SelectOperator = Literal["select"]
 
 EINSUM_OPERATOR: EinsumOperator = "einsum"
 STACK_OPERATOR: StackOperator = "stack"
 TAKE_OPERATOR: TakeOperator = "take"
 SLICE_OPERATOR: SliceOperator = "slice"
 SOFTMAX_OPERATOR: SoftmaxOperator = "softmax"
+SELECT_OPERATOR: SelectOperator = "select"
 
 Operator = (
     UnaryOperator
     | BinaryOperator
     | StackOperator
     | TakeOperator
+    | SelectOperator
     | SliceOperator
     | SoftmaxOperator
     | EinsumOperator
@@ -81,35 +84,43 @@ def map_instruction_arguments(
     )
 
 
-def get_format_string_einsum(instruction: Instruction) -> str:
+def get_einsum_format_string(instruction: Instruction) -> str:
     return get_instruction_specific_arguments(instruction)[0]
 
 
-def get_output_axis_scaled_einsum(instruction: tuple[Any, ...]) -> int:
+def get_scaled_einsum_output_axis(instruction: tuple[Any, ...]) -> int:
     return get_instruction_specific_arguments(instruction)[1]
 
 
-def get_axis_stack(instruction: Instruction) -> int:
+def get_stack_axis(instruction: Instruction) -> int:
     return get_instruction_specific_arguments(instruction)[0]
 
 
-def get_axis_take(instruction: Instruction) -> int:
+def get_take_axis(instruction: Instruction) -> int:
     return get_instruction_specific_arguments(instruction)[0]
 
 
-def slice_start(instruction: tuple[Any, ...]) -> int:
+def get_select_axis(instruction: Instruction) -> int:
     return get_instruction_specific_arguments(instruction)[0]
 
 
-def slice_stop(instruction: tuple[Any, ...]) -> int:
+def get_select_index(instruction: Instruction) -> int:
     return get_instruction_specific_arguments(instruction)[1]
 
 
-def slice_axis(instruction: tuple[Any, ...]) -> int:
+def get_slice_start(instruction: tuple[Any, ...]) -> int:
+    return get_instruction_specific_arguments(instruction)[0]
+
+
+def get_slice_stop(instruction: tuple[Any, ...]) -> int:
+    return get_instruction_specific_arguments(instruction)[1]
+
+
+def get_slice_axis(instruction: tuple[Any, ...]) -> int:
     return get_instruction_specific_arguments(instruction)[2]
 
 
-def softmax_axis(instruction: tuple[Any, ...]) -> int:
+def get_softmax_axis(instruction: tuple[Any, ...]) -> int:
     return get_instruction_specific_arguments(instruction)[0]
 
 

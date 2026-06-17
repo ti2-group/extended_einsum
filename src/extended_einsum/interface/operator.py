@@ -45,12 +45,19 @@ class InterfaceSliceOperator:
     axis: int
 
 
+@dataclass(frozen=True)
+class InterfaceSelectOperator:
+    axis: int
+    index: int
+
+
 InterfaceOperator = (
     InterfaceUnaryOperator
     | InterfaceBinaryOperator
     | InterfaceEinsumOperator
     | InterfaceStackOperator
     | InterfaceTakeOperator
+    | InterfaceSelectOperator
     | InterfaceSoftmaxOperator
     | InterfaceSliceOperator
 )

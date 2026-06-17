@@ -1,4 +1,6 @@
 __pycache__
 
+# environment stuff
 .autoenv
 .autoenv.leave
+typings/
