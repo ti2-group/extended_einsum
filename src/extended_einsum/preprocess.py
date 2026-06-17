@@ -307,7 +307,7 @@ class _UnionFind[T]:
 
 
 def preprocess_einsum_path(
-    expression: str,
+    format_string: str,
     inputs: Sequence[Any],
     path: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     *,
@@ -322,19 +322,19 @@ def preprocess_einsum_path(
     """Lower an einsum path and return a rewritten program plus prepared inputs."""
     input_tuple = tuple(inputs)
     input_shapes = _input_shapes(input_tuple)
-    parsed = _parse_einsum(expression)
+    parsed = _parse_einsum(format_string)
 
     if path is None:
         from sesum import sr
 
         path, _, _ = sr.compute_path(  # pyright: ignore[reportAssignmentType]
-            _format_einsum(parsed),
+            format_string,
             *input_shapes,
             is_linear=False,
         )
     assert path is not None
 
-    program = _program_from_ssa_path(parsed, path)
+    program = _program_from_ssa_path(format_string, path)
 
     return fold_independent_einsums(
         program,
@@ -2003,257 +2003,19 @@ def _live_instruction_indices(program: Program, output_id: int) -> set[int]:
     return live_instruction_indices
 
 
-def _execute_take_stack_program(program: Program, inputs: PreparedInputs) -> Any:
-    tensors = list(inputs)
-    for instruction in program.instructions:
-        operator = get_operator(instruction)
-        arguments = get_arguments(instruction)
-        if operator == STACK_OPERATOR:
-            result = _stack_input_values(
-                tuple(tensors[argument] for argument in arguments)
-            )
-        elif operator == TAKE_OPERATOR:
-            source, index = arguments
-            result = _take_input_value(
-                tensors[source],
-                tensors[index],
-                take_axis(instruction),
-            )
-        elif operator == SELECT_OPERATOR:
-            (source,) = arguments
-            result = _select_input_value(
-                tensors[source],
-                select_axis(instruction),
-                select_index(instruction),
-            )
-        elif operator == SLICE_OPERATOR:
-            (source,) = arguments
-            result = _slice_input_value(
-                tensors[source],
-                slice_axis(instruction),
-                slice_start(instruction),
-                slice_stop(instruction),
-            )
-        else:
-            raise ValueError(
-                "dynamic input transform programs only support "
-                "take, select, slice, and stack"
-            )
-        tensors.append(result)
-    return tensors[program.output_ssa]
-
-
-def _stack_input_values(values: tuple[Any, ...]) -> Any:
-    if not values:
-        raise ValueError("cannot stack an empty input list")
-    reference = values[0]
-    scaled_flags = [isinstance(value, ScaledTensor) for value in values]
-    if any(scaled_flags) and not all(scaled_flags):
-        raise ValueError("cannot stack a mix of scaled and unscaled input values")
-    if scaled_flags[0]:
-        scaled_values = [value for value in values if isinstance(value, ScaledTensor)]
-        axis = scaled_values[0].scale_axis
-        if any(value.scale_axis != axis for value in scaled_values):
-            raise ValueError("cannot stack scaled input values with different axes")
-        return ScaledTensor(
-            _stack_input_values(tuple(value.value for value in scaled_values)),
-            _stack_input_values(tuple(value.log_scale for value in scaled_values)),
-            axis + 1,
-        )
-    if _is_torch_value(reference):
-        import torch
-
-        return torch.stack(list(values), dim=0)
-    if _is_jax_value(reference):
-        import jax.numpy as jnp
-
-        return jnp.stack(list(values), axis=0)
-    return np.stack(list(values), axis=0)
-
-
-def _take_input_value(source: Any, index: Any, axis: int) -> Any:
-    if isinstance(source, ScaledTensor):
-        take_axis = normalize_axis(axis, len(source.shape))
-        if source.scale_axis == take_axis:
-            raise ValueError("cannot take away the scale axis of a scaled tensor")
-        index_shape = tuple(int(dimension) for dimension in getattr(index, "shape", ()))
-        scale_shape = tuple(
-            int(dimension) for dimension in getattr(source.log_scale, "shape", ())
-        )
-        if not scale_shape:
-            log_scale = source.log_scale
-        elif scale_shape[take_axis] != 1:
-            log_scale = _take_input_value(source.log_scale, index, take_axis)
-        else:
-            log_scale = _reshape_input_value(
-                source.log_scale,
-                (
-                    *scale_shape[:take_axis],
-                    *((1,) * len(index_shape)),
-                    *scale_shape[take_axis + 1 :],
-                ),
-            )
-        scale_axis = (
-            source.scale_axis
-            if source.scale_axis < take_axis
-            else source.scale_axis - 1 + len(index_shape)
-        )
-        return ScaledTensor(
-            _take_input_value(source.value, index, take_axis),
-            log_scale,
-            scale_axis,
-        )
-
-    normalized_axis = normalize_axis(axis, len(source.shape))
-    index_shape = tuple(int(dimension) for dimension in getattr(index, "shape", ()))
-    if _is_torch_value(source):
-        import torch
-
-        index_tensor = torch.as_tensor(index, dtype=torch.long, device=source.device)
-        result = torch.index_select(
-            source,
-            dim=normalized_axis,
-            index=index_tensor.reshape(-1),
-        )
-        return result.reshape(
-            (
-                *source.shape[:normalized_axis],
-                *index_shape,
-                *source.shape[normalized_axis + 1 :],
-            )
-        )
-    if _is_jax_value(source):
-        import jax.numpy as jnp
-
-        return jnp.take(source, index, axis=normalized_axis)
-    return np.take(source, index, axis=normalized_axis)
-
-
-def _select_input_value(source: Any, axis: int, index: int) -> Any:
-    if isinstance(source, ScaledTensor):
-        select_axis = normalize_axis(axis, len(source.shape))
-        if source.scale_axis == select_axis:
-            raise ValueError("cannot select away the scale axis of a scaled tensor")
-        scale_shape = tuple(
-            int(dimension) for dimension in getattr(source.log_scale, "shape", ())
-        )
-        if not scale_shape:
-            log_scale = source.log_scale
-        elif scale_shape[select_axis] != 1:
-            log_scale = _select_input_value(source.log_scale, select_axis, index)
-        else:
-            log_scale = _reshape_input_value(
-                source.log_scale,
-                (*scale_shape[:select_axis], *scale_shape[select_axis + 1 :]),
-            )
-        scale_axis = (
-            source.scale_axis
-            if source.scale_axis < select_axis
-            else source.scale_axis - 1
-        )
-        return ScaledTensor(
-            _select_input_value(source.value, select_axis, index),
-            log_scale,
-            scale_axis,
-        )
-
-    normalized_axis = normalize_axis(axis, len(source.shape))
-    if _is_torch_value(source):
-        slices = [slice(None)] * len(source.shape)
-        slices[normalized_axis] = index
-        return source[tuple(slices)]
-    if _is_jax_value(source):
-        import jax.numpy as jnp
-
-        return jnp.take(source, index, axis=normalized_axis)
-    return np.take(source, index, axis=normalized_axis)
-
-
-def _slice_input_value(source: Any, axis: int, start: int, stop: int) -> Any:
-    if isinstance(source, ScaledTensor):
-        slice_axis = normalize_axis(axis, len(source.shape))
-        scale_shape = tuple(
-            int(dimension) for dimension in getattr(source.log_scale, "shape", ())
-        )
-        if not scale_shape or scale_shape[slice_axis] == 1:
-            log_scale = source.log_scale
-        else:
-            log_scale = _slice_input_value(source.log_scale, slice_axis, start, stop)
-        return ScaledTensor(
-            _slice_input_value(source.value, slice_axis, start, stop),
-            log_scale,
-            source.scale_axis,
-        )
-
-    normalized_axis = normalize_axis(axis, len(source.shape))
-    slices = [slice(None)] * len(source.shape)
-    slices[normalized_axis] = slice(start, stop)
-    return source[tuple(slices)]
-
-
-def _reshape_input_value(value: Any, shape: Shape) -> Any:
-    if _is_torch_value(value):
-        return value.reshape(shape)
-    if _is_jax_value(value):
-        import jax.numpy as jnp
-
-        return jnp.reshape(value, shape)
-    return np.reshape(value, shape)
-
-
-def _contiguous_input_value(value: Any) -> Any:
-    if isinstance(value, ScaledTensor):
-        return ScaledTensor(
-            _contiguous_input_value(value.value),
-            _contiguous_input_value(value.log_scale),
-            value.scale_axis,
-        )
-    if _is_torch_value(value):
-        return value.contiguous()
-    if _is_jax_value(value):
-        return value
-    return np.ascontiguousarray(value)
-
-
-def _index_array_like(indices: np.ndarray, reference: Any | None) -> Any:
-    if isinstance(reference, ScaledTensor):
-        reference = reference.value
-    if reference is not None and _is_torch_value(reference):
-        import torch
-
-        return torch.as_tensor(indices, dtype=torch.long, device=reference.device)
-    if reference is not None and _is_jax_value(reference):
-        import jax.numpy as jnp
-
-        return jnp.asarray(indices)
-    return np.asarray(indices, dtype=np.int64)
-
-
-def _is_torch_value(value: Any) -> bool:
-    if isinstance(value, ScaledTensor):
-        value = value.value
-    return type(value).__module__.split(".", maxsplit=1)[0] == "torch"
-
-
-def _is_jax_value(value: Any) -> bool:
-    if isinstance(value, ScaledTensor):
-        value = value.value
-    return type(value).__module__.split(".", maxsplit=1)[0] in {"jax", "jaxlib"}
-
-
 def _program_from_ssa_path(
-    parsed: ParsedEinsum,
+    format_string: str,
     ssa_path: list[tuple[int, int]] | tuple[tuple[int, int], ...],
 ) -> Program:
     instructions: list[Instruction] = []
     for first, second, operator in to_annotated_ssa_path(
-        _format_einsum(parsed),
+        format_string,
         ssa_path,
         is_ascii=True,
     ):
         instructions.append(make_einsum_instruction(operator, first, second))
-
-    return Program(instructions=instructions, n_inputs=len(parsed.inputs))
+    index_strings, _ = parse_format_string(format_string)
+    return Program(instructions=instructions, n_inputs=len(index_strings))
 
 
 def to_annotated_ssa_path(

@@ -4,7 +4,12 @@ from typing import Callable, Generic, Literal, Protocol, TypeVar
 
 import torch
 
-from extended_einsum.format import TensorFormat
+from extended_einsum.format import (
+    DenseFormat,
+    DenseLogspaceFormat,
+    DenseScaledFormat,
+    TensorFormat,
+)
 from extended_einsum.language import Program
 
 Backend = Literal["torch", "numpy", "jax"]
@@ -31,46 +36,46 @@ class Array(Protocol):
 
 @dataclass(frozen=True)
 class DenseArray(Generic[TBackendArray]):
-    array: TBackendArray
+    backend_array: TBackendArray
     is_parameter: bool = False
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return tuple(self.array.shape)
+        return tuple(self.backend_array.shape)
 
     @property
     def format(self) -> TensorFormat:
-        return "dense"
+        return DenseFormat()
 
 
 @dataclass(frozen=True)
 class LogSpaceArray(Generic[TBackendArray]):
-    array: TBackendArray
+    backend_array: TBackendArray
     is_parameter: bool = False
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return tuple(self.array.shape)
+        return tuple(self.backend_array.shape)
 
     @property
     def format(self) -> TensorFormat:
-        return "dense_logspace"
+        return DenseLogspaceFormat()
 
 
 @dataclass(frozen=True)
 class ScaledArray(Generic[TBackendArray]):
-    array: TBackendArray
+    backend_array: TBackendArray
     log_scale: TBackendArray
     scale_axis: int
     is_parameter: bool = False
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return tuple(self.array.shape)
+        return tuple(self.backend_array.shape)
 
     @property
     def format(self) -> TensorFormat:
-        return "dense_scaled"
+        return DenseScaledFormat(axis=self.scale_axis)
 
 
 TArray = TypeVar("TArray", bound=Array)
@@ -172,5 +177,6 @@ class BackendFunctions(Generic[TBackendArray]):
 class BackendCompiler(Protocol[TBackendArray]):
     @staticmethod
     def compile(
-        program: Program, arguments: Sequence[TBackendArray]
+        program: Program,
+        arguments: Sequence[TBackendArray],
     ) -> Callable[[Sequence[TBackendArray]], TBackendArray]: ...

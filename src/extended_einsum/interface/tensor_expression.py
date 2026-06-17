@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Generic
 
 from extended_einsum.backend import BackendCompiler, TBackendArray, get_backend_of_array
@@ -38,8 +39,12 @@ from extended_einsum.shapes import (
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 
 
+@dataclass(frozen=True)
+class Parameter[TBackendArray]:
+    backend_array: TBackendArray
+
+
 class TensorExpression(Generic[TBackendArray]):
-    # TODO: make TBackendArray or TArray possible
     def __init__(
         self,
         interface_operator: InterfaceOperator,
