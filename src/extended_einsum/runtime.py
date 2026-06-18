@@ -28,6 +28,10 @@ def execute_operator(
         case "take":
             axis = instruction_specific_arguments[0]
             return backend.take(tensor_arguments[0], tensor_arguments[1], axis)
+        case "select":
+            axis = instruction_specific_arguments[0]
+            index = instruction_specific_arguments[1]
+            return backend.select(tensor_arguments[0], axis, index)
         case "slice":
             start = instruction_specific_arguments[0]
             stop = instruction_specific_arguments[1]

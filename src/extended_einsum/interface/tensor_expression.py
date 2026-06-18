@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Generic
 
-from extended_einsum.backend import BackendCompiler, TBackendArray, get_backend_of_array
+from extended_einsum.backend import (
+    Array,
+    TBackendArray,
+    # get_backend_of_array,
+)
+from extended_einsum.format import (
+    DenseFormat,
+    DenseLogspaceFormat,
+    DenseScaledFormat,
+    TensorFormat,
+)
 from extended_einsum.interface.operator import (
     InterfaceBinaryOperator,
     InterfaceEinsumOperator,
@@ -17,16 +27,17 @@ from extended_einsum.interface.operator import (
 )
 from extended_einsum.language import (
     Instruction,
-    Program,
     make_einsum_instruction,
+    make_select_instruction,
     make_slice_instruction,
     make_softmax_instruction,
     make_stack_instruction,
     make_take_instruction,
     map_instruction_arguments,
 )
-from extended_einsum.scale import ScaledTensor
+from extended_einsum.preprocess import RichProgram
 from extended_einsum.shapes import (
+    Shape,
     infer_binary_shape,
     infer_einsum_shape,
     infer_select_shape,
@@ -36,27 +47,44 @@ from extended_einsum.shapes import (
     infer_take_shape,
     infer_unary_shape,
 )
-from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 
 
 @dataclass(frozen=True)
 class Parameter[TBackendArray]:
     backend_array: TBackendArray
 
+    @property
+    def shape(self) -> Shape:
+        return tuple(self.backend_array.shape)  # pyright: ignore[reportAttributeAccessIssue]
+
 
 class TensorExpression(Generic[TBackendArray]):
     def __init__(
         self,
         interface_operator: InterfaceOperator,
-        arguments: list[TensorExpression[TBackendArray] | TBackendArray],
+        arguments: list[
+            TensorExpression[TBackendArray]
+            | Parameter[TBackendArray]
+            | Array[TBackendArray]
+            | TBackendArray
+        ],
         keyword_arguments: InterfaceOperator | None = None,
     ) -> None:
         self.interface_operator = interface_operator
         self.arguments = arguments
         self.keyword_arguments = keyword_arguments
+        # propagate shapes and formats
         self._shape = _propagate_shapes(
             interface_operator,
             [tuple(argument.shape) for argument in arguments],
+        )
+        argument_formats = [
+            argument.format if hasattr(argument, "format") else DenseFormat()  # pyright: ignore[reportAttributeAccessIssue]
+            for argument in arguments
+        ]
+        self.format = _propagate_tensor_format(
+            interface_operator,
+            argument_formats,
         )
         # check that the backends are consistent
         if len(arguments) == 0:
@@ -69,69 +97,105 @@ class TensorExpression(Generic[TBackendArray]):
                 )
 
     @property
-    def shape(self) -> tuple[int, ...]:
+    def shape(self) -> Shape:
         return self._shape
 
-    def materialize(self) -> TBackendArray:
-        program, arguments = compile(self)
-        compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[self.backend]
-        backend_code = compiler.compile(program, arguments)
-        return backend_code(arguments)
+    # def materialize(self) -> TBackendArray:
+    #     program, arguments = extract_program(self)
+    #     compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[
+    #         self.backend
+    #     ]
+    #     backend_code = compiler.compile(program, arguments)
+    #     return backend_code(arguments)
 
     def __add__(
-        self, other: TensorExpression[TBackendArray] | TBackendArray
+        self,
+        other: TensorExpression[TBackendArray]
+        | Parameter[TBackendArray]
+        | TBackendArray,
     ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("+"), [self, other])
 
     def __sub__(
-        self, other: TensorExpression[TBackendArray] | TBackendArray
+        self,
+        other: TensorExpression[TBackendArray]
+        | Parameter[TBackendArray]
+        | TBackendArray,
     ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("-"), [self, other])
 
     def __mul__(
-        self, other: TensorExpression[TBackendArray] | TBackendArray
+        self,
+        other: TensorExpression[TBackendArray]
+        | Parameter[TBackendArray]
+        | TBackendArray,
     ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("*"), [self, other])
 
     def __truediv__(
-        self, other: TensorExpression[TBackendArray] | TBackendArray
+        self,
+        other: TensorExpression[TBackendArray]
+        | Parameter[TBackendArray]
+        | TBackendArray,
     ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceBinaryOperator("/"), [self, other])
 
     def __matmul__(
-        self, other: TensorExpression[TBackendArray] | TBackendArray
+        self,
+        other: TensorExpression[TBackendArray]
+        | Parameter[TBackendArray]
+        | TBackendArray,
     ) -> TensorExpression[TBackendArray]:
         return TensorExpression(InterfaceEinsumOperator("ik, kj -> ij"), [self, other])
 
 
 def get_backend_of_argument(
     argument: TensorExpression[TBackendArray]
-    | ScaledTensor[TBackendArray]
+    | Parameter[TBackendArray]
     | TBackendArray,
 ) -> str:
     if isinstance(argument, TensorExpression):
         return argument.backend
-    if isinstance(argument, ScaledTensor):
-        return get_backend_of_array(argument.value)
+    if isinstance(argument, Parameter):
+        return get_backend_of_array(argument.backend_array)
     return get_backend_of_array(argument)
 
 
-def _compile_recursive(
+def _extract_program_recursive(
     tensor_expression: TensorExpression[TBackendArray] | TBackendArray,
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[Instruction],
-    input_tensors: list[Any],
+    input_tensors: list[TBackendArray | Parameter[TBackendArray]],
+    parameter_positions: list[int],
+    shapes: dict[int, Shape],
+    tensor_formats: dict[int, TensorFormat],
 ) -> int:
     # get a unique key for this expression
     expression_key = id(tensor_expression)
 
     # if the expression is a tensor, just add it to the inputs
     if not isinstance(tensor_expression, TensorExpression):
+        # if we already found this input, return its SSA-ID
         if expression_key in input_ssa_ids:
             return input_ssa_ids[expression_key]
+        # if not, continue counting left of 0
         input_ssa_ids[expression_key] = -1 - len(input_ssa_ids)
-        input_tensors.append(tensor_expression)
+        # add it to the list of inputs and maybe also add it to the list of parameters
+        if isinstance(tensor_expression, Parameter):
+            input_tensors.append(tensor_expression.backend_array)
+            parameter_positions.append(input_ssa_ids[expression_key])
+        elif hasattr(tensor_expression, "backend_array"):
+            input_tensors.append(tensor_expression.backend_array)  # pyright: ignore[reportAttributeAccessIssue]
+        else:
+            input_tensors.append(tensor_expression)
+        # add shape and format information
+        shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
+        tensor_formats[input_ssa_ids[expression_key]] = (
+            tensor_expression.format  # pyright: ignore[reportAttributeAccessIssue]
+            if hasattr(tensor_expression, "format")
+            else DenseFormat()
+        )
         return input_ssa_ids[expression_key]
 
     # if we have already seen this expression, return its SSA-ID
@@ -140,12 +204,15 @@ def _compile_recursive(
 
     # recursively compile the children first
     argument_ssa_ids = [
-        _compile_recursive(
+        _extract_program_recursive(
             argument,
             ssa_ids,
             input_ssa_ids,
             instructions,
-            input_tensors,
+            input_tensors,  # pyright: ignore[reportArgumentType]
+            parameter_positions,
+            shapes,
+            tensor_formats,
         )
         for argument in tensor_expression.arguments
     ]
@@ -179,46 +246,171 @@ def _compile_recursive(
                 )
             )
 
+        case InterfaceSelectOperator(axis, index):
+            instructions.append(
+                make_select_instruction(argument_ssa_ids[0], axis, index)
+            )
+
         case InterfaceUnaryOperator(operator):
             instructions.append((operator, tuple(argument_ssa_ids), ()))
 
         case InterfaceBinaryOperator(operator):
             instructions.append((operator, tuple(argument_ssa_ids), ()))
 
+    # add shape and format information
+    shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
+    tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
     return ssa_ids[expression_key]
 
 
-def compile(
+def extract_program(
     tensor_expression: TensorExpression[TBackendArray],
-) -> tuple[Program, list[Any]]:
+) -> tuple[RichProgram, list[Any]]:
     """Compiles a tensor expression into a program and a list of arguments."""
 
+    # extract information
     instructions: list[Instruction] = []
     ssa_ids: dict[int, int] = {}
     input_ssa_ids: dict[int, int] = {}
     input_tensors: list[Any] = []
-    _compile_recursive(
+    parameter_positions: list[int] = []
+    shapes: dict[int, Shape] = {}
+    tensor_formats: dict[int, TensorFormat] = {}
+    _extract_program_recursive(
         tensor_expression,
         ssa_ids,
         input_ssa_ids,
         instructions,
         input_tensors,
+        parameter_positions,
+        shapes,
+        tensor_formats,
     )
 
+    # shift some indices
     n_inputs = len(input_ssa_ids)
 
-    def shift_argument(old_argument: int) -> int:
-        return old_argument + n_inputs if old_argument >= 0 else -1 - old_argument
+    def shift_ssa_id(old_ssa_id: int) -> int:
+        return old_ssa_id + n_inputs if old_ssa_id >= 0 else -1 - old_ssa_id
 
     for i, instruction in enumerate(instructions):
-        instructions[i] = map_instruction_arguments(instruction, shift_argument)
-    return Program(instructions=instructions, n_inputs=n_inputs), input_tensors
+        instructions[i] = map_instruction_arguments(instruction, shift_ssa_id)
+
+    parameter_positions = [shift_ssa_id(position) for position in parameter_positions]
+    shapes = {shift_ssa_id(key): value for key, value in shapes.items()}
+    tensor_formats = {shift_ssa_id(key): value for key, value in tensor_formats.items()}
+    shapes_list: list[Shape] = [()] * n_inputs
+    for i, shape in shapes.items():
+        shapes_list[i] = shape
+    tensor_formats_list: list[TensorFormat] = [DenseFormat()] * n_inputs
+    for i, tensor_format in tensor_formats.items():
+        tensor_formats_list[i] = tensor_format
+
+    return RichProgram(
+        instructions=instructions,
+        n_inputs=n_inputs,
+        shapes=shapes_list,
+        tensor_formats=tensor_formats_list,
+        parameter_indices=parameter_positions,
+    ), input_tensors
+
+
+def _propagate_tensor_format(
+    interface_operator: InterfaceOperator, argument_formats: list[TensorFormat]
+) -> TensorFormat:
+    # find the argument signature
+    match interface_operator:
+        case InterfaceUnaryOperator(operator):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The {operator} operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case InterfaceBinaryOperator(operator):
+            if len(argument_formats) != 2:
+                raise ValueError(
+                    f"The {operator} operator takes exactly two arguments, but {len(argument_formats)} were given."
+                )
+            if argument_formats[0] != argument_formats[1]:
+                raise ValueError(
+                    f"The {operator} operator requires arguments with the same format, but {argument_formats[0]} and {argument_formats[1]} were given."
+                )
+            format_signature = [argument_formats[0], argument_formats[1]]
+
+        case InterfaceStackOperator(_):
+            if len(argument_formats) < 1:
+                raise ValueError(
+                    f"The stack operator requires at least one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+            if any(format != argument_formats[0] for format in argument_formats[1:]):
+                raise ValueError(
+                    f"The stack operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
+                )
+
+        case InterfaceTakeOperator(_):
+            if len(argument_formats) != 2:
+                raise ValueError(
+                    f"The take operator takes exactly two arguments, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0], argument_formats[1]]
+
+        case InterfaceSoftmaxOperator(_):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The softmax operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case InterfaceSliceOperator(_, _, _):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The slice operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case InterfaceEinsumOperator(_):
+            # TODO: this is a hack
+            format_signature = [argument_formats[0]]
+            if any(format != argument_formats[0] for format in argument_formats[1:]):
+                raise ValueError(
+                    f"The einsum operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
+                )
+
+        case InterfaceSelectOperator(_, _):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The select operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+    # decise the output format
+    match format_signature:
+        case [format]:
+            return format
+        case [DenseFormat(), DenseFormat()]:
+            return DenseFormat()
+        case [DenseScaledFormat(axis1), DenseScaledFormat(_)]:
+            return DenseScaledFormat(axis1)
+        case [DenseLogspaceFormat(), DenseLogspaceFormat()]:
+            return DenseLogspaceFormat()
+        case [DenseFormat(), DenseScaledFormat(axis)]:
+            return DenseScaledFormat(axis)
+        case [DenseScaledFormat(axis), DenseFormat()]:
+            return DenseScaledFormat(axis)
+        case [DenseLogspaceFormat(), DenseFormat()]:
+            return DenseLogspaceFormat()
+        case [DenseFormat(), DenseLogspaceFormat()]:
+            return DenseLogspaceFormat()
+        case _:
+            raise NotImplementedError()
 
 
 def _propagate_shapes(
     interface_operator: InterfaceOperator,
-    argument_shapes: list[tuple[int, ...]],
-) -> tuple[int, ...]:
+    argument_shapes: list[Shape],
+) -> Shape:
     """Propagates the shapes of tensors to the shape of the resulting tensor.
 
     Parameters

@@ -6,4 +6,4 @@ from .functions import softmax as softmax
 from .functions import stack as stack
 from .functions import take as take
 from .tensor_expression import TensorExpression as TensorExpression
-from .tensor_expression import compile as compile
+from .tensor_expression import extract_program as extract_program

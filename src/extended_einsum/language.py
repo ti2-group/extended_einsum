@@ -45,6 +45,10 @@ def make_take_instruction(operand_id: int, indices_id: int, axis: int) -> Instru
     return (TAKE_OPERATOR, (operand_id, indices_id), (axis,))
 
 
+def make_select_instruction(operand_id: int, axis: int, index: int) -> Instruction:
+    return (SELECT_OPERATOR, (operand_id,), (axis, index))
+
+
 def make_slice_instruction(
     operand_id: int, start: int, stop: int, axis: int
 ) -> Instruction:

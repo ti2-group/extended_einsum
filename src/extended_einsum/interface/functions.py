@@ -1,4 +1,4 @@
-from extended_einsum.backend import TArray, TBackendArray
+from extended_einsum.backend import Array, TBackendArray, TBackendArrayCovariant
 from extended_einsum.interface.operator import (
     InterfaceEinsumOperator,
     InterfaceSliceOperator,
@@ -11,26 +11,26 @@ from extended_einsum.interface.tensor_expression import Parameter, TensorExpress
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 
-def parameter(a: TBackendArray) -> Parameter[TBackendArray]:
+def parameter(a: TBackendArrayCovariant) -> Parameter[TBackendArrayCovariant]:
     return Parameter(a)
 
 
 def exp(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
+    a: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+) -> TensorExpression[TBackendArray]:
     return TensorExpression(InterfaceUnaryOperator("exp"), [a])
 
 
 def log(
-    a: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
+    a: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+) -> TensorExpression[TBackendArray]:
     return TensorExpression(InterfaceUnaryOperator("log"), [a])
 
 
 def einsum(
     format_string: str,
-    *operands: TensorExpression[TArray] | TArray,
-) -> TensorExpression[TArray]:
+    *operands: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+) -> TensorExpression[TBackendArray]:
     index_strings, output_string = parse_format_string(format_string)
     if len(index_strings) != len(operands):
         raise ValueError(
@@ -45,10 +45,12 @@ def einsum(
 
 
 def stack(
-    operands: list[TensorExpression[TArray] | TArray],
+    operands: list[
+        TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray
+    ],
     *,
     axis: int = 0,
-) -> TensorExpression[TArray]:
+) -> TensorExpression[TBackendArray]:
     axis = normalize_axis(axis, len(operands[0].shape))
     if len(operands) == 0:
         raise ValueError("stack requires at least one argument")
@@ -56,15 +58,15 @@ def stack(
         raise ValueError(
             "The stack operator requires all arguments to have the same shape along the stack axis."
         )
-    return TensorExpression(InterfaceStackOperator(axis), operands)
+    return TensorExpression(InterfaceStackOperator(axis), operands)  # pyright: ignore[reportArgumentType]
 
 
 def take(
-    source: TensorExpression[TArray] | TArray,
-    index: TensorExpression[TArray] | TArray,
+    source: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+    index: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
     *,
     axis: int = 0,
-) -> TensorExpression[TArray]:
+) -> TensorExpression[TBackendArray]:
     axis = normalize_axis(axis, len(source.shape))
     if not source.shape:
         raise ValueError("The take operator requires an operand with a leading axis.")
@@ -74,20 +76,20 @@ def take(
 
 
 def slice(
-    source: TensorExpression[TArray] | TArray,
+    source: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
     start: int,
     stop: int,
     *,
     axis: int = 0,
-) -> TensorExpression[TArray]:
+) -> TensorExpression[TBackendArray]:
     axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(InterfaceSliceOperator(start, stop, axis), [source])
 
 
 def softmax(
-    a: TensorExpression[TArray] | TArray,
+    a: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
     axis: int = 0,
-) -> TensorExpression[TArray]:
+) -> TensorExpression[TBackendArray]:
     """Applies the softmax function to the input tensor."""
 
     if not a.shape:

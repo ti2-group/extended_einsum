@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import permutations
-from typing import Any
+from typing import Any, Protocol, override
 
 import numpy as np
 
@@ -12,7 +12,7 @@ from extended_einsum.backend import (
     BackendFunctions,
     MultiFormatBackendFunctions,
     SingleFormatBackendFunctions,
-    TBackendArray,
+    TBackendArrayCovariant,
 )
 from extended_einsum.format import (
     DenseFormat,
@@ -56,7 +56,7 @@ from extended_einsum.shapes import (
     infer_take_shape,
     infer_unary_shape,
 )
-from extended_einsum.utils import parse_format_string
+from extended_einsum.utils import UnionFind, parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _MAX_REPLAN_PATH_ATTEMPTS = 3
@@ -66,7 +66,7 @@ AxisVar = tuple[str, int, int]
 
 def choose_single_format_backend_functions(
     argument_tensor_format: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArrayCovariant],
 ) -> SingleFormatBackendFunctions:
     match argument_tensor_format:
         case DenseFormat():
@@ -82,7 +82,7 @@ def choose_single_format_backend_functions(
 def choose_multi_format_backend_functions(
     tensor_format_1: TensorFormat,
     tensor_format_2: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArrayCovariant],
 ) -> MultiFormatBackendFunctions:
     match (tensor_format_1, tensor_format_2):
         case (DenseFormat(), DenseFormat()):
@@ -124,229 +124,45 @@ class RichProgram(Program):
                 f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
             )
 
-
-class PreparedInputs(tuple[Any, ...]):
-    index_input_ids: tuple[int, ...]
-    batched_input_ids: tuple[int, ...]
-
-    def __new__(
-        cls,
-        values: Sequence[Any] = (),
-        *,
-        index_input_ids: Sequence[int] = (),
-        batched_input_ids: Sequence[int] = (),
-    ) -> PreparedInputs:
-        prepared = super().__new__(cls, tuple(values))
-        prepared.index_input_ids = tuple(index_input_ids)
-        prepared.batched_input_ids = tuple(batched_input_ids)
-        return prepared
-
-    @property
-    def index_inputs(self) -> tuple[Any, ...]:
-        return tuple(self[input_id] for input_id in self.index_input_ids)
-
-    @property
-    def take_index_inputs(self) -> tuple[Any, ...]:
-        return self.index_inputs
-
-    @property
-    def batched_inputs(self) -> tuple[Any, ...]:
-        return tuple(self[input_id] for input_id in self.batched_input_ids)
+    def strip(self) -> Program:
+        return Program(self.instructions, self.n_inputs)
 
 
-PreprocessedProgram = tuple[Program, PreparedInputs]
+class PreprocessingRoutine(Protocol):
+    @staticmethod
+    def apply(program: RichProgram) -> RichProgram: ...
 
 
-@dataclass(frozen=True)
-class DynamicInputTransform:
-    input_id: int
-    prepared_input_id: int
-    program: Program
-    inputs: PreparedInputs
+class OptimizeContractionPaths(PreprocessingRoutine):
+    @override
+    @staticmethod
+    def apply(program: RichProgram) -> RichProgram:
+        einsum_ops = _valid_einsum_ops(program)
+        consumers = _result_consumers(program, program.n_inputs)
 
-
-@dataclass(frozen=True)
-class PreprocessedProgramWithDynamicInputTransforms:
-    program: Program
-    inputs: PreparedInputs
-    dynamic_input_transforms: tuple[DynamicInputTransform, ...]
-
-
-@dataclass(frozen=True)
-class _ScaleState:
-    axis: int
-
-
-ScaleState = _ScaleState | None
-ScaleAxisKey = tuple[int, int]
-
-
-@dataclass(frozen=True)
-class ParsedEinsum:
-    inputs: tuple[str, ...]
-    output: str
-
-
-@dataclass(frozen=True)
-class CanonicalEinsum:
-    signature: tuple[Any, ...]
-    operator: str
-    inputs: tuple[str, ...]
-    output: str
-    permutation: tuple[int, ...]
-    operand_shapes: list[Shape]
-    operand_scale_states: list[ScaleState]
-    output_shape: Shape
-    output_scale_axis: int | None
-
-
-@dataclass(frozen=True)
-class _Candidate:
-    op_index: int
-    result_id: int
-    depth: int
-    instruction: Instruction
-    arguments: tuple[int, ...]
-    dependencies: frozenset[int]
-    canonical: CanonicalEinsum
-
-
-@dataclass(frozen=True)
-class _ReplannedBlock:
-    op_indices: frozenset[int]
-    boundary_arguments: tuple[int, ...]
-    instructions: tuple[Instruction, ...]
-
-
-ScheduledEvent = int | tuple[_Candidate, ...]
-
-
-@dataclass(frozen=True)
-class _InputArgument:
-    input_id: int
-
-
-@dataclass(frozen=True)
-class _IndexInputArgument:
-    input_index: int
-
-
-@dataclass(frozen=True)
-class _ResultArgument:
-    instruction_index: int
-
-
-@dataclass(frozen=True)
-class _PendingDynamicInputTransform:
-    input_id: int
-    program: Program
-    inputs: PreparedInputs
-
-
-_RawArgument = _InputArgument | _IndexInputArgument | _ResultArgument
-_RawInstruction = tuple[Any, ...]
-
-
-@dataclass(frozen=True)
-class _EinsumOp:
-    instruction: Instruction
-    parsed: ParsedEinsum
-    operator: str
-    output_scale_axis: int | None
-
-
-@dataclass(frozen=True)
-class _TensorRef:
-    argument: _RawArgument
-
-
-@dataclass(frozen=True)
-class _SliceRef:
-    source: _RawArgument
-    index: int
-
-
-@dataclass(frozen=True)
-class _SliceRangeRef:
-    source: _RawArgument
-    axis: int
-    start: int
-    stop: int
-
-
-@dataclass(frozen=True)
-class _TakeRef:
-    source: _RawArgument
-    axis: int
-    index: int
-
-
-_TensorValueRef = _TensorRef | _SliceRef | _SliceRangeRef | _TakeRef
-
-
-class _UnionFind[T]:
-    def __init__(self) -> None:
-        self._parents: dict[T, T] = {}
-
-    def add(self, item: T) -> None:
-        self._parents.setdefault(item, item)
-
-    def find(self, item: T) -> T:
-        self.add(item)
-        parent = self._parents[item]
-        if parent != item:
-            parent = self.find(parent)
-            self._parents[item] = parent
-        return parent
-
-    def union(self, first: T, second: T) -> None:
-        first_root = self.find(first)
-        second_root = self.find(second)
-        if first_root != second_root:
-            self._parents[second_root] = first_root
-
-
-def preprocess_einsum_path(
-    format_string: str,
-    inputs: Sequence[Any],
-    path: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
-    *,
-    min_group_size: int = 2,
-    fold_softmax_operations: bool = True,
-    fold_same_depth_only: bool = False,
-    reorder_inputs: bool = True,
-    optimize_stacking: bool = True,
-    dynamic_input_ids: Sequence[int] = (),
-    return_dynamic_input_transforms: bool = False,
-) -> RichProgram:
-    """Lower an einsum path and return a rewritten program plus prepared inputs."""
-    input_tuple = tuple(inputs)
-    input_shapes = _input_shapes(input_tuple)
-    parsed = _parse_einsum(format_string)
-
-    if path is None:
-        from sesum import sr
-
-        path, _, _ = sr.compute_path(  # pyright: ignore[reportAssignmentType]
-            format_string,
-            *input_shapes,
-            is_linear=False,
+        accepted_blocks = _replanned_maximal_blocks(
+            program,
+            einsum_ops,
+            consumers,
+            minimize=minimize,
         )
-    assert path is not None
 
-    program = _program_from_ssa_path(format_string, path)
+        if not accepted_blocks:
+            return program
 
-    return fold_independent_einsums(
-        program,
-        input_tuple,
-        min_group_size=min_group_size,
-        fold_softmax_operations=fold_softmax_operations,
-        fold_same_depth_only=fold_same_depth_only,
-        reorder_inputs=reorder_inputs,
-        optimize_stacking=optimize_stacking,
-        dynamic_input_ids=dynamic_input_ids,
-        return_dynamic_input_transforms=return_dynamic_input_transforms,
-    )
+        return _rewrite_replanned_blocks(program, accepted_blocks)
+
+
+class FoldSameShapedOperations(PreprocessingRoutine):
+    @override
+    @staticmethod
+    def apply(program: RichProgram) -> RichProgram: ...
+
+
+class OptimizeMemoryLayout(PreprocessingRoutine):
+    @override
+    @staticmethod
+    def apply(program: RichProgram) -> RichProgram: ...
 
 
 def merge_replan_einsums(
@@ -728,9 +544,7 @@ def _infer_tensor_info(
 
 
 def _valid_einsum_ops(
-    program: Program,
-    shapes: tuple[Shape, ...],
-    scale_states: tuple[ScaleState, ...],
+    program: RichProgram,
 ) -> dict[int, _EinsumOp]:
     valid: dict[int, _EinsumOp] = {}
     for op_index, instruction in enumerate(program.instructions):
@@ -772,9 +586,8 @@ def _valid_einsum_ops(
 
 
 def _replanned_maximal_blocks(
-    program: Program,
-    shapes: tuple[Shape, ...],
-    einsum_ops: dict[int, _EinsumOp],
+    program: RichProgram,
+    format_strings: list[str],
     consumers: dict[int, list[tuple[int, int]]],
     *,
     minimize: str,
@@ -824,14 +637,12 @@ def _replanned_maximal_blocks(
 
         replanned = _build_replanned_block(
             program,
-            shapes,
             einsum_ops,
             component,
             sinks[0],
             minimize=minimize,
         )
-        if replanned is not None:
-            accepted_by_sink[sinks[0]] = replanned
+        accepted_by_sink[sinks[0]] = replanned
 
     return accepted_by_sink
 
@@ -854,69 +665,44 @@ def _external_output_ops(
 
 
 def _build_replanned_block(
-    program: Program,
-    shapes: tuple[Shape, ...],
-    einsum_ops: dict[int, _EinsumOp],
+    program: RichProgram,
+    format_strings: dict[int, str],
     block_ops: set[int],
     sink_op_index: int,
     *,
     minimize: str = "flops",
-) -> _ReplannedBlock | None:
-    merged = _build_merged_einsum(program, shapes, einsum_ops, block_ops, sink_op_index)
-    if merged is None:
-        return None
+) -> RichProgram:
+    merged = _build_merged_einsum(program, format_strings, block_ops, sink_op_index)
     merged_expression, boundary_arguments, boundary_shapes = merged
-    if len(boundary_arguments) < 2:
-        return None
 
-    original_size_log2 = _block_peak_size_log2(program, shapes, block_ops)
+    original_size_log2 = _block_peak_size_log2(program, block_ops)
     source_einsum_depths = _program_einsum_depths(program)
     original_einsum_depth = source_einsum_depths[program.n_inputs + sink_op_index]
 
+    from sesum import sr
+
     for _attempt in range(_MAX_REPLAN_PATH_ATTEMPTS):
-        try:
-            from sesum import sr
+        path: list[tuple[int, int]]
+        path, _flops_log10, planned_size_log2 = sr.compute_path(  # pyright: ignore[reportAssignmentType]
+            merged_expression,
+            *boundary_shapes,
+            minimize=minimize,
+            is_linear=False,
+            max_repeats=128,
+            skops_alpha=10,
+            seed=_attempt,
+        )
 
-            path: list[tuple[int, int]]
-            path, _flops_log10, planned_size_log2 = sr.compute_path(  # pyright: ignore[reportAssignmentType]
-                merged_expression,
-                *boundary_shapes,
-                minimize=minimize,
-                is_linear=False,
-                max_repeats=128,
-                skops_alpha=10,
-                seed=_attempt,
-            )
-        except Exception:
-            return None
+        annotated_path = to_annotated_ssa_path(
+            merged_expression,
+            path,
+            is_ascii=False,
+        )
+        instructions = tuple(
+            make_einsum_instruction(step_format, first, second)
+            for first, second, step_format in annotated_path
+        )
 
-        if planned_size_log2 > original_size_log2 + 1e-12:
-            return None
-
-        try:
-            annotated_path = to_annotated_ssa_path(
-                merged_expression,
-                path,
-                is_ascii=False,
-            )
-            sink_op = einsum_ops[sink_op_index]
-            instructions = tuple(
-                _planned_instruction_for_step(
-                    sink_op,
-                    step_format,
-                    first,
-                    second,
-                    is_final=step_index == len(annotated_path) - 1,
-                )
-                for step_index, (first, second, step_format) in enumerate(
-                    annotated_path
-                )
-            )
-        except ValueError:
-            return None
-
-        if not instructions:
-            return None
         planned_einsum_depth = _planned_einsum_output_depth(
             instructions,
             boundary_arguments,
@@ -931,7 +717,7 @@ def _build_replanned_block(
                 instructions=instructions,
             )
 
-    return None
+    return program
 
 
 def _program_einsum_depths(program: Program) -> tuple[int, ...]:
@@ -995,13 +781,12 @@ def _planned_instruction_for_step(
 
 
 def _build_merged_einsum(
-    program: Program,
-    shapes: tuple[Shape, ...],
-    einsum_ops: dict[int, _EinsumOp],
+    program: RichProgram,
+    format_strings: dict[int, str],
     block_ops: set[int],
     sink_op_index: int,
 ) -> tuple[str, tuple[int, ...], tuple[Shape, ...]] | None:
-    uf = _UnionFind()
+    uf = UnionFind()
     output_vars_by_tensor: dict[int, tuple[AxisVar, ...]] = {}
     boundary_position_by_occurrence: dict[tuple[int, int], int] = {}
     boundary_arguments: list[int] = []
@@ -1017,14 +802,12 @@ def _build_merged_einsum(
             boundary_arguments.append(tensor_id)
         return tuple(
             ("boundary", boundary_position, axis)
-            for axis in range(len(shapes[tensor_id]))
+            for axis in range(len(program.shapes[tensor_id]))
         )
 
     for op_index in sorted(block_ops):
-        parsed = einsum_ops[op_index].parsed
+        index_strings, output_string = parse_format_string(format_strings[op_index])
         arguments = get_arguments(program.instructions[op_index])
-        if len(parsed.inputs) != len(arguments):
-            return None
 
         input_vars: list[tuple[AxisVar, ...]] = []
         for argument_position, argument in enumerate(arguments):
@@ -1032,28 +815,22 @@ def _build_merged_einsum(
                 argument >= program.n_inputs
                 and argument - program.n_inputs in block_ops
             ):
-                argument_vars = output_vars_by_tensor.get(argument)
-                if argument_vars is None:
-                    return None
+                argument_vars = output_vars_by_tensor[argument]
             else:
                 argument_vars = boundary_vars(op_index, argument_position, argument)
             input_vars.append(argument_vars)
 
-        for subscript, argument_vars in zip(parsed.inputs, input_vars, strict=True):
-            if len(subscript) != len(argument_vars):
-                return None
-
         result_id = program.n_inputs + op_index
         output_vars = tuple(
-            ("output", op_index, axis) for axis in range(len(parsed.output))
+            ("output", op_index, axis) for axis in range(len(output_string))
         )
         output_vars_by_tensor[result_id] = output_vars
 
         label_representatives: dict[str, AxisVar] = {}
-        for subscript, argument_vars in zip(parsed.inputs, input_vars, strict=True):
-            for label, axis_var in zip(subscript, argument_vars, strict=True):
+        for index_string, argument_vars in zip(index_strings, input_vars, strict=True):
+            for label, axis_var in zip(index_string, argument_vars, strict=True):
                 _union_label_occurrence(uf, label_representatives, label, axis_var)
-        for label, axis_var in zip(parsed.output, output_vars, strict=True):
+        for label, axis_var in zip(output_string, output_vars, strict=True):
             _union_label_occurrence(uf, label_representatives, label, axis_var)
 
     sink_output_vars = output_vars_by_tensor.get(program.n_inputs + sink_op_index)
@@ -1063,38 +840,30 @@ def _build_merged_einsum(
     boundary_subscripts: list[str] = []
     label_by_root: dict[AxisVar, str] = {}
     for boundary_position, tensor_id in enumerate(boundary_arguments):
-        subscript = _labels_for_axis_vars(
+        index_string = _labels_for_axis_vars(
             tuple(
                 ("boundary", boundary_position, axis)
-                for axis in range(len(shapes[tensor_id]))
+                for axis in range(len(program.shapes[tensor_id]))
             ),
             uf,
             label_by_root,
         )
-        if subscript is None:
+        if index_string is None:
             return None
-        boundary_subscripts.append(subscript)
+        boundary_subscripts.append(index_string)
 
     output_subscript = _labels_for_axis_vars(sink_output_vars, uf, label_by_root)
     if output_subscript is None or len(set(output_subscript)) != len(output_subscript):
         return None
 
     expression = f"{','.join(boundary_subscripts)}->{output_subscript}"
-    boundary_shapes = tuple(shapes[argument] for argument in boundary_arguments)
-    parsed = _parse_einsum(expression)
-    if parsed is None:
-        return None
-    if (
-        _infer_einsum_output_shape(parsed, boundary_shapes)
-        != shapes[program.n_inputs + sink_op_index]
-    ):
-        return None
+    boundary_shapes = tuple(program.shapes[argument] for argument in boundary_arguments)
 
     return expression, tuple(boundary_arguments), boundary_shapes
 
 
 def _union_label_occurrence(
-    uf: _UnionFind,
+    uf: UnionFind[AxisVar],
     label_representatives: dict[str, AxisVar],
     label: str,
     axis_var: AxisVar,
@@ -1106,7 +875,7 @@ def _union_label_occurrence(
 
 def _labels_for_axis_vars(
     axis_vars: tuple[AxisVar, ...],
-    uf: _UnionFind,
+    uf: UnionFind[AxisVar],
     label_by_root: dict[AxisVar, str],
 ) -> str | None:
     labels: list[str] = []
@@ -1123,13 +892,12 @@ def _labels_for_axis_vars(
 
 
 def _block_peak_size_log2(
-    program: Program,
-    shapes: tuple[Shape, ...],
+    program: RichProgram,
     block_ops: set[int],
 ) -> float:
     peak_size = 0
     for op_index in block_ops:
-        shape = shapes[program.n_inputs + op_index]
+        shape = program.shapes[program.n_inputs + op_index]
         peak_size = max(peak_size, int(np.prod(shape, dtype=np.int64)))
     if peak_size <= 0:
         return float("-inf")
