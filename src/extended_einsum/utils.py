@@ -73,3 +73,25 @@ def normalize_axis(axis: int, rank: int) -> int:
     if normalized < 0 or normalized >= rank:
         raise ValueError(f"axis {axis} is out of bounds for rank {rank}")
     return normalized
+
+
+class UnionFind[T]:
+    def __init__(self) -> None:
+        self._parents: dict[T, T] = {}
+
+    def add(self, item: T) -> None:
+        self._parents.setdefault(item, item)
+
+    def find(self, item: T) -> T:
+        self.add(item)
+        parent = self._parents[item]
+        if parent != item:
+            parent = self.find(parent)
+            self._parents[item] = parent
+        return parent
+
+    def union(self, first: T, second: T) -> None:
+        first_root = self.find(first)
+        second_root = self.find(second)
+        if first_root != second_root:
+            self._parents[second_root] = first_root

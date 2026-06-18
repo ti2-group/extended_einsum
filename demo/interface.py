@@ -11,9 +11,9 @@ intermediate_2 = xe.log(intermediate_1)
 intermediate_3 = xe.exp(intermediate_1)
 result = intermediate_2 + intermediate_3
 
-program, inputs = xe.compile(result)
+program, inputs = xe.extract_program(result)
 print(program)
 
 einsum_expr = xe.einsum("ij,jk->ik", x, w)
-einsum_program, einsum_inputs = xe.compile(einsum_expr)
+einsum_program, einsum_inputs = xe.extract_program(einsum_expr)
 print(einsum_program)
