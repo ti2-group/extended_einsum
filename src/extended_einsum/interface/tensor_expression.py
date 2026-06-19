@@ -324,7 +324,7 @@ def extract_program(
     tensor_formats_list: list[TensorFormat] = [DenseFormat()] * n_inputs
     for i, tensor_format in tensor_formats.items():
         tensor_formats_list[i] = tensor_format
-    consumers_of_ssa_id_list = [[]] * n_inputs
+    consumers_of_ssa_id_list = [[] for _ in range(n_inputs + len(instructions))]
     for i, consumers in consumers_of_ssa_id.items():
         consumers_of_ssa_id_list[i] = consumers
 

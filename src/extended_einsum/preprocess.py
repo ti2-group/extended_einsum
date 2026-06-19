@@ -56,12 +56,9 @@ from extended_einsum.shapes import (
     infer_take_shape,
     infer_unary_shape,
 )
-from extended_einsum.utils import UnionFind, parse_format_string
+from extended_einsum.utils import parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-_MAX_REPLAN_PATH_ATTEMPTS = 3
-
-AxisVar = tuple[str, int, int]
 
 
 def choose_single_format_backend_functions(
@@ -135,24 +132,242 @@ class PreprocessingRoutine(Protocol):
     def apply(program: RichProgram) -> RichProgram: ...
 
 
+@dataclass(frozen=True)
+class _ConnectedEinsumComponent:
+    op_indices: frozenset[int]
+    sink_op_index: int
+    boundary_arguments: tuple[int, ...]
+    format_string: str
+
+
+def extract_connected_einsum_components(
+    program: RichProgram,
+) -> tuple[_ConnectedEinsumComponent, ...]:
+    """Find einsum components by walking from the program output to its inputs."""
+    components: list[_ConnectedEinsumComponent] = []
+    visited: set[int] = set()
+    pending_ssa_ids = [program.output_ssa]
+
+    # Walk the complete program from its output towards the inputs. Non-einsum
+    # operations separate components, but their arguments may lead to more components.
+    while pending_ssa_ids:
+        ssa_id = pending_ssa_ids.pop()
+        if ssa_id < program.n_inputs:
+            continue
+
+        op_index = ssa_id - program.n_inputs
+        if op_index in visited:
+            continue
+
+        instruction = program.instructions[op_index]
+        if get_operator(instruction) != EINSUM_OPERATOR:
+            visited.add(op_index)
+            pending_ssa_ids.extend(get_arguments(instruction))
+            continue
+
+        sink_op_index = op_index
+        _sink_inputs, sink_output = parse_format_string(
+            get_einsum_format_string(instruction)
+        )
+        next_label = 0
+
+        def new_label() -> str:
+            nonlocal next_label
+            label = chr(0x100 + next_label)
+            next_label += 1
+            return label
+
+        # Every queued einsum carries the component-wide labels that its output
+        # must use. This propagates consistent labels from consumers to producers.
+        relabeled_output = "".join(new_label() for _ in sink_output)
+        component: set[int] = set()
+        boundary_arguments: list[int] = []
+        boundary_strings: list[str] = []
+        pending_einsum_ops = [(op_index, relabeled_output)]
+        while pending_einsum_ops:
+            einsum_op_index, expected_output = pending_einsum_ops.pop()
+            if einsum_op_index in visited:
+                continue
+
+            visited.add(einsum_op_index)
+            component.add(einsum_op_index)
+            einsum_instruction = program.instructions[einsum_op_index]
+            input_strings, output_string = parse_format_string(
+                get_einsum_format_string(einsum_instruction)
+            )
+            label_map = dict(zip(output_string, expected_output, strict=True))
+
+            for argument, input_string in zip(
+                get_arguments(einsum_instruction), input_strings, strict=True
+            ):
+                # Preserve labels shared with the output and allocate labels for
+                # contraction indices that are first encountered at this operation.
+                relabeled_input_labels: list[str] = []
+                for label in input_string:
+                    if label not in label_map:
+                        label_map[label] = new_label()
+                    relabeled_input_labels.append(label_map[label])
+                relabeled_input = "".join(relabeled_input_labels)
+
+                if argument >= program.n_inputs:
+                    producer_op_index = argument - program.n_inputs
+                    producer = program.instructions[producer_op_index]
+                    # A uniquely consumed einsum producer belongs to this component.
+                    # Everything else is a boundary input and a new traversal root.
+                    if (
+                        get_operator(producer) == EINSUM_OPERATOR
+                        and len(program.consumers_of_ssa_id[argument]) == 1
+                    ):
+                        pending_einsum_ops.append((producer_op_index, relabeled_input))
+                        continue
+
+                boundary_arguments.append(argument)
+                boundary_strings.append(relabeled_input)
+                pending_ssa_ids.append(argument)
+
+        if len(component) >= 2:
+            components.append(
+                _ConnectedEinsumComponent(
+                    op_indices=frozenset(component),
+                    sink_op_index=sink_op_index,
+                    boundary_arguments=tuple(boundary_arguments),
+                    format_string=(f"{','.join(boundary_strings)}->{relabeled_output}"),
+                )
+            )
+
+    return tuple(components)
+
+
 class OptimizeContractionPaths(PreprocessingRoutine):
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
-        einsum_ops = _valid_einsum_ops(program)
-        consumers = _result_consumers(program, program.n_inputs)
+        # Compute a replacement contraction path for each extracted component.
+        blocks: dict[
+            int,
+            tuple[frozenset[int], tuple[int, ...], tuple[Instruction, ...]],
+        ] = {}
+        for component in extract_connected_einsum_components(program):
+            if len(component.boundary_arguments) < 2:
+                continue
 
-        accepted_blocks = _replanned_maximal_blocks(
-            program,
-            einsum_ops,
-            consumers,
-            minimize=minimize,
-        )
+            boundary_shapes = tuple(
+                program.shapes[argument] for argument in component.boundary_arguments
+            )
 
-        if not accepted_blocks:
+            from sesum import sr
+
+            try:
+                path, _flops, _size = sr.compute_path(
+                    component.format_string,
+                    *boundary_shapes,
+                    minimize="size",
+                    is_linear=False,
+                    max_repeats=128,
+                    skops_alpha=10,
+                )
+            except (RuntimeError, ValueError):
+                continue
+
+            planned_instructions = tuple(
+                make_einsum_instruction(step_format, first, second)
+                for first, second, step_format in to_annotated_ssa_path(
+                    component.format_string,
+                    path,
+                    is_ascii=True,
+                )
+            )
+            blocks[component.sink_op_index] = (
+                component.op_indices,
+                component.boundary_arguments,
+                planned_instructions,
+            )
+
+        if not blocks:
             return program
 
-        return _rewrite_replanned_blocks(program, accepted_blocks)
+        # Operations in a planned component are omitted from the old program and
+        # replaced by the new pairwise contractions when its sink is reached.
+        block_ops = {
+            op_index
+            for component, _arguments, _instructions in blocks.values()
+            for op_index in component
+        }
+        tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
+        instructions: list[Instruction] = []
+        shapes = program.shapes[: program.n_inputs]
+        tensor_formats = program.tensor_formats[: program.n_inputs]
+
+        # Rebuild in topological order while mapping every old SSA ID to the SSA ID
+        # of its value in the rewritten program.
+        for op_index, instruction in enumerate(program.instructions):
+            result_id = program.n_inputs + op_index
+            block = blocks.get(op_index)
+
+            if block is not None:
+                # Planned paths use local IDs: boundary inputs first, followed by
+                # intermediate results. Translate those IDs as instructions are added.
+                _component, boundary_arguments, planned_instructions = block
+                local_tensor_map = {
+                    local_id: tensor_map[argument]
+                    for local_id, argument in enumerate(boundary_arguments)
+                }
+                block_format = program.tensor_formats[result_id]
+                for step_index, planned_instruction in enumerate(planned_instructions):
+                    planned_arguments = get_arguments(planned_instruction)
+                    mapped_arguments = tuple(
+                        local_tensor_map[argument] for argument in planned_arguments
+                    )
+                    argument_map = dict(
+                        zip(planned_arguments, mapped_arguments, strict=True)
+                    )
+                    mapped_instruction = map_instruction_arguments(
+                        planned_instruction, argument_map.__getitem__
+                    )
+                    planned_result_id = program.n_inputs + len(instructions)
+                    instructions.append(mapped_instruction)
+                    shapes.append(
+                        infer_einsum_shape(
+                            get_einsum_format_string(mapped_instruction),
+                            [shapes[argument] for argument in mapped_arguments],
+                        )
+                    )
+                    tensor_formats.append(block_format)
+                    local_tensor_map[len(boundary_arguments) + step_index] = (
+                        planned_result_id
+                    )
+                tensor_map[result_id] = planned_result_id
+                continue
+
+            if op_index in block_ops:
+                continue
+
+            arguments = get_arguments(instruction)
+            argument_map = {argument: tensor_map[argument] for argument in arguments}
+            tensor_map[result_id] = program.n_inputs + len(instructions)
+            instructions.append(
+                map_instruction_arguments(instruction, argument_map.__getitem__)
+            )
+            shapes.append(program.shapes[result_id])
+            tensor_formats.append(program.tensor_formats[result_id])
+
+        # Consumer IDs depend on instruction positions, so regenerate them after
+        # the rewritten instruction order and SSA IDs are final.
+        consumers_of_ssa_id = [[] for _ in shapes]
+        for op_index, instruction in enumerate(instructions):
+            consumer_ssa_id = program.n_inputs + op_index
+            for argument in get_arguments(instruction):
+                consumers_of_ssa_id[argument].append(consumer_ssa_id)
+
+        return RichProgram(
+            instructions=instructions,
+            n_inputs=program.n_inputs,
+            stability=program.stability,
+            shapes=shapes,
+            tensor_formats=tensor_formats,
+            parameter_indices=program.parameter_indices,
+            consumers_of_ssa_id=consumers_of_ssa_id,
+        )
 
 
 class FoldSameShapedOperations(PreprocessingRoutine):
@@ -165,27 +380,6 @@ class OptimizeMemoryLayout(PreprocessingRoutine):
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram: ...
-
-
-def merge_replan_einsums(
-    program: Program,
-    inputs: Sequence[Any],
-    *,
-    minimize: str = "size",
-) -> PreprocessedProgram:
-    """Merge einsum-only regions, replan them, and return a rewritten program."""
-    input_tuple = tuple(inputs)
-    if program.n_inputs != len(input_tuple):
-        raise ValueError("program.n_inputs must match the number of provided inputs")
-    input_shapes = _input_shapes(input_tuple)
-    input_scale_states = _input_scale_states(input_tuple)
-    optimized_program = _merge_replan_einsums_by_shape(
-        program,
-        input_shapes,
-        input_scale_states,
-        minimize=minimize,
-    )
-    return optimized_program, PreparedInputs(input_tuple)
 
 
 def fold_independent_einsums(
@@ -483,485 +677,6 @@ def _fold_independent_einsums_by_shape(
         instructions=optimized,
         n_inputs=input_count + len(index_inputs),
     ), tuple(index_inputs)
-
-
-def _merge_replan_einsums_by_shape(
-    program: Program,
-    input_shapes: list[Shape],
-    input_scale_states: list[ScaleState],
-    *,
-    minimize: str,
-) -> Program:
-    try:
-        shapes, scale_states = _infer_tensor_info(
-            program,
-            input_shapes,
-            input_scale_states,
-        )
-    except ValueError:
-        return program
-
-    einsum_ops = _valid_einsum_ops(program, shapes, scale_states)
-    if not einsum_ops:
-        return program
-
-    consumers = _result_consumers(program, program.n_inputs)
-
-    accepted_blocks = _replanned_maximal_blocks(
-        program,
-        shapes,
-        einsum_ops,
-        consumers,
-        minimize=minimize,
-    )
-
-    if not accepted_blocks:
-        return program
-
-    return _rewrite_replanned_blocks(program, accepted_blocks)
-
-
-def _infer_tensor_info(
-    program: Program,
-    input_shapes: list[Shape],
-    input_scale_states: list[ScaleState],
-) -> tuple[tuple[Shape, ...], tuple[ScaleState, ...]]:
-    shapes = input_shapes.copy()
-    scale_states = list(input_scale_states)
-    for instruction in program.instructions:
-        arguments = get_arguments(instruction)
-        argument_shapes = [shapes[argument] for argument in arguments]
-        argument_scale_states = [scale_states[argument] for argument in arguments]
-        output_shape = _infer_instruction_shape(instruction, argument_shapes)
-        shapes.append(output_shape)
-        scale_states.append(
-            _infer_instruction_tensor_format(
-                instruction,
-                argument_scale_states,
-                output_shape,
-                argument_shapes,
-            )
-        )
-    return tuple(shapes), tuple(scale_states)
-
-
-def _valid_einsum_ops(
-    program: RichProgram,
-) -> dict[int, _EinsumOp]:
-    valid: dict[int, _EinsumOp] = {}
-    for op_index, instruction in enumerate(program.instructions):
-        operator = get_operator(instruction)
-        if operator != "einsum":
-            continue
-        try:
-            parsed = _parse_einsum(get_einsum_format_string(instruction))
-        except Exception:
-            continue
-        arguments = get_arguments(instruction)
-        if is_scaled_einsum_instruction(instruction) and not parsed.output:
-            continue
-        if (
-            is_normal_einsum_instruction(instruction)
-            or is_logspace_einsum_instruction(instruction)
-        ) and any(scale_states[argument] is not None for argument in arguments):
-            continue
-        operand_shapes: tuple[tuple[int, ...], ...] = tuple(
-            shapes[argument] for argument in arguments
-        )
-        if _infer_einsum_output_shape(parsed, operand_shapes) is None:
-            continue
-        output_scale_axis = (
-            normalize_axis(
-                scaled_einsum_output_axis(instruction),
-                len(parsed.output),
-            )
-            if is_scaled_einsum_instruction(instruction)
-            else None
-        )
-        valid[op_index] = _EinsumOp(
-            instruction=instruction,
-            parsed=parsed,
-            operator=operator,
-            output_scale_axis=output_scale_axis,
-        )
-    return valid
-
-
-def _replanned_maximal_blocks(
-    program: RichProgram,
-    format_strings: list[str],
-    consumers: dict[int, list[tuple[int, int]]],
-    *,
-    minimize: str,
-) -> dict[int, _ReplannedBlock]:
-    links: dict[int, set[int]] = {op_index: set() for op_index in einsum_ops}
-
-    for parent_op_index in sorted(einsum_ops):
-        parent_result_id = program.n_inputs + parent_op_index
-        result_consumers = consumers.get(parent_result_id, [])
-        if len(result_consumers) != 1:
-            continue
-
-        consumer_op_index, _argument_position = result_consumers[0]
-        if consumer_op_index not in einsum_ops:
-            continue
-        if (
-            einsum_ops[parent_op_index].operator
-            != einsum_ops[consumer_op_index].operator
-        ):
-            continue
-
-        links[parent_op_index].add(consumer_op_index)
-        links[consumer_op_index].add(parent_op_index)
-
-    accepted_by_sink: dict[int, _ReplannedBlock] = {}
-    visited: set[int] = set()
-    for seed_op_index in sorted(einsum_ops):
-        if seed_op_index in visited:
-            continue
-
-        component: set[int] = set()
-        pending = [seed_op_index]
-        while pending:
-            op_index = pending.pop()
-            if op_index in component:
-                continue
-            component.add(op_index)
-            pending.extend(sorted(links[op_index] - component, reverse=True))
-
-        visited.update(component)
-        if len(component) < 2:
-            continue
-
-        sinks = _external_output_ops(program, component, consumers)
-        if len(sinks) != 1:
-            continue
-
-        replanned = _build_replanned_block(
-            program,
-            einsum_ops,
-            component,
-            sinks[0],
-            minimize=minimize,
-        )
-        accepted_by_sink[sinks[0]] = replanned
-
-    return accepted_by_sink
-
-
-def _external_output_ops(
-    program: Program,
-    block_ops: set[int],
-    consumers: dict[int, list[tuple[int, int]]],
-) -> list[int]:
-    output_op_indices: list[int] = []
-    for op_index in sorted(block_ops):
-        result_id = program.n_inputs + op_index
-        has_external_consumer = any(
-            consumer_op_index not in block_ops
-            for consumer_op_index, _argument_position in consumers.get(result_id, [])
-        )
-        if result_id == program.output_ssa or has_external_consumer:
-            output_op_indices.append(op_index)
-    return output_op_indices
-
-
-def _build_replanned_block(
-    program: RichProgram,
-    format_strings: dict[int, str],
-    block_ops: set[int],
-    sink_op_index: int,
-    *,
-    minimize: str = "flops",
-) -> RichProgram:
-    merged = _build_merged_einsum(program, format_strings, block_ops, sink_op_index)
-    merged_expression, boundary_arguments, boundary_shapes = merged
-
-    original_size_log2 = _block_peak_size_log2(program, block_ops)
-    source_einsum_depths = _program_einsum_depths(program)
-    original_einsum_depth = source_einsum_depths[program.n_inputs + sink_op_index]
-
-    from sesum import sr
-
-    for _attempt in range(_MAX_REPLAN_PATH_ATTEMPTS):
-        path: list[tuple[int, int]]
-        path, _flops_log10, planned_size_log2 = sr.compute_path(  # pyright: ignore[reportAssignmentType]
-            merged_expression,
-            *boundary_shapes,
-            minimize=minimize,
-            is_linear=False,
-            max_repeats=128,
-            skops_alpha=10,
-            seed=_attempt,
-        )
-
-        annotated_path = to_annotated_ssa_path(
-            merged_expression,
-            path,
-            is_ascii=False,
-        )
-        instructions = tuple(
-            make_einsum_instruction(step_format, first, second)
-            for first, second, step_format in annotated_path
-        )
-
-        planned_einsum_depth = _planned_einsum_output_depth(
-            instructions,
-            boundary_arguments,
-            source_einsum_depths,
-        )
-        if planned_einsum_depth <= original_einsum_depth or (
-            _attempt == _MAX_REPLAN_PATH_ATTEMPTS - 1
-        ):
-            return _ReplannedBlock(
-                op_indices=frozenset(block_ops),
-                boundary_arguments=boundary_arguments,
-                instructions=instructions,
-            )
-
-    return program
-
-
-def _program_einsum_depths(program: Program) -> tuple[int, ...]:
-    depths = [0] * program.n_inputs
-    for instruction in program.instructions:
-        arguments = get_arguments(instruction)
-        argument_depth = max((depths[argument] for argument in arguments), default=0)
-        depths.append(argument_depth + int(get_operator(instruction) == "einsum"))
-    return tuple(depths)
-
-
-def _planned_einsum_output_depth(
-    instructions: tuple[Instruction, ...],
-    boundary_arguments: tuple[int, ...],
-    source_depths: tuple[int, ...],
-) -> int:
-    local_depths = [source_depths[argument] for argument in boundary_arguments]
-    for instruction in instructions:
-        arguments = get_arguments(instruction)
-        argument_depth = max(
-            (local_depths[argument] for argument in arguments),
-            default=0,
-        )
-        local_depths.append(argument_depth + int(get_operator(instruction) == "einsum"))
-    return local_depths[-1]
-
-
-def _planned_instruction_for_step(
-    sink_op: _EinsumOp,
-    step_format: str,
-    first: int,
-    second: int,
-    *,
-    is_final: bool,
-) -> Instruction:
-    if sink_op.operator == EINSUM_OPERATOR:
-        return make_einsum_instruction(step_format, first, second)
-    if sink_op.operator == LSE_SUM_EINSUM_OPERATOR:
-        return make_logspace_einsum_instruction(
-            step_format,
-            first,
-            second,
-        )
-    if sink_op.operator in SCALED_EINSUM_OPERATORS:
-        parsed = _parse_einsum(step_format)
-        if parsed is None or not parsed.output:
-            raise ValueError("scaled replanning requires non-scalar pairwise outputs")
-        output_axis = (
-            sink_op.output_scale_axis
-            if is_final and sink_op.output_scale_axis is not None
-            else len(parsed.output) - 1
-        )
-        return make_scaled_einsum_instruction(
-            sink_op.operator,
-            step_format,
-            first,
-            second,
-            output_axis,
-        )
-    raise ValueError(f"unsupported replanned einsum operator: {sink_op.operator!r}")
-
-
-def _build_merged_einsum(
-    program: RichProgram,
-    format_strings: dict[int, str],
-    block_ops: set[int],
-    sink_op_index: int,
-) -> tuple[str, tuple[int, ...], tuple[Shape, ...]] | None:
-    uf = UnionFind()
-    output_vars_by_tensor: dict[int, tuple[AxisVar, ...]] = {}
-    boundary_position_by_occurrence: dict[tuple[int, int], int] = {}
-    boundary_arguments: list[int] = []
-
-    def boundary_vars(
-        op_index: int, argument_position: int, tensor_id: int
-    ) -> tuple[AxisVar, ...]:
-        occurrence = (op_index, argument_position)
-        boundary_position = boundary_position_by_occurrence.get(occurrence)
-        if boundary_position is None:
-            boundary_position = len(boundary_arguments)
-            boundary_position_by_occurrence[occurrence] = boundary_position
-            boundary_arguments.append(tensor_id)
-        return tuple(
-            ("boundary", boundary_position, axis)
-            for axis in range(len(program.shapes[tensor_id]))
-        )
-
-    for op_index in sorted(block_ops):
-        index_strings, output_string = parse_format_string(format_strings[op_index])
-        arguments = get_arguments(program.instructions[op_index])
-
-        input_vars: list[tuple[AxisVar, ...]] = []
-        for argument_position, argument in enumerate(arguments):
-            if (
-                argument >= program.n_inputs
-                and argument - program.n_inputs in block_ops
-            ):
-                argument_vars = output_vars_by_tensor[argument]
-            else:
-                argument_vars = boundary_vars(op_index, argument_position, argument)
-            input_vars.append(argument_vars)
-
-        result_id = program.n_inputs + op_index
-        output_vars = tuple(
-            ("output", op_index, axis) for axis in range(len(output_string))
-        )
-        output_vars_by_tensor[result_id] = output_vars
-
-        label_representatives: dict[str, AxisVar] = {}
-        for index_string, argument_vars in zip(index_strings, input_vars, strict=True):
-            for label, axis_var in zip(index_string, argument_vars, strict=True):
-                _union_label_occurrence(uf, label_representatives, label, axis_var)
-        for label, axis_var in zip(output_string, output_vars, strict=True):
-            _union_label_occurrence(uf, label_representatives, label, axis_var)
-
-    sink_output_vars = output_vars_by_tensor.get(program.n_inputs + sink_op_index)
-    if sink_output_vars is None:
-        return None
-
-    boundary_subscripts: list[str] = []
-    label_by_root: dict[AxisVar, str] = {}
-    for boundary_position, tensor_id in enumerate(boundary_arguments):
-        index_string = _labels_for_axis_vars(
-            tuple(
-                ("boundary", boundary_position, axis)
-                for axis in range(len(program.shapes[tensor_id]))
-            ),
-            uf,
-            label_by_root,
-        )
-        if index_string is None:
-            return None
-        boundary_subscripts.append(index_string)
-
-    output_subscript = _labels_for_axis_vars(sink_output_vars, uf, label_by_root)
-    if output_subscript is None or len(set(output_subscript)) != len(output_subscript):
-        return None
-
-    expression = f"{','.join(boundary_subscripts)}->{output_subscript}"
-    boundary_shapes = tuple(program.shapes[argument] for argument in boundary_arguments)
-
-    return expression, tuple(boundary_arguments), boundary_shapes
-
-
-def _union_label_occurrence(
-    uf: UnionFind[AxisVar],
-    label_representatives: dict[str, AxisVar],
-    label: str,
-    axis_var: AxisVar,
-) -> None:
-    uf.add(axis_var)
-    representative = label_representatives.setdefault(label, axis_var)
-    uf.union(representative, axis_var)
-
-
-def _labels_for_axis_vars(
-    axis_vars: tuple[AxisVar, ...],
-    uf: UnionFind[AxisVar],
-    label_by_root: dict[AxisVar, str],
-) -> str | None:
-    labels: list[str] = []
-    for axis_var in axis_vars:
-        root = uf.find(axis_var)
-        label = label_by_root.get(root)
-        if label is None:
-            if len(label_by_root) == len(_LABELS):
-                return None
-            label = _LABELS[len(label_by_root)]
-            label_by_root[root] = label
-        labels.append(label)
-    return "".join(labels)
-
-
-def _block_peak_size_log2(
-    program: RichProgram,
-    block_ops: set[int],
-) -> float:
-    peak_size = 0
-    for op_index in block_ops:
-        shape = program.shapes[program.n_inputs + op_index]
-        peak_size = max(peak_size, int(np.prod(shape, dtype=np.int64)))
-    if peak_size <= 0:
-        return float("-inf")
-    return float(np.log2(peak_size))
-
-
-def _rewrite_replanned_blocks(
-    program: Program,
-    accepted_by_sink: dict[int, _ReplannedBlock],
-) -> Program:
-    block_ops = {
-        op_index for block in accepted_by_sink.values() for op_index in block.op_indices
-    }
-    tensor_map: dict[int, int] = {
-        input_id: input_id for input_id in range(program.n_inputs)
-    }
-    instructions: list[Instruction] = []
-
-    def append_instruction(instruction: Instruction) -> int:
-        result_id = program.n_inputs + len(instructions)
-        instructions.append(instruction)
-        return result_id
-
-    for op_index, instruction in enumerate(program.instructions):
-        arguments = get_arguments(instruction)
-        block = accepted_by_sink.get(op_index)
-        result_id = program.n_inputs + op_index
-
-        if block is not None:
-            local_tensor_map: dict[int, int] = {
-                local_id: tensor_map[argument]
-                for local_id, argument in enumerate(block.boundary_arguments)
-            }
-            for step_index, planned_instruction in enumerate(block.instructions):
-                planned_arguments = get_arguments(planned_instruction)
-                mapped_arguments = tuple(
-                    local_tensor_map[argument] for argument in planned_arguments
-                )
-                argument_map = dict(
-                    zip(planned_arguments, mapped_arguments, strict=True)
-                )
-                planned_result_id = append_instruction(
-                    map_instruction_arguments(
-                        planned_instruction, argument_map.__getitem__
-                    )
-                )
-                local_tensor_map[len(block.boundary_arguments) + step_index] = (
-                    planned_result_id
-                )
-            tensor_map[result_id] = planned_result_id
-            continue
-
-        if op_index in block_ops:
-            continue
-
-        mapped_arguments = tuple(tensor_map[argument] for argument in arguments)
-        argument_map = dict(zip(arguments, mapped_arguments, strict=True))
-        tensor_map[result_id] = append_instruction(
-            map_instruction_arguments(instruction, argument_map.__getitem__)
-        )
-
-    return Program(instructions=instructions, n_inputs=program.n_inputs)
 
 
 def _input_shapes(inputs: tuple[Any, ...]) -> list[Shape]:
