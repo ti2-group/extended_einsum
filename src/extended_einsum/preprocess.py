@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import permutations
-from typing import Any, Protocol, override
+from typing import Any, Literal, Protocol, override
 
 import numpy as np
 
@@ -108,6 +108,7 @@ class RichProgram(Program):
     instructions: list[Instruction]
     n_inputs: int
 
+    stability: Literal["none", "scaled", "logspace"]
     shapes: list[Shape]
     tensor_formats: list[TensorFormat]
     parameter_indices: list[int]
