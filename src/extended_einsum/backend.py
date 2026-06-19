@@ -2,6 +2,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable, Generic, Literal, Protocol, TypeVar, override
 
+import jax
+import numpy as np
 import torch
 
 from extended_einsum.format import (
@@ -18,6 +20,18 @@ Backend = Literal["torch", "numpy", "jax"]
 class BackendArray(Protocol):
     @property
     def shape(self) -> tuple[int, ...] | torch.Size: ...
+
+
+def get_backend_of_array(array: BackendArray) -> Backend:
+    match array:
+        case np.ndarray:
+            return "numpy"
+        case torch.Tensor:
+            return "torch"
+        case jax.Array:
+            return "jax"
+        case _:
+            raise NotImplementedError("Unsupported backend array type")
 
 
 TBackendArrayCovariant = TypeVar(

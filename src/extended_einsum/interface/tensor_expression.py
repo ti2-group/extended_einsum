@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Generic
+from typing import Any, Generic, Literal
 
 from extended_einsum.backend import (
     Array,
+    BackendCompiler,
     TBackendArray,
-    # get_backend_of_array,
+    get_backend_of_array,
 )
 from extended_einsum.format import (
     DenseFormat,
@@ -47,6 +48,7 @@ from extended_einsum.shapes import (
     infer_take_shape,
     infer_unary_shape,
 )
+from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 
 
 @dataclass(frozen=True)
@@ -100,13 +102,15 @@ class TensorExpression(Generic[TBackendArray]):
     def shape(self) -> Shape:
         return self._shape
 
-    # def materialize(self) -> TBackendArray:
-    #     program, arguments = extract_program(self)
-    #     compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[
-    #         self.backend
-    #     ]
-    #     backend_code = compiler.compile(program, arguments)
-    #     return backend_code(arguments)
+    def materialize(
+        self, stability: Literal["none", "scaled", "logspace"] = "none"
+    ) -> TBackendArray:
+        program, arguments = extract_program(self, stability)
+        compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[self.backend]
+        # TODO: the specific backend implementations should be clear after preprocessing. also we need to preprocess here
+        backend_implementations = ...
+        backend_code = compiler.compile(program, arguments, backend_implementations)
+        return backend_code(arguments)
 
     def __add__(
         self,
@@ -265,6 +269,7 @@ def _extract_program_recursive(
 
 def extract_program(
     tensor_expression: TensorExpression[TBackendArray],
+    stability: Literal["none", "scaled", "logspace"] = "none",
 ) -> tuple[RichProgram, list[Any]]:
     """Compiles a tensor expression into a program and a list of arguments."""
 
@@ -309,6 +314,7 @@ def extract_program(
     return RichProgram(
         instructions=instructions,
         n_inputs=n_inputs,
+        stability=stability,
         shapes=shapes_list,
         tensor_formats=tensor_formats_list,
         parameter_indices=parameter_positions,
