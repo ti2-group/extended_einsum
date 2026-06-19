@@ -112,6 +112,7 @@ class RichProgram(Program):
     shapes: list[Shape]
     tensor_formats: list[TensorFormat]
     parameter_indices: list[int]
+    consumers_of_ssa_id: list[list[int]]
 
     def __post_init__(self) -> None:
         n_ssa_ids = self.n_inputs + len(self.instructions)

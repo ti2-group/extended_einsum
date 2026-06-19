@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Generic, Literal
 
@@ -174,6 +175,7 @@ def _extract_program_recursive(
     parameter_positions: list[int],
     shapes: dict[int, Shape],
     tensor_formats: dict[int, TensorFormat],
+    consumers_of_ssa_id: dict[int, list[int]],
 ) -> int:
     # get a unique key for this expression
     expression_key = id(tensor_expression)
@@ -217,6 +219,7 @@ def _extract_program_recursive(
             parameter_positions,
             shapes,
             tensor_formats,
+            consumers_of_ssa_id,
         )
         for argument in tensor_expression.arguments
     ]
@@ -264,6 +267,9 @@ def _extract_program_recursive(
     # add shape and format information
     shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
     tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
+    # add this expression as a consumer of all its arguments
+    for argument_ssa_id in argument_ssa_ids:
+        consumers_of_ssa_id[argument_ssa_id].append(input_ssa_ids[expression_key])
     return ssa_ids[expression_key]
 
 
@@ -281,6 +287,7 @@ def extract_program(
     parameter_positions: list[int] = []
     shapes: dict[int, Shape] = {}
     tensor_formats: dict[int, TensorFormat] = {}
+    consumers_of_ssa_id: dict[int, list[int]] = defaultdict(list)
     _extract_program_recursive(
         tensor_expression,
         ssa_ids,
@@ -290,35 +297,49 @@ def extract_program(
         parameter_positions,
         shapes,
         tensor_formats,
+        consumers_of_ssa_id,
     )
 
-    # shift some indices
+    # prepare shifting ssa ids
     n_inputs = len(input_ssa_ids)
 
     def shift_ssa_id(old_ssa_id: int) -> int:
         return old_ssa_id + n_inputs if old_ssa_id >= 0 else -1 - old_ssa_id
 
+    # shift ssa ids
     for i, instruction in enumerate(instructions):
         instructions[i] = map_instruction_arguments(instruction, shift_ssa_id)
-
     parameter_positions = [shift_ssa_id(position) for position in parameter_positions]
     shapes = {shift_ssa_id(key): value for key, value in shapes.items()}
     tensor_formats = {shift_ssa_id(key): value for key, value in tensor_formats.items()}
+    consumers_of_ssa_id = {
+        shift_ssa_id(argument): [shift_ssa_id(consumer) for consumer in value]
+        for argument, value in consumers_of_ssa_id.items()
+    }
+
+    # turn dicts into lists
     shapes_list: list[Shape] = [()] * n_inputs
     for i, shape in shapes.items():
         shapes_list[i] = shape
     tensor_formats_list: list[TensorFormat] = [DenseFormat()] * n_inputs
     for i, tensor_format in tensor_formats.items():
         tensor_formats_list[i] = tensor_format
+    consumers_of_ssa_id_list = [[]] * n_inputs
+    for i, consumers in consumers_of_ssa_id.items():
+        consumers_of_ssa_id_list[i] = consumers
 
-    return RichProgram(
-        instructions=instructions,
-        n_inputs=n_inputs,
-        stability=stability,
-        shapes=shapes_list,
-        tensor_formats=tensor_formats_list,
-        parameter_indices=parameter_positions,
-    ), input_tensors
+    return (
+        RichProgram(
+            instructions=instructions,
+            n_inputs=n_inputs,
+            stability=stability,
+            shapes=shapes_list,
+            tensor_formats=tensor_formats_list,
+            parameter_indices=parameter_positions,
+            consumers_of_ssa_id=consumers_of_ssa_id_list,
+        ),
+        input_tensors,
+    )
 
 
 def _propagate_tensor_format(
