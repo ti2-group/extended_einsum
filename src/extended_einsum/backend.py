@@ -5,8 +5,6 @@ import jax
 import numpy as np
 import torch
 
-from extended_einsum.language import Program
-
 Backend = Literal["torch", "numpy", "jax"]
 
 
