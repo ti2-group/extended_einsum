@@ -7,6 +7,7 @@ EinsumOperator = Literal["einsum"]
 StackOperator = Literal["stack"]
 TakeOperator = Literal["take"]
 SliceOperator = Literal["slice"]
+SelectOperator = Literal["select"]
 SoftmaxOperator = Literal["softmax"]
 
 OperatorName = (
@@ -16,6 +17,7 @@ OperatorName = (
     | StackOperator
     | TakeOperator
     | SliceOperator
+    | SelectOperator
     | SoftmaxOperator
 )
 
@@ -30,7 +32,11 @@ class Operator(Protocol):
     @property
     def raw_extra_arguments(self) -> tuple[Any, ...]: ...
 
-    def check_inputs(self, operands: list[Any]) -> bool: ...
+    def check_inputs(self, operands: list[Any]) -> None: ...
+
+    def propagate_shapes(
+        self, input_shapes: list[tuple[int, ...]]
+    ) -> tuple[int, ...]: ...
 
     def to_instruction(self, operand_ids: tuple[int, ...]) -> RawInstruction:
         return (self.name, operand_ids, self.raw_extra_arguments)
