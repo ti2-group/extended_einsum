@@ -1,10 +1,9 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Literal
 
 from extended_einsum.language.core import ArgumentSSAIds, RawProgram
 from extended_einsum.language.rich_operators import RichOperator
-from extended_einsum.language.types import Shape, TensorFormat
+from extended_einsum.language.types import Shape, StabilityMode, TensorFormat
 
 RichInstruction = tuple[RichOperator, ArgumentSSAIds]
 
@@ -13,7 +12,7 @@ RichInstruction = tuple[RichOperator, ArgumentSSAIds]
 class RichProgram:
     instructions: list[RichInstruction]
     n_inputs: int
-    stability_mode: Literal["none", "scaled", "logspace"]
+    stability_mode: StabilityMode
 
     tensor_formats: list[TensorFormat]
     shapes: list[Shape]

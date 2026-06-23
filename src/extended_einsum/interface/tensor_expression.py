@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Generic
+from typing import Callable, Generic, Protocol, TypeVar
 
-from extended_einsum.backend import BackendCompiler, TArray
+from extended_einsum.backend import BackendCompiler, HasBackend
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
     OperatorDivide,
@@ -12,8 +12,14 @@ from extended_einsum.language.rich_operators import (
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichInstruction, RichProgram
-from extended_einsum.language.types import Shape
+from extended_einsum.language.types import HasShape, Shape, StabilityMode, TensorFormat
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
+
+
+class Array(HasShape, HasBackend, Protocol): ...
+
+
+TArray = TypeVar("TArray", bound=Array)
 
 
 @dataclass(frozen=True)
@@ -58,14 +64,11 @@ class TensorExpression(Generic[TBackendArray]):
     def shape(self) -> Shape:
         return self._shape
 
-    def materialize(
-        self, stability: Literal["none", "scaled", "logspace"] = "none"
-    ) -> TBackendArray:
-        program, arguments = extract_program(self, stability)
-        compiler: BackendCompiler[TBackendArray] = BACKEND_TO_COMPILER[self.backend]
-        # TODO: the specific backend implementations should be clear after preprocessing. also we need to preprocess here
-        backend_implementations = ...
-        backend_code = compiler.compile(program, arguments, backend_implementations)
+    def materialize(self, stability_mode: StabilityMode) -> TArray:
+        rich_program, arguments = compile(self, stability_mode)
+        raw_program = rich_program.to_raw_program()
+        compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
+        backend_code = compiler.compile(raw_program, arguments)
         return backend_code(arguments)
 
     def __add__(
@@ -104,7 +107,10 @@ def _extract_program_recursive(
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[RichInstruction],
-    input_tensors: list[Any],
+    input_tensors: list[TArray],
+    parameter_positions: list[int],
+    shapes: dict[int, Shape],
+    tensor_formats: dict[int, TensorFormat],
 ) -> int:
     # get a unique key for this expression
     expression_key = id(tensor_expression)
@@ -144,11 +150,10 @@ def _extract_program_recursive(
             ssa_ids,
             input_ssa_ids,
             instructions,
-            input_tensors,  # pyright: ignore[reportArgumentType]
+            input_tensors,
             parameter_positions,
             shapes,
             tensor_formats,
-            consumers_of_ssa_id,
         )
         for argument in tensor_expression.arguments
     )
@@ -175,18 +180,31 @@ def _map_instruction_arguments(
 
 def compile(
     tensor_expression: TensorExpression[TArray],
-) -> tuple[RichProgram, list[Any]]:
-    """Compiles a tensor expression into a program and a list of arguments."""
+    stability_mode: StabilityMode,
+) -> tuple[RichProgram, list[TArray]]:
+    """Compiles a tensor expression into a rich program and a list of arguments.
+
+    Parameters
+    ----------
+    tensor_expression : TensorExpression[TArray]
+        Root of the tensor expression to be compiled.
+    stability_mode : StabilityMode
+        The stability mode to be used for the compiled program.
+
+    Returns
+    -------
+    tuple[RichProgram, list[TArray]]
+        A tuple containing the compiled rich program and a list of arguments.
+    """
 
     instructions: list[RichInstruction] = []
     ssa_ids: dict[int, int] = {}
     input_ssa_ids: dict[int, int] = {}
-    input_tensors: list[Any] = []
+    input_tensors: list[TArray] = []
     parameter_positions: list[int] = []
     shapes: dict[int, Shape] = {}
     tensor_formats: dict[int, TensorFormat] = {}
-    consumers_of_ssa_id: dict[int, list[int]] = defaultdict(list)
-    _extract_program_recursive(
+    _compile_recursive(
         tensor_expression,
         ssa_ids,
         input_ssa_ids,
@@ -195,7 +213,6 @@ def compile(
         parameter_positions,
         shapes,
         tensor_formats,
-        consumers_of_ssa_id,
     )
 
     # prepare shifting ssa ids
@@ -206,81 +223,27 @@ def compile(
 
     # shift ssa ids
     for i, instruction in enumerate(instructions):
-        instructions[i] = _map_instruction_arguments(instruction, shift_argument)
-    return RichProgram(instructions=instructions, n_inputs=n_inputs), input_tensors
+        instructions[i] = _map_instruction_arguments(instruction, shift_ssa_id)
+    parameter_positions = [shift_ssa_id(position) for position in parameter_positions]
+    shapes = {shift_ssa_id(key): value for key, value in shapes.items()}
+    tensor_formats = {shift_ssa_id(key): value for key, value in tensor_formats.items()}
 
+    # turn dicts into lists
+    shapes_list: list[Shape] = [()] * n_inputs
+    for i, shape in shapes.items():
+        shapes_list[i] = shape
+    tensor_formats_list: list[TensorFormat] = ["dense"] * n_inputs
+    for i, tensor_format in tensor_formats.items():
+        tensor_formats_list[i] = tensor_format
 
-def _propagate_shapes(
-    interface_operator: InterfaceOperator,
-    argument_shapes: list[Shape],
-) -> Shape:
-    """Propagates the shapes of tensors to the shape of the resulting tensor.
-
-    Parameters
-    ----------
-    operator : InterfaceOperator
-        The operator to be applied to the tensors. This is a dataclass with extra argument information.
-    argument_shapes : list[tuple[int, ...]]
-        The shapes of the tensors to be applied to the operator.
-
-    Returns
-    -------
-    tuple[int, ...]
-        The shape of the resulting tensor.
-
-    Raises
-    ------
-    ValueError
-        If the number of arguments is not compatible with the operator.
-    RuntimeError
-        If the shapes of the tensors are incompatible with the operator.
-    """
-
-    match interface_operator:
-        case InterfaceUnaryOperator(operator):
-            if len(argument_shapes) != 1:
-                raise ValueError(
-                    f"The {operator} operator takes exactly one argument, but {len(argument_shapes)} were given."
-                )
-            return infer_unary_shape(argument_shapes[0])
-
-        case InterfaceBinaryOperator(operator):
-            if len(argument_shapes) != 2:
-                raise ValueError(
-                    f"The {operator} operator takes exactly two arguments, but {len(argument_shapes)} were given."
-                )
-            return infer_binary_shape(argument_shapes[0], argument_shapes[1])
-
-        case InterfaceStackOperator(axis):
-            return infer_stack_shape(argument_shapes, axis)
-
-        case InterfaceTakeOperator(axis):
-            if len(argument_shapes) != 2:
-                raise ValueError(
-                    f"The take operator takes exactly two arguments, but {len(argument_shapes)} were given."
-                )
-            return infer_take_shape(argument_shapes[0], argument_shapes[1], axis)
-
-        case InterfaceSoftmaxOperator(_):
-            if len(argument_shapes) != 1:
-                raise ValueError(
-                    f"The softmax operator takes exactly one argument, but {len(argument_shapes)} were given."
-                )
-            return infer_softmax_shape(argument_shapes[0])
-
-        case InterfaceSliceOperator(start, stop, axis):
-            if len(argument_shapes) != 1:
-                raise ValueError(
-                    f"The slice operator takes exactly one argument, but {len(argument_shapes)} were given."
-                )
-            return infer_slice_shape(argument_shapes[0], start, stop, axis)
-
-        case InterfaceEinsumOperator(format_string):
-            return infer_einsum_shape(format_string, argument_shapes)
-
-        case InterfaceSelectOperator(axis, _):
-            if len(argument_shapes) != 1:
-                raise ValueError(
-                    f"The select operator takes exactly one argument, but {len(argument_shapes)} were given."
-                )
-            return infer_select_shape(argument_shapes[0], axis)
+    return (
+        RichProgram(
+            instructions=instructions,
+            n_inputs=n_inputs,
+            stability_mode=stability_mode,
+            shapes=shapes_list,
+            tensor_formats=tensor_formats_list,
+            parameter_indices=frozenset(parameter_positions),
+        ),
+        input_tensors,
+    )
