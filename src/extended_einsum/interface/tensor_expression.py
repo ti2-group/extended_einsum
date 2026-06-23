@@ -1,29 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Generic
+from typing import Any, Callable, Generic
 
-from extended_einsum.backend import BackendCompiler, TArray, get_backend_of_array
-from extended_einsum.interface.operator import (
-    InterfaceBinaryOperator,
-    InterfaceEinsumOperator,
-    InterfaceOperator,
-    InterfaceSliceOperator,
-    InterfaceSoftmaxOperator,
-    InterfaceStackOperator,
-    InterfaceTakeOperator,
-    InterfaceUnaryOperator,
+from extended_einsum.backend import BackendCompiler, TArray
+from extended_einsum.language.rich_operators import (
+    OperatorAdd,
+    OperatorDivide,
+    OperatorEinsum,
+    OperatorMultiply,
+    OperatorSubtract,
+    RichOperator,
 )
-from extended_einsum.language import (
-    Instruction,
-    Program,
-    make_einsum_instruction,
-    make_slice_instruction,
-    make_softmax_instruction,
-    make_stack_instruction,
-    make_take_instruction,
-    map_instruction_arguments,
-)
-from extended_einsum.scale import ScaledTensor
+from extended_einsum.language.rich_program import RichInstruction, RichProgram
+from extended_einsum.language.types import Shape
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 from extended_einsum.utils import get_axis_sizes, parse_format_string
 
@@ -31,29 +20,26 @@ from extended_einsum.utils import get_axis_sizes, parse_format_string
 class TensorExpression(Generic[TArray]):
     def __init__(
         self,
-        interface_operator: InterfaceOperator,
+        operator: RichOperator,
         arguments: list[TensorExpression[TArray] | TArray],
-        keyword_arguments: InterfaceOperator | None = None,
     ) -> None:
-        self.interface_operator = interface_operator
+        self.operator = operator
         self.arguments = arguments
-        self.keyword_arguments = keyword_arguments
-        self._shape = _propagate_shapes(
-            interface_operator,
-            [tuple(argument.shape) for argument in arguments],
+        self._shape = operator.propagate_shapes(
+            [tuple(argument.shape) for argument in arguments]
         )
         # check that the backends are consistent
         if len(arguments) == 0:
             raise ValueError("Tensor expression must have at least one argument.")
-        self.backend = get_backend_of_argument(arguments[0])
+        self.backend = arguments[0].backend
         for argument in arguments[1:]:
-            if get_backend_of_argument(argument) != self.backend:
+            if argument.backend != self.backend:
                 raise ValueError(
-                    f"Tensor expression has arguments with different backends: {self.backend} and {get_backend_of_argument(argument)}."
+                    f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}."
                 )
 
     @property
-    def shape(self) -> tuple[int, ...]:
+    def shape(self) -> Shape:
         return self._shape
 
     def materialize(self) -> TArray:
@@ -65,44 +51,39 @@ class TensorExpression(Generic[TArray]):
     def __add__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
-        return TensorExpression(InterfaceBinaryOperator("+"), [self, other])
+        return TensorExpression(OperatorAdd(), [self, other])
 
     def __sub__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
-        return TensorExpression(InterfaceBinaryOperator("-"), [self, other])
+        return TensorExpression(OperatorSubtract(), [self, other])
 
     def __mul__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
-        return TensorExpression(InterfaceBinaryOperator("*"), [self, other])
+        return TensorExpression(OperatorMultiply(), [self, other])
 
     def __truediv__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
-        return TensorExpression(InterfaceBinaryOperator("/"), [self, other])
+        return TensorExpression(OperatorDivide(), [self, other])
 
     def __matmul__(
         self, other: TensorExpression[TArray] | TArray
     ) -> TensorExpression[TArray]:
-        return TensorExpression(InterfaceEinsumOperator("ik, kj -> ij"), [self, other])
+        return TensorExpression(OperatorEinsum("ik, kj -> ij"), [self, other])
 
-
-def get_backend_of_argument(
-    argument: TensorExpression[TArray] | ScaledTensor[TArray] | TArray,
-) -> str:
-    if isinstance(argument, TensorExpression):
-        return argument.backend
-    if isinstance(argument, ScaledTensor):
-        return get_backend_of_array(argument.value)
-    return get_backend_of_array(argument)
+    def __getitem__(self, index: int | slice) -> TensorExpression[TArray]:
+        raise NotImplementedError(
+            "Indexing is not yet implemented. This should produce a select, take, or slice operator."
+        )
 
 
 def _compile_recursive(
     tensor_expression: TensorExpression[TArray] | TArray,
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
-    instructions: list[Instruction],
+    instructions: list[RichInstruction],
     input_tensors: list[Any],
 ) -> int:
     # get a unique key for this expression
@@ -120,8 +101,8 @@ def _compile_recursive(
     if expression_key in ssa_ids:
         return ssa_ids[expression_key]
 
-    # recursively compile the children first
-    argument_ssa_ids = [
+    # recursively compile the children
+    argument_ssa_ids = tuple(
         _compile_recursive(
             argument,
             ssa_ids,
@@ -130,52 +111,28 @@ def _compile_recursive(
             input_tensors,
         )
         for argument in tensor_expression.arguments
-    ]
+    )
 
     # add the instruction to the program
     ssa_ids[expression_key] = len(ssa_ids)
-    match tensor_expression.interface_operator:
-        case InterfaceEinsumOperator(format_string):
-            instructions.append(
-                make_einsum_instruction(format_string, *argument_ssa_ids)
-            )
-
-        case InterfaceStackOperator(axis):
-            instructions.append(make_stack_instruction(tuple(argument_ssa_ids), axis))
-
-        case InterfaceTakeOperator(axis):
-            instructions.append(
-                make_take_instruction(argument_ssa_ids[0], argument_ssa_ids[1], axis)
-            )
-
-        case InterfaceSoftmaxOperator(axis):
-            instructions.append(make_softmax_instruction(argument_ssa_ids[0], axis))
-
-        case InterfaceSliceOperator(start, stop, axis):
-            instructions.append(
-                make_slice_instruction(
-                    argument_ssa_ids[0],
-                    start,
-                    stop,
-                    axis,
-                )
-            )
-
-        case InterfaceUnaryOperator(operator):
-            instructions.append((operator, tuple(argument_ssa_ids), ()))
-
-        case InterfaceBinaryOperator(operator):
-            instructions.append((operator, tuple(argument_ssa_ids), ()))
+    instructions.append((tensor_expression.operator, argument_ssa_ids))
 
     return ssa_ids[expression_key]
 
 
+def _map_instruction_arguments(
+    instruction: RichInstruction, shift_argument: Callable[[int], int]
+) -> RichInstruction:
+    operator, argument_ssa_ids = instruction
+    return operator, tuple(shift_argument(argument) for argument in argument_ssa_ids)
+
+
 def compile(
     tensor_expression: TensorExpression[TArray],
-) -> tuple[Program, list[Any]]:
+) -> tuple[RichProgram, list[Any]]:
     """Compiles a tensor expression into a program and a list of arguments."""
 
-    instructions: list[Instruction] = []
+    instructions: list[RichInstruction] = []
     ssa_ids: dict[int, int] = {}
     input_ssa_ids: dict[int, int] = {}
     input_tensors: list[Any] = []
@@ -193,8 +150,8 @@ def compile(
         return old_argument + n_inputs if old_argument >= 0 else -1 - old_argument
 
     for i, instruction in enumerate(instructions):
-        instructions[i] = map_instruction_arguments(instruction, shift_argument)
-    return Program(instructions=instructions, n_inputs=n_inputs), input_tensors
+        instructions[i] = _map_instruction_arguments(instruction, shift_argument)
+    return RichProgram(instructions=instructions, n_inputs=n_inputs), input_tensors
 
 
 def _propagate_shapes(

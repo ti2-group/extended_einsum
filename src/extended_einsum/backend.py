@@ -5,12 +5,18 @@ import jax
 import numpy as np
 import torch
 
+from extended_einsum.language.core import RawProgram
+from extended_einsum.language.types import HasShape
+
 Backend = Literal["torch", "numpy", "jax"]
 
 
-class Array(Protocol):
+class HasBackend(Protocol):
     @property
-    def shape(self) -> tuple[int, ...] | torch.Size: ...
+    def backend(self) -> Backend: ...
+
+
+class Array(HasShape, HasBackend, Protocol): ...
 
 
 TArray = TypeVar("TArray", bound=Array)
@@ -60,7 +66,7 @@ class BackendFunctions(Protocol[TArray]):
 class BackendCompiler(Protocol[TArray]):
     @staticmethod
     def compile(
-        program: Program, arguments: Sequence[TArray]
+        program: RawProgram, arguments: Sequence[TArray]
     ) -> Callable[[Sequence[TArray]], TArray]: ...
 
 
