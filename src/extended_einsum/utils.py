@@ -1,43 +1,9 @@
 import os
 
-from extended_einsum.language import (
-    Program,
-    get_arguments,
-)
-
 
 def ensure_directories(path: str) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path
-
-
-def unify_indices(program: Program) -> Program:
-    """Builds a new program that has consistent index strings for tensors.
-
-    Parameters
-    ----------
-    program : Program
-        Programm that possibly refers to the same axis of the same tensor with different characters in different einsum calls.
-
-    Returns
-    -------
-    Program
-        Program that refers to the axes of each tensor with the same characters respectively always.
-    """
-
-    # trivial identity implementation for now (placeholder)
-    return program
-
-
-def get_ssa_parents(program: Program) -> dict[int, tuple[int, ...]]:
-    """Builds a dictionary that maps each SSA-IDs to the SSA-IDs of its parents."""
-
-    # the SSA-IDs 0 to program.n_inputs - 1 are occupied by the inputs, so the first intermediate tensor has SSA-ID program.n_inputs
-    parents: dict[int, tuple[int, ...]] = {i: () for i in range(program.n_inputs)}
-    for i, instruction in enumerate(program.instructions):
-        # each instruction writes to a new SSA-ID, so we just fill the parents with the SSA-IDs of the arguments
-        parents[program.n_inputs + i] = get_arguments(instruction)
-    return parents
 
 
 def parse_format_string(format_string: str) -> tuple[list[str], str]:

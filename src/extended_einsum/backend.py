@@ -6,12 +6,18 @@ import jax
 import numpy as np
 import torch
 
+from extended_einsum.language.core import RawProgram
+from extended_einsum.language.types import HasShape
+
 Backend = Literal["torch", "numpy", "jax"]
 
 
-class BackendArray(Protocol):
+class HasBackend(Protocol):
     @property
-    def shape(self) -> tuple[int, ...] | torch.Size: ...
+    def backend(self) -> Backend: ...
+
+
+class Array(HasShape, HasBackend, Protocol): ...
 
 
 def get_backend_of_array(array: BackendArray) -> Backend:
@@ -211,9 +217,16 @@ class BackendFunctions(Generic[TBackendArrayCovariant]):
 class BackendCompiler(Protocol[TBackendArray]):
     @staticmethod
     def compile(
-        program: Program,
-        arguments: Sequence[TBackendArray],
-        backend_implementations: list[
-            SingleFormatBackendFunctions | MultiFormatBackendFunctions
-        ],
-    ) -> Callable[[Sequence[TBackendArray]], TBackendArray]: ...
+        program: RawProgram, arguments: Sequence[TArray]
+    ) -> Callable[[Sequence[TArray]], TArray]: ...
+
+
+def get_backend_of_array(array: Array) -> Backend:
+    if isinstance(array, torch.Tensor):
+        return "torch"
+    elif isinstance(array, np.ndarray):
+        return "numpy"
+    elif isinstance(array, jax.Array):
+        return "jax"
+    else:
+        raise ValueError(f"Unsupported array type: {type(array)}")

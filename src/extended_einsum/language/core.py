@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 UnaryOperator = Literal["sin", "cos", "tan", "exp", "log", "sqrt", "1/"]
 BinaryOperator = Literal["+", "-", "*", "/", "**"]
@@ -20,39 +20,16 @@ OperatorName = (
     | SelectOperator
     | SoftmaxOperator
 )
+ArgumentSSAIds = tuple[int, ...]
+ExtraArguments = tuple[Any, ...]
 
-
-RawInstruction = tuple[OperatorName, tuple[int, ...], tuple[Any, ...]]
-
-
-class Operator(Protocol):
-    @property
-    def name(self) -> OperatorName: ...
-
-    @property
-    def raw_extra_arguments(self) -> tuple[Any, ...]: ...
-
-    def check_inputs(self, operands: list[Any]) -> None: ...
-
-    def propagate_shapes(
-        self, input_shapes: list[tuple[int, ...]]
-    ) -> tuple[int, ...]: ...
-
-    def to_instruction(self, operand_ids: tuple[int, ...]) -> RawInstruction:
-        return (self.name, operand_ids, self.raw_extra_arguments)
+RawInstruction = tuple[OperatorName, ArgumentSSAIds, ExtraArguments]
 
 
 @dataclass(frozen=True)
-class Program:
+class RawProgram:
     instructions: list[RawInstruction]
     n_inputs: int
-    # ssa_id_to_tensor_format: list[TensorFormat]
-
-    # def __post_init__(self):
-    #     if len(self.ssa_id_to_tensor_format) != len(self.instructions) + self.n_inputs:
-    #         raise ValueError(
-    #             f"Number of tensor formats ({len(self.ssa_id_to_tensor_format)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-    #         )
 
     @property
     def output_ssa(self) -> int:
