@@ -3,12 +3,36 @@ from typing import Any, Protocol, override
 
 import numpy as np
 
-from extended_einsum.backend import Array
-from extended_einsum.language.core import Operator, OperatorName
+from extended_einsum.language.core import OperatorName, RawInstruction
+from extended_einsum.language.types import HasShape, Shape
 from extended_einsum.utils import parse_format_string
 
+################################
+# main protocol, everything in here inherits from this
+################################
 
-class UnaryArithmeticOperator(Operator, Protocol):
+
+class RichOperator(Protocol):
+    @property
+    def name(self) -> OperatorName: ...
+
+    @property
+    def raw_extra_arguments(self) -> tuple[Any, ...]: ...
+
+    def check_inputs(self, operands: list[Any]) -> None: ...
+
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape: ...
+
+    def to_instruction(self, operand_ids: Shape) -> RawInstruction:
+        return (self.name, operand_ids, self.raw_extra_arguments)
+
+
+################################
+# some functions are the same for many operators
+################################
+
+
+class UnaryArithmeticOperator(RichOperator, Protocol):
     @override
     def check_inputs(self, operands: list[Any]) -> None:
         if len(operands) != 1:
@@ -17,11 +41,11 @@ class UnaryArithmeticOperator(Operator, Protocol):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         return input_shapes[0]
 
 
-class BinaryArithmeticOperator(Operator, Protocol):
+class BinaryArithmeticOperator(RichOperator, Protocol):
     @override
     def check_inputs(self, operands: list[Any]) -> None:
         if len(operands) != 2:
@@ -30,17 +54,23 @@ class BinaryArithmeticOperator(Operator, Protocol):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         return np.broadcast_shapes(input_shapes[0], input_shapes[1])
 
 
-class NoExtraArgumentOperator(Operator, Protocol):
+class NoExtraArgumentOperator(RichOperator, Protocol):
     @property
     @override
     def raw_extra_arguments(self) -> tuple[Any, ...]:
         return ()
 
 
+################################
+# complete operators
+################################
+
+
+@dataclass(frozen=True)
 class OperatorSin(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -48,6 +78,7 @@ class OperatorSin(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "sin"
 
 
+@dataclass(frozen=True)
 class OperatorCos(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -55,6 +86,7 @@ class OperatorCos(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "cos"
 
 
+@dataclass(frozen=True)
 class OperatorTan(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -62,6 +94,7 @@ class OperatorTan(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "tan"
 
 
+@dataclass(frozen=True)
 class OperatorExp(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -69,6 +102,7 @@ class OperatorExp(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "exp"
 
 
+@dataclass(frozen=True)
 class OperatorLog(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -76,6 +110,7 @@ class OperatorLog(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "log"
 
 
+@dataclass(frozen=True)
 class OperatorSqrt(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -83,6 +118,7 @@ class OperatorSqrt(UnaryArithmeticOperator, NoExtraArgumentOperator):
         return "sqrt"
 
 
+@dataclass(frozen=True)
 class OperatorInverse(UnaryArithmeticOperator, NoExtraArgumentOperator):
     @property
     @override
@@ -123,7 +159,7 @@ class OperatorDivide(BinaryArithmeticOperator, NoExtraArgumentOperator):
 
 
 @dataclass(frozen=True)
-class OperatorStack(Operator):
+class OperatorStack(RichOperator):
     axis: int
 
     @property
@@ -137,7 +173,7 @@ class OperatorStack(Operator):
         return (self.axis,)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         if len(operands) == 0:
             raise ValueError("stack requires at least one argument")
         non_stacked_shape = operands[0].shape
@@ -145,19 +181,23 @@ class OperatorStack(Operator):
             raise ValueError(
                 "The stack operator requires all arguments to have the same shape along the stack axis."
             )
+        if not 0 <= self.axis <= len(non_stacked_shape):
+            raise ValueError(
+                f"The stack operator wants to stack axis {self.axis} but the operands only have {len(non_stacked_shape)} axes. Bounds are 0 <= axis <= {len(non_stacked_shape)}."
+            )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         non_stacked_shape = input_shapes[0]
         return (
             *non_stacked_shape[: self.axis],
             len(input_shapes),
-            *non_stacked_shape[self.axis + 1 :],
+            *non_stacked_shape[self.axis :],
         )
 
 
 @dataclass(frozen=True)
-class OperatorTake(Operator):
+class OperatorTake(RichOperator):
     axis: int
 
     @property
@@ -171,7 +211,7 @@ class OperatorTake(Operator):
         return (self.axis,)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         if len(operands) != 2:
             raise ValueError(
                 f"The take operator takes exactly two arguments, but {len(operands)} were given."
@@ -186,7 +226,7 @@ class OperatorTake(Operator):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         return (
             *input_shapes[0][: self.axis],
             *input_shapes[1],
@@ -195,7 +235,7 @@ class OperatorTake(Operator):
 
 
 @dataclass(frozen=True)
-class OperatorSlice(Operator):
+class OperatorSlice(RichOperator):
     start: int
     stop: int
     axis: int
@@ -211,7 +251,7 @@ class OperatorSlice(Operator):
         return (self.start, self.stop, self.axis)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         if len(operands) != 1:
             raise ValueError(
                 f"The slice operator takes exactly one argument, but {len(operands)} were given."
@@ -222,7 +262,7 @@ class OperatorSlice(Operator):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         return (
             *input_shapes[0][: self.axis],
             self.stop - self.start,
@@ -231,7 +271,7 @@ class OperatorSlice(Operator):
 
 
 @dataclass(frozen=True)
-class OperatorSelect(Operator):
+class OperatorSelect(RichOperator):
     axis: int
     index: int
 
@@ -246,7 +286,7 @@ class OperatorSelect(Operator):
         return (self.axis, self.index)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         if len(operands) != 1:
             raise ValueError(
                 f"The select operator takes exactly one argument, but {len(operands)} were given."
@@ -257,7 +297,7 @@ class OperatorSelect(Operator):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         # TODO: is this the correct shape? or do we just delete the middle axis?
         return (
             *input_shapes[0][: self.axis],
@@ -267,7 +307,7 @@ class OperatorSelect(Operator):
 
 
 @dataclass(frozen=True)
-class OperatorSoftmax(Operator):
+class OperatorSoftmax(RichOperator):
     axis: int
 
     @property
@@ -281,7 +321,7 @@ class OperatorSoftmax(Operator):
         return (self.axis,)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         if len(operands) != 1:
             raise ValueError(
                 f"The softmax operator takes exactly one argument, but {len(operands)} were given."
@@ -292,23 +332,25 @@ class OperatorSoftmax(Operator):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
         return input_shapes[0]
 
 
 @dataclass(frozen=True)
-class OperatorEinsum(Operator):
+class OperatorEinsum(RichOperator):
     format_string: str
-    
+
     def __post_init__(self):
         index_strings, output_string = parse_format_string(self.format_string)
         symbols_in_output_string = set(output_string)
         symbols_in_index_strings = set().union(*index_strings)
-        if any(symbol not in symbols_in_index_strings for symbol in symbols_in_output_string):
+        if any(
+            symbol not in symbols_in_index_strings
+            for symbol in symbols_in_output_string
+        ):
             raise ValueError(
                 f"Einsum format string error: an output symbol in {output_string} is not present in the input index strings."
             )
-        
 
     @property
     @override
@@ -321,7 +363,7 @@ class OperatorEinsum(Operator):
         return (self.format_string,)
 
     @override
-    def check_inputs(self, operands: list[Array]) -> None:
+    def check_inputs(self, operands: list[HasShape]) -> None:
         index_strings, output_string = parse_format_string(self.format_string)
         if len(index_strings) != len(operands):
             raise ValueError(
@@ -329,4 +371,5 @@ class OperatorEinsum(Operator):
             )
 
     @override
-    def propagate_shapes(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
+        raise NotImplementedError
