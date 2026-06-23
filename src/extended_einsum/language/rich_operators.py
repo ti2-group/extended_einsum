@@ -224,6 +224,10 @@ class OperatorTake(RichOperator):
             raise ValueError(
                 f"The take operator takes a vector as second arguments, but the second argument has shape {operands[1].shape}."
             )
+        if not 0 <= self.axis < len(operands[0].shape):
+            raise ValueError(
+                f"The take operator wants to take axis {self.axis} but operand[0] only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}."
+            )
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
@@ -260,6 +264,10 @@ class OperatorSlice(RichOperator):
             raise ValueError(
                 f"The slice operator takes a non-scalar as first arguments, but the first argument has shape {operands[0].shape}."
             )
+        if not 0 <= self.axis < len(operands[0].shape):
+            raise ValueError(
+                f"The slice operator wants to slice axis {self.axis} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}."
+            )
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
@@ -294,6 +302,14 @@ class OperatorSelect(RichOperator):
         if len(operands[0].shape) == 0:
             raise ValueError(
                 f"The select operator takes a non-scalar as first arguments, but the first argument has shape {operands[0].shape}."
+            )
+        if not 0 <= self.axis < len(operands[0].shape):
+            raise ValueError(
+                f"The select operator wants to select axis {self.axis} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}."
+            )
+        if not 0 <= self.index < operands[0].shape[self.axis]:
+            raise ValueError(
+                f"The select operator wants to select index {self.index} but the operand only has {operands[0].shape[self.axis]} indices along axis {self.axis}. Bounds are 0 <= index < {operands[0].shape[self.axis]}."
             )
 
     @override
@@ -330,6 +346,10 @@ class OperatorSoftmax(RichOperator):
             raise ValueError(
                 f"The softmax operator takes a non-scalar as first arguments, but the first argument has shape {operands[0].shape}."
             )
+        if not 0 <= self.axis < len(operands[0].shape):
+            raise ValueError(
+                f"The softmax operator wants to softmax axis {self.axis} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}."
+            )
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
@@ -364,12 +384,40 @@ class OperatorEinsum(RichOperator):
 
     @override
     def check_inputs(self, operands: list[HasShape]) -> None:
-        index_strings, output_string = parse_format_string(self.format_string)
+        index_strings, _ = parse_format_string(self.format_string)
+        # check that the number of indices in the format string matches the number of operands
         if len(index_strings) != len(operands):
             raise ValueError(
                 f"The number of indices in the einsum format string ({len(index_strings)}) does not match the number of arguments ({len(operands)})."
             )
+        # check that the length of index strings in the format string matches the orders of the operands
+        if any(
+            len(index_string) != len(operand.shape)
+            for index_string, operand in zip(index_strings, operands)
+        ):
+            raise ValueError(
+                f"The einsum format string ({self.format_string}) has indices of different lengths than the order of the operands."
+            )
+        # check that all axes have consistent sizes
+        _get_axis_sizes(index_strings, [operand.shape for operand in operands])
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
-        raise NotImplementedError
+        index_strings, output_string = parse_format_string(self.format_string)
+        axis_sizes = _get_axis_sizes(index_strings, input_shapes)
+        return tuple(axis_sizes[index] for index in output_string)
+
+
+def _get_axis_sizes(
+    index_strings: list[str], tensor_shapes: list[Shape]
+) -> dict[str, int]:
+    axis_sizes: dict[str, int] = {}
+    for index_string, tensor_shape in zip(index_strings, tensor_shapes):
+        for index in index_string:
+            if index not in axis_sizes:
+                axis_sizes[index] = tensor_shape[index_string.index(index)]
+            elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
+                raise RuntimeError(
+                    f"Incompatible shapes for index {index_string}: {tensor_shape} and {axis_sizes[index]}."
+                )
+    return axis_sizes
