@@ -41,6 +41,9 @@ class BackendFunctions(Protocol[TBackendArray]):
     ) -> TBackendArray: ...
 
     @staticmethod
+    def select(array: TBackendArray, axis: int, index: int) -> TBackendArray: ...
+
+    @staticmethod
     def slice(
         array: TBackendArray, start: int, stop: int, axis: int = 0
     ) -> TBackendArray: ...
