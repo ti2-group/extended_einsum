@@ -1,3 +1,4 @@
+from .functions import array as array
 from .functions import einsum as einsum
 from .functions import exp as exp
 from .functions import log as log
