@@ -104,15 +104,14 @@ class TorchCompiler(BackendCompiler[torch.Tensor]):
     @override
     @staticmethod
     def compile(
-        program: RawProgram, arguments: Sequence[torch.Tensor]
+        program: RawProgram,
+        arguments: Sequence[torch.Tensor],
+        backend_functions_per_instruction: list[BackendFunctions[torch.Tensor]],
     ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-        torch_translation = TorchTranslation()
         return torch.compile(  # pyright: ignore[reportReturnType] - this is just because torch.Shape isn't exactly a tuple
             partial(
                 run_program,
                 program,
-                backend_functions_per_instruction=[  # pyright: ignore[reportArgumentType]
-                    torch_translation for _ in program.instructions
-                ],
+                backend_functions_per_instruction=backend_functions_per_instruction,  # pyright: ignore[reportArgumentType]
             )
         )
