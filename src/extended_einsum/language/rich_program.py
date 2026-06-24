@@ -2,10 +2,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from extended_einsum.language.core import ArgumentSSAIds, RawProgram
-from extended_einsum.language.rich_operators import RichOperator
+from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.types import Shape, StabilityMode, TensorFormat
-
-RichInstruction = tuple[RichOperator, ArgumentSSAIds]
 
 
 @dataclass(frozen=True)
@@ -36,15 +34,15 @@ class RichProgram:
 
         # map from ssa id to its arguments
         arguments_of_ssa_id: dict[int, ArgumentSSAIds] = defaultdict(tuple)
-        for i, (_, arguments) in enumerate(self.instructions):
-            arguments_of_ssa_id[self.n_inputs + i] = arguments
+        for i, instruction in enumerate(self.instructions):
+            arguments_of_ssa_id[self.n_inputs + i] = instruction.argument_ssa_ids
 
         # for each ssa id remember the ssa ids where it is used as an argument
         consumers_of_ssa_id: dict[int, list[int]] = defaultdict(list)
-        for i, (_, arguments) in enumerate(self.instructions):
-            for argument in arguments:
+        for i, instruction in enumerate(self.instructions):
+            for argument_ssa_id in instruction.argument_ssa_ids:
                 # self.n_inputs + i is the ssa id that the instruction writes to
-                consumers_of_ssa_id[argument].append(self.n_inputs + i)
+                consumers_of_ssa_id[argument_ssa_id].append(self.n_inputs + i)
 
         # overwrite the generated fields
         object.__setattr__(self, "arguments_of_ssa_id", arguments_of_ssa_id)
@@ -65,11 +63,11 @@ class RichProgram:
         return RawProgram(
             instructions=[
                 (
-                    rich_operator.name,
-                    argument_ssa_ids,
-                    rich_operator.raw_extra_arguments,
+                    instruction.operator.name,
+                    instruction.argument_ssa_ids,
+                    instruction.operator.raw_extra_arguments,
                 )
-                for rich_operator, argument_ssa_ids in self.instructions
+                for instruction in self.instructions
             ],
             n_inputs=self.n_inputs,
         )

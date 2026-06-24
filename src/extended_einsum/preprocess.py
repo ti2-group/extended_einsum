@@ -4,30 +4,9 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, override
 
-from extended_einsum.backend import (
-    BackendFunctions,
-    MultiFormatBackendFunctions,
-    SingleFormatBackendFunctions,
-    TBackendArrayCovariant,
-)
-from extended_einsum.format import (
-    DenseFormat,
-    DenseLogspaceFormat,
-    DenseScaledFormat,
-    TensorFormat,
-)
-from extended_einsum.language import (
-    EINSUM_OPERATOR,
-    Instruction,
-    Operator,
-    Program,
-    get_arguments,
-    get_einsum_format_string,
-    get_instruction_specific_arguments,
-    get_operator,
-    make_einsum_instruction,
-    map_instruction_arguments,
-)
+from extended_einsum.language.rich_instruction import RichInstruction
+from extended_einsum.language.rich_operators import OperatorEinsum
+from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.shapes import (
     Shape,
     infer_einsum_shape,
@@ -478,19 +457,19 @@ def extract_connected_einsum_components(
         if ssa_id < program.n_inputs:
             continue
 
-        op_index = ssa_id - program.n_inputs
-        if op_index in visited:
+        instruction_index = ssa_id - program.n_inputs
+        if instruction_index in visited:
             continue
 
-        instruction = program.instructions[op_index]
-        if get_operator(instruction) != EINSUM_OPERATOR:
-            visited.add(op_index)
-            pending_ssa_ids.extend(get_arguments(instruction))
+        instruction = program.instructions[instruction_index]
+        if not isinstance(instruction.operator, OperatorEinsum):
+            visited.add(instruction_index)
+            pending_ssa_ids.extend(instruction.argument_ssa_ids)
             continue
 
-        sink_op_index = op_index
+        sink_op_index = instruction_index
         _sink_inputs, sink_output = parse_format_string(
-            get_einsum_format_string(instruction)
+            instruction.operator.format_string
         )
         label_allocator = _EinsumLabelAllocator()
 
@@ -500,22 +479,23 @@ def extract_connected_einsum_components(
         component: set[int] = set()
         boundary_arguments: list[int] = []
         boundary_strings: list[str] = []
-        pending_einsum_ops = [(op_index, relabeled_output)]
-        while pending_einsum_ops:
-            einsum_op_index, expected_output = pending_einsum_ops.pop()
+        pending_einsum_instructions = [(instruction_index, relabeled_output)]
+        while pending_einsum_instructions:
+            einsum_op_index, expected_output = pending_einsum_instructions.pop()
             if einsum_op_index in visited:
                 continue
 
             visited.add(einsum_op_index)
             component.add(einsum_op_index)
             einsum_instruction = program.instructions[einsum_op_index]
+            assert isinstance(einsum_instruction.operator, OperatorEinsum)
             input_strings, output_string = parse_format_string(
-                get_einsum_format_string(einsum_instruction)
+                einsum_instruction.operator.format_string
             )
             label_map = dict(zip(output_string, expected_output, strict=True))
 
-            for argument, input_string in zip(
-                get_arguments(einsum_instruction), input_strings, strict=True
+            for argument_ssa_id, input_string in zip(
+                einsum_instruction.argument_ssa_ids, input_strings, strict=True
             ):
                 # Preserve labels shared with the output and allocate labels for
                 # contraction indices that are first encountered at this operation.
@@ -526,21 +506,25 @@ def extract_connected_einsum_components(
                     relabeled_input_labels.append(label_map[label])
                 relabeled_input = "".join(relabeled_input_labels)
 
-                if argument >= program.n_inputs:
-                    producer_op_index = argument - program.n_inputs
-                    producer = program.instructions[producer_op_index]
+                if argument_ssa_id >= program.n_inputs:
+                    argument_instruction_index = argument_ssa_id - program.n_inputs
                     # A uniquely consumed einsum producer belongs to this component.
                     # Everything else is a boundary input and a new traversal root.
                     if (
-                        get_operator(producer) == EINSUM_OPERATOR
-                        and len(program.consumers_of_ssa_id[argument]) == 1
+                        isinstance(
+                            program.instructions[argument_instruction_index].operator,
+                            OperatorEinsum,
+                        )
+                        and len(program.consumers_of_ssa_id[argument_ssa_id]) == 1
                     ):
-                        pending_einsum_ops.append((producer_op_index, relabeled_input))
+                        pending_einsum_instructions.append(
+                            (argument_instruction_index, relabeled_input)
+                        )
                         continue
 
-                boundary_arguments.append(argument)
+                boundary_arguments.append(argument_ssa_id)
                 boundary_strings.append(relabeled_input)
-                pending_ssa_ids.append(argument)
+                pending_ssa_ids.append(argument_ssa_id)
 
         if len(component) >= 2:
             components.append(
@@ -587,7 +571,10 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 continue
 
             planned_instructions = tuple(
-                make_einsum_instruction(step_format, first, second)
+                RichInstruction(
+                    operator=OperatorEinsum(step_format),
+                    argument_ssa_ids=(first, second),
+                )
                 for first, second, step_format in to_annotated_ssa_path(
                     component.format_string,
                     path,
@@ -631,12 +618,17 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 }
                 block_format = program.tensor_formats[result_id]
                 for step_index, planned_instruction in enumerate(planned_instructions):
-                    planned_arguments = get_arguments(planned_instruction)
+                    assert isinstance(planned_instruction.operator, OperatorEinsum)
                     mapped_arguments = tuple(
-                        local_tensor_map[argument] for argument in planned_arguments
+                        local_tensor_map[argument]
+                        for argument in planned_instruction.argument_ssa_ids
                     )
                     argument_map = dict(
-                        zip(planned_arguments, mapped_arguments, strict=True)
+                        zip(
+                            planned_instruction.argument_ssa_ids,
+                            mapped_arguments,
+                            strict=True,
+                        )
                     )
                     mapped_instruction = map_instruction_arguments(
                         planned_instruction, argument_map.__getitem__
@@ -645,7 +637,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                     instructions.append(mapped_instruction)
                     shapes.append(
                         infer_einsum_shape(
-                            get_einsum_format_string(mapped_instruction),
+                            planned_instruction.operator.format_string,
                             [shapes[argument] for argument in mapped_arguments],
                         )
                     )
@@ -659,8 +651,10 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             if op_index in block_ops:
                 continue
 
-            arguments = get_arguments(instruction)
-            argument_map = {argument: tensor_map[argument] for argument in arguments}
+            argument_map = {
+                argument: tensor_map[argument]
+                for argument in instruction.argument_ssa_ids
+            }
             tensor_map[result_id] = program.n_inputs + len(instructions)
             instructions.append(
                 map_instruction_arguments(instruction, argument_map.__getitem__)
