@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Protocol, override
 
@@ -694,13 +694,15 @@ class OptimizeContractionPaths(PreprocessingRoutine):
 class FoldSameShapedOperations(PreprocessingRoutine):
     @override
     @staticmethod
-    def apply(program: RichProgram) -> RichProgram: ...
+    def apply(program: RichProgram) -> RichProgram:
+        return program  # TODO
 
 
 class OptimizeMemoryLayout(PreprocessingRoutine):
     @override
     @staticmethod
-    def apply(program: RichProgram) -> RichProgram: ...
+    def apply(program: RichProgram) -> RichProgram:
+        return program  # TODO
 
 
 def to_annotated_ssa_path(

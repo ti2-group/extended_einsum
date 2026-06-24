@@ -298,8 +298,7 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(
-                tuple(member.op_index for member in group.members)
-                for group in groups
+                tuple(member.op_index for member in group.members) for group in groups
             ),
             ((2,), (1,)),
         )
@@ -356,12 +355,14 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(
             groups[0].canonical_instruction_specific_arguments,
-            (f"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\u0100->a",),
+            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\u0100->a",),
         )
 
 
 class EinsumLabelAllocationTests(unittest.TestCase):
-    def test_extract_connected_einsum_components_prefers_ascii_before_extended(self) -> None:
+    def test_extract_connected_einsum_components_prefers_ascii_before_extended(
+        self,
+    ) -> None:
         labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0"
         program = _program(
             instructions=[
