@@ -1,8 +1,13 @@
 from dataclasses import dataclass
 from typing import Generic, override
 
-from extended_einsum.backend import Backend, TBackendArray, get_backend_of_array
-from extended_einsum.interface.tensor_expression import Array, TArray, TensorExpression
+from extended_einsum.backend import TBackendArray, get_backend_of_array
+from extended_einsum.interface.tensor_expression import (
+    Array,
+    Parameter,
+    TArray,
+    TensorExpression,
+)
 from extended_einsum.language.rich_operators import (
     OperatorCos,
     OperatorEinsum,
@@ -17,14 +22,14 @@ from extended_einsum.language.rich_operators import (
     OperatorTake,
     OperatorTan,
 )
-from extended_einsum.language.types import Shape, TensorFormat
+from extended_einsum.language.types import Backend, Shape, TensorFormat
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 
 @dataclass(frozen=True)
 class BackendArrayWrapper(Array, Generic[TBackendArray]):
     backend_array: TBackendArray
-    tensor_format: TensorFormat
+    _format: TensorFormat
 
     @property
     @override
@@ -36,9 +41,14 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
     def backend(self) -> Backend:
         return get_backend_of_array(self.backend_array)
 
+    @property
+    @override
+    def format(self) -> TensorFormat:
+        return self._format
+
 
 def array(
-    backend_array: TBackendArray, format: TensorFormat
+    backend_array: TBackendArray, format: TensorFormat = "dense"
 ) -> BackendArrayWrapper[TBackendArray]:
     return BackendArrayWrapper(backend_array, format)
 
@@ -103,9 +113,7 @@ def einsum(
 
 
 def stack(
-    operands: list[
-        TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray
-    ],
+    operands: list[TensorExpression[TArray] | Parameter[TArray] | TArray],
     *,
     axis: int = 0,
 ) -> TensorExpression[TBackendArray]:

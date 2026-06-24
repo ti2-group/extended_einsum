@@ -1,68 +1,104 @@
 from __future__ import annotations
 
-from typing import Callable, Generic, Protocol, TypeVar
+from dataclasses import dataclass
+from typing import Callable, Generic, Protocol, TypeVar, override
 
-from extended_einsum.backend import BackendCompiler, HasBackend
+from extended_einsum.backend import BackendCompiler
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
+    OperatorCos,
     OperatorDivide,
     OperatorEinsum,
+    OperatorExp,
+    OperatorInverse,
+    OperatorLog,
     OperatorMultiply,
+    OperatorSelect,
+    OperatorSin,
+    OperatorSlice,
+    OperatorSoftmax,
+    OperatorSqrt,
+    OperatorStack,
     OperatorSubtract,
+    OperatorTake,
+    OperatorTan,
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichInstruction, RichProgram
-from extended_einsum.language.types import HasShape, Shape, StabilityMode, TensorFormat
+from extended_einsum.language.types import (
+    Backend,
+    HasBackend,
+    HasFormat,
+    HasShape,
+    Shape,
+    StabilityMode,
+    TensorFormat,
+)
 from extended_einsum.translations.translations import BACKEND_TO_COMPILER
 
 
-class Array(HasShape, HasBackend, Protocol): ...
+class Array(HasShape, HasBackend, HasFormat, Protocol): ...
 
 
 TArray = TypeVar("TArray", bound=Array)
 
 
 @dataclass(frozen=True)
-class Parameter[TBackendArray]:
-    backend_array: TBackendArray
+class Parameter(Generic[TArray]):
+    array: TArray
 
     @property
     def shape(self) -> Shape:
-        return tuple(self.backend_array.shape)  # pyright: ignore[reportAttributeAccessIssue]
+        return tuple(self.array.shape)
+
+    @property
+    def backend(self) -> Backend:
+        return self.array.backend
+
+    @property
+    def format(self) -> TensorFormat:
+        return self.array.format
 
 
-class TensorExpression(Generic[TBackendArray]):
+class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def __init__(
         self,
         operator: RichOperator,
-        arguments: list[TensorExpression[TArray] | TArray],
+        arguments: list[TensorExpression[TArray] | Parameter[TArray] | TArray],
     ) -> None:
         self.operator = operator
         self.arguments = arguments
         self._shape = operator.propagate_shapes(
             [tuple(argument.shape) for argument in arguments]
         )
-        argument_formats = [
-            argument.format if hasattr(argument, "format") else DenseFormat()  # pyright: ignore[reportAttributeAccessIssue]
-            for argument in arguments
-        ]
-        self.format = _propagate_tensor_format(
-            interface_operator,
-            argument_formats,
+        self._format: TensorFormat = _propagate_tensor_format(
+            operator,
+            [argument.format for argument in arguments],
         )
         # check that the backends are consistent
         if len(arguments) == 0:
             raise ValueError("Tensor expression must have at least one argument.")
-        self.backend = arguments[0].backend
+        self._backend: Backend = arguments[0].backend
         for argument in arguments[1:]:
-            if argument.backend != self.backend:
+            if argument.backend != self._backend:
                 raise ValueError(
                     f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}."
                 )
 
     @property
+    @override
     def shape(self) -> Shape:
         return self._shape
+
+    @property
+    @override
+    def backend(self) -> Backend:
+        return self._backend
+
+    @property
+    @override
+    def format(self) -> TensorFormat:
+        return self._format
 
     def materialize(self, stability_mode: StabilityMode) -> TArray:
         rich_program, arguments = compile(self, stability_mode)
@@ -102,8 +138,8 @@ class TensorExpression(Generic[TBackendArray]):
         )
 
 
-def _extract_program_recursive(
-    tensor_expression: TensorExpression[TBackendArray] | TBackendArray,
+def _compile_recursive(
+    tensor_expression: TensorExpression[TArray] | Parameter[TArray] | TArray,
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[RichInstruction],
@@ -124,19 +160,13 @@ def _extract_program_recursive(
         input_ssa_ids[expression_key] = -1 - len(input_ssa_ids)
         # add it to the list of inputs and maybe also add it to the list of parameters
         if isinstance(tensor_expression, Parameter):
-            input_tensors.append(tensor_expression.backend_array)
+            input_tensors.append(tensor_expression.array)
             parameter_positions.append(input_ssa_ids[expression_key])
-        elif hasattr(tensor_expression, "backend_array"):
-            input_tensors.append(tensor_expression.backend_array)  # pyright: ignore[reportAttributeAccessIssue]
         else:
             input_tensors.append(tensor_expression)
         # add shape and format information
         shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
-        tensor_formats[input_ssa_ids[expression_key]] = (
-            tensor_expression.format  # pyright: ignore[reportAttributeAccessIssue]
-            if hasattr(tensor_expression, "format")
-            else DenseFormat()
-        )
+        tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
         return input_ssa_ids[expression_key]
 
     # if we have already seen this expression, return its SSA-ID
@@ -150,7 +180,7 @@ def _extract_program_recursive(
             ssa_ids,
             input_ssa_ids,
             instructions,
-            input_tensors,
+            input_tensors,  # pyright: ignore[reportArgumentType]
             parameter_positions,
             shapes,
             tensor_formats,
@@ -161,6 +191,8 @@ def _extract_program_recursive(
     # add the instruction to the program
     ssa_ids[expression_key] = len(ssa_ids)
     instructions.append((tensor_expression.operator, argument_ssa_ids))
+    shapes[ssa_ids[expression_key]] = tensor_expression.shape
+    tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
 
     # add shape and format information
     shapes[ssa_ids[expression_key]] = tensor_expression.shape
@@ -229,10 +261,11 @@ def compile(
     tensor_formats = {shift_ssa_id(key): value for key, value in tensor_formats.items()}
 
     # turn dicts into lists
-    shapes_list: list[Shape] = [()] * n_inputs
+    n_ssa_ids = n_inputs + len(ssa_ids)
+    shapes_list: list[Shape] = [()] * n_ssa_ids
     for i, shape in shapes.items():
         shapes_list[i] = shape
-    tensor_formats_list: list[TensorFormat] = ["dense"] * n_inputs
+    tensor_formats_list: list[TensorFormat] = ["dense"] * n_ssa_ids
     for i, tensor_format in tensor_formats.items():
         tensor_formats_list[i] = tensor_format
 
@@ -247,3 +280,101 @@ def compile(
         ),
         input_tensors,
     )
+
+
+def _propagate_tensor_format(
+    operator: RichOperator, argument_formats: list[TensorFormat]
+) -> TensorFormat:
+    format_signature: list[TensorFormat]
+    # find the argument signature
+    match operator:
+        case (
+            OperatorSin()
+            | OperatorCos()
+            | OperatorTan()
+            | OperatorExp()
+            | OperatorLog()
+            | OperatorSqrt()
+            | OperatorInverse()
+        ):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The {operator} operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case OperatorAdd() | OperatorSubtract() | OperatorMultiply() | OperatorDivide():
+            if len(argument_formats) != 2:
+                raise ValueError(
+                    f"The {operator} operator takes exactly two arguments, but {len(argument_formats)} were given."
+                )
+            if argument_formats[0] != argument_formats[1]:
+                raise ValueError(
+                    f"The {operator} operator requires arguments with the same format, but {argument_formats[0]} and {argument_formats[1]} were given."
+                )
+            format_signature = [argument_formats[0], argument_formats[1]]
+
+        case OperatorStack(_):
+            if len(argument_formats) < 1:
+                raise ValueError(
+                    f"The stack operator requires at least one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+            if any(format != argument_formats[0] for format in argument_formats[1:]):
+                raise ValueError(
+                    f"The stack operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
+                )
+
+        case OperatorTake(_):
+            if len(argument_formats) != 2:
+                raise ValueError(
+                    f"The take operator takes exactly two arguments, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0], argument_formats[1]]
+
+        case OperatorSelect(_, _):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The select operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case OperatorSlice(_, _, _):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The slice operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case OperatorSoftmax(_):
+            if len(argument_formats) != 1:
+                raise ValueError(
+                    f"The softmax operator takes exactly one argument, but {len(argument_formats)} were given."
+                )
+            format_signature = [argument_formats[0]]
+
+        case OperatorEinsum(_):
+            # TODO: this is a hack
+            format_signature = [argument_formats[0]]
+            if any(format != argument_formats[0] for format in argument_formats[1:]):
+                raise ValueError(
+                    f"The einsum operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
+                )
+
+        case _:
+            raise NotImplementedError(f"Operator {operator} is not yet supported.")
+
+    # decise the output format
+    match format_signature:
+        case [format]:
+            return format
+        case ["dense", "dense"]:
+            return "dense"
+        case ["dense", "sparse"]:
+            return "sparse"
+        case ["sparse", "dense"]:
+            return "sparse"
+        case ["sparse", "sparse"]:
+            return "sparse"
+        case _:
+            raise NotImplementedError()
