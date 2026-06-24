@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Generic, Protocol, TypeVar, override
 
-from extended_einsum.backend import BackendCompiler
+from extended_einsum.backend import BackendCompiler, BackendFunctions
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
     OperatorCos,
@@ -34,7 +34,10 @@ from extended_einsum.language.types import (
     StabilityMode,
     TensorFormat,
 )
-from extended_einsum.translations.translations import BACKEND_TO_COMPILER
+from extended_einsum.translations.translations import (
+    BACKEND_TO_COMPILER,
+    STABILITY_AND_BACKEND_TO_TRANSLATION,
+)
 
 
 class Array(HasShape, HasBackend, HasFormat, Protocol): ...
@@ -101,11 +104,30 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         return self._format
 
     def materialize(self, stability_mode: StabilityMode) -> TArray:
-        rich_program, arguments = compile(self, stability_mode)
+        rich_program, input_arguments = compile(self, stability_mode)
+        # TODO: this is a hack
+        input_arguments = [
+            argument.backend_array if hasattr(argument, "backend_array") else argument  # pyright: ignore[reportAttributeAccessIssue]
+            for argument in input_arguments
+        ]
         raw_program = rich_program.to_raw_program()
         compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
-        backend_code = compiler.compile(raw_program, arguments)
-        return backend_code(arguments)
+        backend_functions_per_instruction: list[BackendFunctions[TArray]] = [  # pyright: ignore[reportAssignmentType]
+            choose_backend_functions(
+                operator,
+                stability_mode,
+                self.backend,
+                [
+                    rich_program.tensor_formats[ssa_id]
+                    for ssa_id in instruction_arguments
+                ],
+            )
+            for operator, instruction_arguments in rich_program.instructions
+        ]
+        backend_code = compiler.compile(
+            raw_program, input_arguments, backend_functions_per_instruction
+        )
+        return backend_code(input_arguments)
 
     def __add__(
         self, other: TensorExpression[TArray] | TArray
@@ -376,5 +398,22 @@ def _propagate_tensor_format(
             return "sparse"
         case ["sparse", "sparse"]:
             return "sparse"
+        case _:
+            raise NotImplementedError()
+
+
+def choose_backend_functions(
+    operator: RichOperator,
+    stability_mode: StabilityMode,
+    backend: Backend,
+    argument_formats: list[TensorFormat],
+) -> BackendFunctions[HasShape]:
+    match stability_mode:
+        case "none":
+            return STABILITY_AND_BACKEND_TO_TRANSLATION["none"][backend]
+        case "scaled":
+            raise NotImplementedError()
+        case "logspace":
+            raise NotImplementedError()
         case _:
             raise NotImplementedError()

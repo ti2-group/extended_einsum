@@ -35,33 +35,23 @@ class JaxDenseImplementation(
 
     @override
     @staticmethod
-    def softmax(array: DenseArray[jax.Array], axis: int = 0) -> DenseArray[jax.Array]:
-        return DenseArray(jax.nn.softmax(array._backend_array, axis=axis))
+    def sum(array: jax.Array, axis: int) -> jax.Array:
+        return jnp.sum(array, axis=axis)
 
     @override
     @staticmethod
-    def stack(
-        arrays: Sequence[DenseArray[jax.Array]], axis: int = 0
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(
-            jnp.stack([array._backend_array for array in arrays], axis=axis)
-        )
+    def max(array: jax.Array, axis: int) -> jax.Array:
+        return jnp.max(array, axis=axis)
 
     @override
     @staticmethod
-    def slice(
-        array: DenseArray[jax.Array], start: int, stop: int, axis: int = 0
-    ) -> DenseArray[jax.Array]:
-        slices = [slice(None)] * array._backend_array.ndim
-        slices[axis] = slice(start, stop)
-        return DenseArray(array._backend_array[tuple(slices)])
+    def stack(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
+        return jnp.stack(arrays, axis=axis)
 
     @override
     @staticmethod
-    def take(
-        array: DenseArray[jax.Array], indices: DenseArray[jax.Array], axis: int = 0
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(jnp.take(array._backend_array, indices._backend_array, axis))
+    def take(array: jax.Array, indices: jax.Array, axis: int) -> jax.Array:
+        return jnp.take(array, indices, axis=axis)
 
     @override
     @staticmethod
@@ -70,7 +60,7 @@ class JaxDenseImplementation(
 
     @override
     @staticmethod
-    def slice(array: jax.Array, start: int, stop: int, axis: int = 0) -> jax.Array:
+    def slice(array: jax.Array, start: int, stop: int, axis: int) -> jax.Array:
         normalized_axis = normalize_axis(axis, len(array.shape))
         slices = [slice(None)] * array.ndim
         slices[normalized_axis] = slice(start, stop)
@@ -78,13 +68,8 @@ class JaxDenseImplementation(
 
     @override
     @staticmethod
-    def add(
-        summand_array_1: DenseArray[jax.Array],
-        summand_array_2: DenseArray[jax.Array],
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(
-            summand_array_1._backend_array + summand_array_2._backend_array
-        )
+    def softmax(array: jax.Array, axis: int) -> jax.Array:
+        return jax.nn.softmax(array, axis=axis)
 
     @override
     @staticmethod
@@ -134,16 +119,15 @@ class JaxCompiler(BackendCompiler[jax.Array]):
     @override
     @staticmethod
     def compile(
-        program: RawProgram, arguments: Sequence[jax.Array]
+        program: RawProgram,
+        arguments: Sequence[jax.Array],
+        backend_functions_per_instruction: list[BackendFunctions[jax.Array]],
     ) -> Callable[[Sequence[jax.Array]], jax.Array]:
-        jax_translation = JaxTranslation()
         jit_prepared = jax.jit(
             partial(
                 run_program,
                 program,
-                backend_functions_per_instruction=[  # pyright: ignore[reportArgumentType]
-                    jax_translation for _ in program.instructions
-                ],
+                backend_functions_per_instruction=backend_functions_per_instruction,  # pyright: ignore[reportArgumentType]
             )
         )
         return jit_prepared.trace(arguments).lower().compile()
