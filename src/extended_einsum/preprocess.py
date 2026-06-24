@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import permutations
@@ -30,9 +30,11 @@ from extended_einsum.language import (
     TAKE_OPERATOR,
     UNARY_OPERATORS,
     Instruction,
+    Operator,
     Program,
     get_arguments,
     get_einsum_format_string,
+    get_instruction_specific_arguments,
     get_operator,
     get_select_axis,
     get_select_index,
@@ -59,6 +61,7 @@ from extended_einsum.shapes import (
 from extended_einsum.utils import parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_COMMUTATIVE_OPERATORS = frozenset({"+", "*"})
 
 
 def choose_single_format_backend_functions(
@@ -130,6 +133,324 @@ class RichProgram(Program):
 class PreprocessingRoutine(Protocol):
     @staticmethod
     def apply(program: RichProgram) -> RichProgram: ...
+
+
+@dataclass(frozen=True)
+class OutputDepthOpGroupMember:
+    op_index: int
+    result_id: int
+    arguments: tuple[int, ...]
+    canonical_argument_order: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _OutputDepthOpSignature:
+    depth: int
+    operator: Operator
+    canonical_instruction_specific_arguments: tuple[Any, ...]
+    operand_shapes: tuple[Shape, ...]
+    operand_tensor_formats: tuple[TensorFormat, ...]
+
+
+@dataclass(frozen=True)
+class OutputDepthOpGroup(_OutputDepthOpSignature):
+    members: tuple[OutputDepthOpGroupMember, ...]
+
+
+def group_identical_ops_by_output_depth(
+    program: RichProgram,
+    *,
+    min_group_size: int = 2,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Group live, canonically identical ops by nearest output depth."""
+    if min_group_size < 1:
+        raise ValueError("min_group_size must be at least 1")
+
+    output_depths = _nearest_output_depths(program)
+    result_dependencies = _instruction_result_dependencies(program)
+    buckets: dict[_OutputDepthOpSignature, list[OutputDepthOpGroupMember]] = {}
+
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        depth = output_depths.get(result_id)
+        if depth is None:
+            continue
+
+        signature, member = _canonicalize_output_depth_op(program, op_index, depth)
+        buckets.setdefault(signature, []).append(member)
+
+    groups: list[OutputDepthOpGroup] = []
+    for signature, members in buckets.items():
+        for safe_group in _split_dependency_safe_op_groups(
+            members,
+            result_dependencies,
+        ):
+            if len(safe_group) < min_group_size:
+                continue
+            canonical_args = signature.canonical_instruction_specific_arguments
+            groups.append(
+                OutputDepthOpGroup(
+                    depth=signature.depth,
+                    operator=signature.operator,
+                    canonical_instruction_specific_arguments=canonical_args,
+                    operand_shapes=signature.operand_shapes,
+                    operand_tensor_formats=signature.operand_tensor_formats,
+                    members=safe_group,
+                )
+            )
+
+    return tuple(sorted(groups, key=_output_depth_group_sort_key))
+
+
+def _nearest_output_depths(program: Program) -> dict[int, int]:
+    depths: dict[int, int] = {}
+    pending: deque[tuple[int, int]] = deque([(program.output_ssa, 0)])
+
+    while pending:
+        ssa_id, depth = pending.popleft()
+        known_depth = depths.get(ssa_id)
+        if known_depth is not None and known_depth <= depth:
+            continue
+        depths[ssa_id] = depth
+
+        if ssa_id < program.n_inputs:
+            continue
+
+        instruction = program.instructions[ssa_id - program.n_inputs]
+        for argument in get_arguments(instruction):
+            pending.append((argument, depth + 1))
+
+    return depths
+
+
+def _instruction_result_dependencies(program: Program) -> dict[int, frozenset[int]]:
+    dependencies: dict[int, frozenset[int]] = {
+        input_id: frozenset() for input_id in range(program.n_inputs)
+    }
+
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        result_dependencies: set[int] = set()
+        for argument in get_arguments(instruction):
+            result_dependencies.update(dependencies[argument])
+            if argument >= program.n_inputs:
+                result_dependencies.add(argument)
+        dependencies[result_id] = frozenset(result_dependencies)
+
+    return dependencies
+
+
+def _canonicalize_output_depth_op(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    instruction = program.instructions[op_index]
+    operator = get_operator(instruction)
+    if operator == EINSUM_OPERATOR:
+        return _canonicalize_output_depth_einsum(program, op_index, depth)
+
+    arguments = get_arguments(instruction)
+    canonical_argument_order = _canonical_argument_order_for_operator(
+        operator,
+        arguments,
+        program,
+    )
+    return _make_output_depth_op_group_entry(
+        program,
+        op_index,
+        depth,
+        operator,
+        get_instruction_specific_arguments(instruction),
+        canonical_argument_order,
+    )
+
+
+def _make_output_depth_op_group_entry(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+    operator: Operator,
+    canonical_args: tuple[Any, ...],
+    canonical_argument_order: tuple[int, ...],
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    arguments = get_arguments(program.instructions[op_index])
+    ordered_arguments = tuple(arguments[index] for index in canonical_argument_order)
+    operand_shapes = tuple(program.shapes[argument] for argument in ordered_arguments)
+    operand_tensor_formats = tuple(
+        program.tensor_formats[argument] for argument in ordered_arguments
+    )
+
+    return (
+        _OutputDepthOpSignature(
+            depth=depth,
+            operator=operator,
+            canonical_instruction_specific_arguments=canonical_args,
+            operand_shapes=operand_shapes,
+            operand_tensor_formats=operand_tensor_formats,
+        ),
+        OutputDepthOpGroupMember(
+            op_index=op_index,
+            result_id=program.n_inputs + op_index,
+            arguments=arguments,
+            canonical_argument_order=canonical_argument_order,
+        ),
+    )
+
+
+def _canonical_argument_order_for_operator(
+    operator: Operator,
+    arguments: tuple[int, ...],
+    program: RichProgram,
+) -> tuple[int, ...]:
+    if operator not in _COMMUTATIVE_OPERATORS:
+        return tuple(range(len(arguments)))
+
+    return tuple(
+        sorted(
+            range(len(arguments)),
+            key=lambda index: (
+                program.shapes[arguments[index]],
+                program.tensor_formats[arguments[index]].sort_key,
+                index,
+            ),
+        )
+    )
+
+
+def _canonicalize_output_depth_einsum(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    instruction = program.instructions[op_index]
+    arguments = get_arguments(instruction)
+
+    input_strings, output_string = parse_format_string(
+        get_einsum_format_string(instruction)
+    )
+
+    if len(input_strings) != len(arguments):
+        raise ValueError("einsum input count must match argument count")
+
+    # Labels alone do not identify indistinguishable operands; include tensor
+    # format metadata so canonical permutations keep tensor slots aligned.
+    argument_sort_keys = tuple(
+        (program.tensor_formats[argument].sort_key,)
+        for argument in arguments
+    )
+    canonical_format_string, canonical_argument_order = (
+        _canonicalize_einsum_string_from_output(
+            input_strings,
+            output_string,
+            argument_sort_keys,
+        )
+    )
+    return _make_output_depth_op_group_entry(
+        program,
+        op_index,
+        depth,
+        EINSUM_OPERATOR,
+        (canonical_format_string,),
+        canonical_argument_order,
+    )
+
+
+def _canonicalize_einsum_string_from_output(
+    input_strings: list[str],
+    output_string: str,
+    argument_sort_keys: tuple[tuple[Any, ...], ...],
+) -> tuple[str, tuple[int, ...]]:
+    if len(input_strings) != len(argument_sort_keys):
+        raise ValueError("argument sort keys must match einsum inputs")
+
+    label_map: dict[str, str] = {}
+    normalized_output = _normalize_einsum_subscript(output_string, label_map)
+
+    def argument_sort_key(argument_position: int) -> tuple[Any, ...]:
+        return (
+            _normalize_einsum_subscript(
+                input_strings[argument_position],
+                label_map.copy(),
+            ),
+            argument_sort_keys[argument_position],
+            argument_position,
+        )
+
+    canonical_argument_order = tuple(
+        sorted(range(len(input_strings)), key=argument_sort_key)
+    )
+    normalized_inputs = tuple(
+        _normalize_einsum_subscript(input_strings[index], label_map)
+        for index in canonical_argument_order
+    )
+    return (
+        f"{','.join(normalized_inputs)}->{normalized_output}",
+        canonical_argument_order,
+    )
+
+
+def _normalize_einsum_subscript(
+    subscript: str,
+    label_map: dict[str, str],
+) -> str:
+    normalized_labels: list[str] = []
+    for label in subscript:
+        if label not in label_map:
+            if len(label_map) >= len(_LABELS):
+                raise ValueError(
+                    "einsum expression uses more unique labels than can be "
+                    "represented for canonical grouping"
+                )
+            label_map[label] = _LABELS[len(label_map)]
+        normalized_labels.append(label_map[label])
+    return "".join(normalized_labels)
+
+
+def _split_dependency_safe_op_groups(
+    members: list[OutputDepthOpGroupMember],
+    result_dependencies: dict[int, frozenset[int]],
+) -> list[tuple[OutputDepthOpGroupMember, ...]]:
+    groups: list[list[OutputDepthOpGroupMember]] = []
+    for member in sorted(members, key=lambda item: item.op_index):
+        for group in groups:
+            if all(
+                not _op_members_depend_on_each_other(
+                    member,
+                    existing_member,
+                    result_dependencies,
+                )
+                for existing_member in group
+            ):
+                group.append(member)
+                break
+        else:
+            groups.append([member])
+    return [tuple(group) for group in groups]
+
+
+def _op_members_depend_on_each_other(
+    first: OutputDepthOpGroupMember,
+    second: OutputDepthOpGroupMember,
+    result_dependencies: dict[int, frozenset[int]],
+) -> bool:
+    first_result_id = first.result_id
+    second_result_id = second.result_id
+    return (
+        second_result_id in result_dependencies[first_result_id]
+        or first_result_id in result_dependencies[second_result_id]
+    )
+
+
+def _output_depth_group_sort_key(group: OutputDepthOpGroup) -> tuple[Any, ...]:
+    return (
+        group.depth,
+        group.operator,
+        group.canonical_instruction_specific_arguments,
+        group.operand_shapes,
+        tuple(tensor_format.sort_key for tensor_format in group.operand_tensor_formats),
+        tuple(member.op_index for member in group.members),
+    )
 
 
 @dataclass(frozen=True)
@@ -373,13 +694,15 @@ class OptimizeContractionPaths(PreprocessingRoutine):
 class FoldSameShapedOperations(PreprocessingRoutine):
     @override
     @staticmethod
-    def apply(program: RichProgram) -> RichProgram: ...
+    def apply(program: RichProgram) -> RichProgram:
+        return program  # TODO
 
 
 class OptimizeMemoryLayout(PreprocessingRoutine):
     @override
     @staticmethod
-    def apply(program: RichProgram) -> RichProgram: ...
+    def apply(program: RichProgram) -> RichProgram:
+        return program  # TODO
 
 
 def fold_independent_einsums(
