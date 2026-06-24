@@ -1,169 +1,138 @@
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Any, cast
+from typing import override
 
 import torch
-from exteinsum.language import (
-    EINSUM_OPERATOR,
-    SCALED_EINSUM_OPERATORS,
-    SLICE_OPERATOR,
-    SOFTMAX_OPERATOR,
-    STACK_OPERATOR,
-    TAKE_OPERATOR,
-    BinaryOperator,
-    Program,
-    UnaryOperator,
-    einsum_format,
-    instruction_arguments,
-    instruction_operator,
-    normalize_axis,
-    scaled_einsum_output_axis,
-    slice_axis,
-    slice_start,
-    slice_stop,
-    softmax_axis,
-    take_axis,
-)
-from exteinsum.translations._scaled import (
-    BackendOps,
-    binary_value,
-    normal_einsum,
-    scaled_einsum,
-    slice_value,
-    softmax_value,
-    stack_values,
-    take_value,
-    unary_value,
-)
 
-UNARY_OPERATOR_TO_TORCH: dict[UnaryOperator, Callable[[torch.Tensor], torch.Tensor]] = {
-    "sin": torch.sin,
-    "cos": torch.cos,
-    "tan": torch.tan,
-    "exp": torch.exp,
-    "log": torch.log,
-    "sqrt": torch.sqrt,
-}
+from extended_einsum.backend import BackendCompiler, BackendFunctions
+from extended_einsum.format import DenseArray
+from extended_einsum.language.core import RawProgram
+from extended_einsum.runtime import run_program
+from extended_einsum.utils import normalize_axis
 
-BINARY_OPERATOR_TO_TORCH: dict[
-    BinaryOperator, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-] = {
-    "+": torch.add,
-    "-": torch.sub,
-    "*": torch.mul,
-    "/": torch.div,
-    "**": torch.pow,
-}
+# jax.tree_util.register_dataclass(
+#     ScaledTensor,
+#     data_fields=["value", "log_scale"],
+#     meta_fields=["scale_axis"],
+# )
 
 
-def torch_einsum_helper(
-    format_string: str, operands: Sequence[torch.Tensor]
-) -> torch.Tensor:
-    return torch.einsum(format_string, *operands)
+class TorchTranslation(BackendFunctions[DenseArray[torch.Tensor]]):
+    @override
+    @staticmethod
+    def exp(array: DenseArray[torch.Tensor]) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.exp(array.backend_array))
 
+    @override
+    @staticmethod
+    def log(array: DenseArray[torch.Tensor]) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.log(array.backend_array))
 
-def einsum_to_torch(
-    format_string: str,
-) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-    return partial(torch_einsum_helper, format_string)
+    @override
+    @staticmethod
+    def sum(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.sum(array.backend_array, dim=axis))
 
+    @override
+    @staticmethod
+    def max(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.max(array.backend_array, dim=axis))  # pyright: ignore[reportArgumentType]
 
-def _torch_take(source: torch.Tensor, index: torch.Tensor, axis: int) -> torch.Tensor:
-    take_axis = normalize_axis(axis, len(source.shape))
-    result = torch.index_select(source, dim=take_axis, index=index.reshape(-1))
-    return result.reshape(
-        (*source.shape[:take_axis], *index.shape, *source.shape[take_axis + 1 :])
-    )
+    @override
+    @staticmethod
+    def stack(
+        arrays: Sequence[DenseArray[torch.Tensor]], axis: int
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(
+            torch.stack([array.backend_array for array in arrays], dim=axis)
+        )
 
+    @override
+    @staticmethod
+    def take(
+        array: DenseArray[torch.Tensor], indices: DenseArray[torch.Tensor], axis: int
+    ) -> DenseArray[torch.Tensor]:
+        # return torch.take(array, indices, dim=axis)
+        raise NotImplementedError("Torch doesn't support take with an axis.")
 
-def _torch_slice(
-    source: torch.Tensor, axis: int, start: int, stop: int
-) -> torch.Tensor:
-    normalized_axis = normalize_axis(axis, len(source.shape))
-    slices = [slice(None)] * source.ndim
-    slices[normalized_axis] = slice(start, stop)
-    return source[tuple(slices)]
+    @override
+    @staticmethod
+    def select(
+        array: DenseArray[torch.Tensor], axis: int, index: int
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.select(array.backend_array, dim=axis, index=index))
 
+    @override
+    @staticmethod
+    def slice(
+        array: DenseArray[torch.Tensor], start: int, stop: int, axis: int
+    ) -> DenseArray[torch.Tensor]:
+        normalized_axis = normalize_axis(axis, len(array.shape))
+        slices = [slice(None)] * array.backend_array.ndim
+        slices[normalized_axis] = slice(start, stop)
+        return DenseArray(array.backend_array[tuple(slices)])
 
-TORCH_OPS = BackendOps(
-    exp=torch.exp,
-    log=torch.log,
-    sum=torch.sum,
-    max=torch.amax,
-    stack=lambda values: torch.stack(list(values), dim=0),
-    take=_torch_take,
-    slice=_torch_slice,
-    softmax=lambda value, axis: torch.softmax(value, dim=axis),
-    reshape=torch.reshape,
-    einsum=lambda format_string, operands: torch.einsum(format_string, *operands),
-)
+    @override
+    @staticmethod
+    def softmax(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.softmax(array.backend_array, dim=axis))
 
-
-def execute_program_torch(program: Program, inputs: Sequence[Any]) -> Any:
-    tensors: list[Any] = list(inputs)
-    for instruction in program.instructions:
-        operator = instruction_operator(instruction)
-        arguments = instruction_arguments(instruction)
-        if operator == STACK_OPERATOR:
-            result = stack_values(
-                [tensors[argument] for argument in arguments], TORCH_OPS
+    @override
+    @staticmethod
+    def einsum(
+        format_string: str, *operands: DenseArray[torch.Tensor]
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(
+            torch.einsum(
+                format_string, *[operand.backend_array for operand in operands]
             )
-        elif operator == TAKE_OPERATOR:
-            result = take_value(
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                take_axis(instruction),
-                TORCH_OPS,
-            )
-        elif operator == SLICE_OPERATOR:
-            result = slice_value(
-                tensors[arguments[0]],
-                slice_axis(instruction),
-                slice_start(instruction),
-                slice_stop(instruction),
-                TORCH_OPS,
-            )
-        elif operator == SOFTMAX_OPERATOR:
-            result = softmax_value(
-                tensors[arguments[0]],
-                softmax_axis(instruction),
-                TORCH_OPS,
-            )
-        elif operator in UNARY_OPERATOR_TO_TORCH:
-            result = unary_value(
-                operator,
-                tensors[arguments[0]],
-                UNARY_OPERATOR_TO_TORCH[cast(UnaryOperator, operator)],
-                TORCH_OPS,
-            )
-        elif operator in BINARY_OPERATOR_TO_TORCH:
-            result = binary_value(
-                operator,
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                BINARY_OPERATOR_TO_TORCH[cast(BinaryOperator, operator)],
-            )
-        elif operator == EINSUM_OPERATOR:
-            result = normal_einsum(
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                TORCH_OPS,
-            )
-        elif operator in SCALED_EINSUM_OPERATORS:
-            result = scaled_einsum(
-                cast(Any, operator),
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                scaled_einsum_output_axis(instruction),
-                TORCH_OPS,
-            )
-        else:
-            raise ValueError(f"unsupported instruction operator: {operator!r}")
-        tensors.append(result)
-    return tensors[-1]
+        )
+
+    @override
+    @staticmethod
+    def add(
+        summand_array_1: DenseArray[torch.Tensor],
+        summand_array_2: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(summand_array_1.backend_array + summand_array_2.backend_array)
+
+    @override
+    @staticmethod
+    def subtract(
+        minuend_array: DenseArray[torch.Tensor],
+        subtrahend_array: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(minuend_array.backend_array - subtrahend_array.backend_array)
+
+    @override
+    @staticmethod
+    def multiply(
+        factor_array_1: DenseArray[torch.Tensor],
+        factor_array_2: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(factor_array_1.backend_array * factor_array_2.backend_array)
+
+    @override
+    @staticmethod
+    def divide(
+        dividend_array: DenseArray[torch.Tensor],
+        divisor_array: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(dividend_array.backend_array / divisor_array.backend_array)
 
 
-def compile_program_torch(
-    program: Program,
-) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-    return torch.compile(partial(execute_program_torch, program))
+class TorchCompiler(BackendCompiler[torch.Tensor]):
+    @override
+    @staticmethod
+    def compile(
+        program: RawProgram,
+        arguments: Sequence[torch.Tensor],
+        backend_functions_per_instruction: list[BackendFunctions[torch.Tensor]],
+    ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+        return torch.compile(  # pyright: ignore[reportReturnType] - this is just because torch.Shape isn't exactly a tuple
+            partial(
+                run_program,
+                program,
+                backend_functions_per_instruction=backend_functions_per_instruction,  # pyright: ignore[reportArgumentType]
+            )
+        )

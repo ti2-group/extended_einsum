@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from extended_einsum.language import BinaryOperator, UnaryOperator
+from extended_einsum.language.core import BinaryOperator, UnaryOperator
 
 
 @dataclass(frozen=True)
