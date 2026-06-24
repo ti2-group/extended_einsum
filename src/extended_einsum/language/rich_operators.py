@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Protocol, override
+from typing import Any, Protocol, override, runtime_checkable
 
 import numpy as np
 
@@ -32,6 +32,7 @@ class RichOperator(Protocol):
 ################################
 
 
+@runtime_checkable
 class UnaryArithmeticOperator(RichOperator, Protocol):
     @override
     def check_inputs(self, operands: list[Any]) -> None:
@@ -45,6 +46,7 @@ class UnaryArithmeticOperator(RichOperator, Protocol):
         return input_shapes[0]
 
 
+@runtime_checkable
 class BinaryArithmeticOperator(RichOperator, Protocol):
     @override
     def check_inputs(self, operands: list[Any]) -> None:

@@ -1,20 +1,12 @@
 from collections.abc import Sequence
-from typing import Callable, Literal, Protocol, TypeVar
+from typing import Callable, Protocol, TypeVar
 
 import jax
 import numpy as np
 import torch
 
 from extended_einsum.language.core import RawProgram
-from extended_einsum.language.types import HasShape
-
-Backend = Literal["torch", "numpy", "jax"]
-
-
-class HasBackend(Protocol):
-    @property
-    def backend(self) -> Backend: ...
-
+from extended_einsum.language.types import Backend, HasShape
 
 TBackendArray = TypeVar("TBackendArray", bound=HasShape)
 
@@ -27,17 +19,17 @@ class BackendFunctions(Protocol[TBackendArray]):
     def log(array: TBackendArray) -> TBackendArray: ...
 
     @staticmethod
-    def sum(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
+    def sum(array: TBackendArray, axis: int) -> TBackendArray: ...
 
     @staticmethod
-    def max(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
+    def max(array: TBackendArray, axis: int) -> TBackendArray: ...
 
     @staticmethod
-    def stack(arrays: Sequence[TBackendArray], axis: int = 0) -> TBackendArray: ...
+    def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
 
     @staticmethod
     def take(
-        array: TBackendArray, indices: TBackendArray, axis: int = 0
+        array: TBackendArray, indices: TBackendArray, axis: int
     ) -> TBackendArray: ...
 
     @staticmethod
@@ -45,11 +37,11 @@ class BackendFunctions(Protocol[TBackendArray]):
 
     @staticmethod
     def slice(
-        array: TBackendArray, start: int, stop: int, axis: int = 0
+        array: TBackendArray, start: int, stop: int, axis: int
     ) -> TBackendArray: ...
 
     @staticmethod
-    def softmax(array: TBackendArray, axis: int = 0) -> TBackendArray: ...
+    def softmax(array: TBackendArray, axis: int) -> TBackendArray: ...
 
     @staticmethod
     def einsum(format_string: str, *operands: TBackendArray) -> TBackendArray: ...

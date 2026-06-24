@@ -1,169 +1,118 @@
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Any, cast
+from typing import override
 
 import torch
-from exteinsum.language import (
-    EINSUM_OPERATOR,
-    SCALED_EINSUM_OPERATORS,
-    SLICE_OPERATOR,
-    SOFTMAX_OPERATOR,
-    STACK_OPERATOR,
-    TAKE_OPERATOR,
-    BinaryOperator,
-    Program,
-    UnaryOperator,
-    einsum_format,
-    instruction_arguments,
-    instruction_operator,
-    normalize_axis,
-    scaled_einsum_output_axis,
-    slice_axis,
-    slice_start,
-    slice_stop,
-    softmax_axis,
-    take_axis,
-)
-from exteinsum.translations._scaled import (
-    BackendOps,
-    binary_value,
-    normal_einsum,
-    scaled_einsum,
-    slice_value,
-    softmax_value,
-    stack_values,
-    take_value,
-    unary_value,
-)
 
-UNARY_OPERATOR_TO_TORCH: dict[UnaryOperator, Callable[[torch.Tensor], torch.Tensor]] = {
-    "sin": torch.sin,
-    "cos": torch.cos,
-    "tan": torch.tan,
-    "exp": torch.exp,
-    "log": torch.log,
-    "sqrt": torch.sqrt,
-}
+from extended_einsum.backend import BackendCompiler, BackendFunctions
+from extended_einsum.language.core import RawProgram
+from extended_einsum.runtime import run_program
+from extended_einsum.utils import normalize_axis
 
-BINARY_OPERATOR_TO_TORCH: dict[
-    BinaryOperator, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-] = {
-    "+": torch.add,
-    "-": torch.sub,
-    "*": torch.mul,
-    "/": torch.div,
-    "**": torch.pow,
-}
+# jax.tree_util.register_dataclass(
+#     ScaledTensor,
+#     data_fields=["value", "log_scale"],
+#     meta_fields=["scale_axis"],
+# )
 
 
-def torch_einsum_helper(
-    format_string: str, operands: Sequence[torch.Tensor]
-) -> torch.Tensor:
-    return torch.einsum(format_string, *operands)
+class TorchTranslation(BackendFunctions[torch.Tensor]):
+    @override
+    @staticmethod
+    def exp(array: torch.Tensor) -> torch.Tensor:
+        return torch.exp(array)
+
+    @override
+    @staticmethod
+    def log(array: torch.Tensor) -> torch.Tensor:
+        return torch.log(array)
+
+    @override
+    @staticmethod
+    def sum(array: torch.Tensor, axis: int) -> torch.Tensor:
+        return torch.sum(array, dim=axis)
+
+    @override
+    @staticmethod
+    def max(array: torch.Tensor, axis: int) -> torch.Tensor:
+        return torch.max(array, dim=axis)  # pyright: ignore[reportReturnType]
+
+    @override
+    @staticmethod
+    def stack(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+        return torch.stack(arrays, dim=axis)  # pyright: ignore[reportArgumentType]
+
+    @override
+    @staticmethod
+    def take(array: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:
+        # return torch.take(array, indices, dim=axis)
+        raise NotImplementedError("Torch doesn't support take with an axis.")
+
+    @override
+    @staticmethod
+    def select(array: torch.Tensor, axis: int, index: int) -> torch.Tensor:
+        return torch.select(array, dim=axis, index=index)
+
+    @override
+    @staticmethod
+    def slice(array: torch.Tensor, start: int, stop: int, axis: int) -> torch.Tensor:
+        normalized_axis = normalize_axis(axis, len(array.shape))
+        slices = [slice(None)] * array.ndim
+        slices[normalized_axis] = slice(start, stop)
+        return array[tuple(slices)]
+
+    @override
+    @staticmethod
+    def softmax(array: torch.Tensor, axis: int) -> torch.Tensor:
+        return torch.softmax(array, dim=axis)
+
+    @override
+    @staticmethod
+    def einsum(format_string: str, *operands: torch.Tensor) -> torch.Tensor:
+        return torch.einsum(format_string, *operands)
+
+    @override
+    @staticmethod
+    def add(
+        summand_array_1: torch.Tensor, summand_array_2: torch.Tensor
+    ) -> torch.Tensor:
+        return summand_array_1 + summand_array_2
+
+    @override
+    @staticmethod
+    def subtract(
+        minuend_array: torch.Tensor, subtrahend_array: torch.Tensor
+    ) -> torch.Tensor:
+        return minuend_array - subtrahend_array
+
+    @override
+    @staticmethod
+    def multiply(
+        factor_array_1: torch.Tensor, factor_array_2: torch.Tensor
+    ) -> torch.Tensor:
+        return factor_array_1 * factor_array_2
+
+    @override
+    @staticmethod
+    def divide(
+        dividend_array: torch.Tensor, divisor_array: torch.Tensor
+    ) -> torch.Tensor:
+        return dividend_array / divisor_array
 
 
-def einsum_to_torch(
-    format_string: str,
-) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-    return partial(torch_einsum_helper, format_string)
-
-
-def _torch_take(source: torch.Tensor, index: torch.Tensor, axis: int) -> torch.Tensor:
-    take_axis = normalize_axis(axis, len(source.shape))
-    result = torch.index_select(source, dim=take_axis, index=index.reshape(-1))
-    return result.reshape(
-        (*source.shape[:take_axis], *index.shape, *source.shape[take_axis + 1 :])
-    )
-
-
-def _torch_slice(
-    source: torch.Tensor, axis: int, start: int, stop: int
-) -> torch.Tensor:
-    normalized_axis = normalize_axis(axis, len(source.shape))
-    slices = [slice(None)] * source.ndim
-    slices[normalized_axis] = slice(start, stop)
-    return source[tuple(slices)]
-
-
-TORCH_OPS = BackendOps(
-    exp=torch.exp,
-    log=torch.log,
-    sum=torch.sum,
-    max=torch.amax,
-    stack=lambda values: torch.stack(list(values), dim=0),
-    take=_torch_take,
-    slice=_torch_slice,
-    softmax=lambda value, axis: torch.softmax(value, dim=axis),
-    reshape=torch.reshape,
-    einsum=lambda format_string, operands: torch.einsum(format_string, *operands),
-)
-
-
-def execute_program_torch(program: Program, inputs: Sequence[Any]) -> Any:
-    tensors: list[Any] = list(inputs)
-    for instruction in program.instructions:
-        operator = instruction_operator(instruction)
-        arguments = instruction_arguments(instruction)
-        if operator == STACK_OPERATOR:
-            result = stack_values(
-                [tensors[argument] for argument in arguments], TORCH_OPS
+class TorchCompiler(BackendCompiler[torch.Tensor]):
+    @override
+    @staticmethod
+    def compile(
+        program: RawProgram, arguments: Sequence[torch.Tensor]
+    ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+        torch_translation = TorchTranslation()
+        return torch.compile(  # pyright: ignore[reportReturnType] - this is just because torch.Shape isn't exactly a tuple
+            partial(
+                run_program,
+                program,
+                backend_functions_per_instruction=[  # pyright: ignore[reportArgumentType]
+                    torch_translation for _ in program.instructions
+                ],
             )
-        elif operator == TAKE_OPERATOR:
-            result = take_value(
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                take_axis(instruction),
-                TORCH_OPS,
-            )
-        elif operator == SLICE_OPERATOR:
-            result = slice_value(
-                tensors[arguments[0]],
-                slice_axis(instruction),
-                slice_start(instruction),
-                slice_stop(instruction),
-                TORCH_OPS,
-            )
-        elif operator == SOFTMAX_OPERATOR:
-            result = softmax_value(
-                tensors[arguments[0]],
-                softmax_axis(instruction),
-                TORCH_OPS,
-            )
-        elif operator in UNARY_OPERATOR_TO_TORCH:
-            result = unary_value(
-                operator,
-                tensors[arguments[0]],
-                UNARY_OPERATOR_TO_TORCH[cast(UnaryOperator, operator)],
-                TORCH_OPS,
-            )
-        elif operator in BINARY_OPERATOR_TO_TORCH:
-            result = binary_value(
-                operator,
-                tensors[arguments[0]],
-                tensors[arguments[1]],
-                BINARY_OPERATOR_TO_TORCH[cast(BinaryOperator, operator)],
-            )
-        elif operator == EINSUM_OPERATOR:
-            result = normal_einsum(
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                TORCH_OPS,
-            )
-        elif operator in SCALED_EINSUM_OPERATORS:
-            result = scaled_einsum(
-                cast(Any, operator),
-                einsum_format(instruction),
-                [tensors[argument] for argument in arguments],
-                scaled_einsum_output_axis(instruction),
-                TORCH_OPS,
-            )
-        else:
-            raise ValueError(f"unsupported instruction operator: {operator!r}")
-        tensors.append(result)
-    return tensors[-1]
-
-
-def compile_program_torch(
-    program: Program,
-) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-    return torch.compile(partial(execute_program_torch, program))
+        )
