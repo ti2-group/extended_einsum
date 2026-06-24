@@ -1,22 +1,17 @@
 from collections.abc import Sequence
 from typing import Any
 
-from extended_einsum.backend import BackendFunctions, TArray
-from extended_einsum.language import (
-    Operator,
-    Program,
-    get_arguments,
-    get_instruction_specific_arguments,
-    get_operator,
-)
+from extended_einsum.backend import BackendFunctions
+from extended_einsum.language.core import OperatorName, RawProgram
+from extended_einsum.language.types import HasShape
 
 
 def execute_operator(
-    operator: Operator,
-    tensor_arguments: Sequence[TArray],
+    operator: OperatorName,
+    tensor_arguments: Sequence[HasShape],
     instruction_specific_arguments: tuple[Any, ...],
-    backend_functions: BackendFunctions[TArray],
-) -> TArray:
+    backend_functions: BackendFunctions[HasShape],
+) -> HasShape:
     match operator:
         case "stack":
             axis = instruction_specific_arguments[0]
@@ -26,6 +21,10 @@ def execute_operator(
             return backend_functions.take(
                 tensor_arguments[0], tensor_arguments[1], axis
             )
+        case "select":
+            axis = instruction_specific_arguments[0]
+            index = instruction_specific_arguments[1]
+            return backend_functions.select(tensor_arguments[0], axis, index)
         case "slice":
             start = instruction_specific_arguments[0]
             stop = instruction_specific_arguments[1]
@@ -54,20 +53,20 @@ def execute_operator(
 
 
 def run_program(
-    program: Program,
-    inputs: Sequence[TArray],
-    backend_functions: BackendFunctions[TArray],
-) -> TArray:
-    tensors: list[TArray] = list(inputs)
-    for instruction in program.instructions:
-        operator = get_operator(instruction)
-        arguments = get_arguments(instruction)
-        instruction_specific_arguments = get_instruction_specific_arguments(instruction)
+    program: RawProgram,
+    inputs: Sequence[HasShape],
+    backend_functions_per_instruction: list[BackendFunctions[HasShape]],
+) -> HasShape:
+    tensors: list[HasShape] = list(inputs)
+    for i, (operator, arguments, instruction_specific_arguments) in enumerate(
+        program.instructions
+    ):
+        argument_tensors = [tensors[argument] for argument in arguments]
         result = execute_operator(
             operator,
-            [tensors[argument] for argument in arguments],
+            argument_tensors,
             instruction_specific_arguments,
-            backend_functions,
+            backend_functions_per_instruction[i],
         )
         tensors.append(result)
     return tensors[-1]
