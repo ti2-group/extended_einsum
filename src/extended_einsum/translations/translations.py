@@ -1,10 +1,26 @@
 from extended_einsum.backend import BackendCompiler, BackendFunctions
-from extended_einsum.translations.jax import JaxCompiler, JaxTranslation
+from extended_einsum.language.types import Backend, StabilityMode
+from extended_einsum.translations.jax import JaxCompiler, JaxDenseUnstableImplementation
+from extended_einsum.translations.torch import TorchCompiler, TorchTranslation
 
-BACKEND_TO_TRANSLATION: dict[str, BackendFunctions] = {
-    "jax": JaxTranslation(),
+STABILITY_AND_BACKEND_TO_TRANSLATION: dict[
+    StabilityMode, dict[Backend, BackendFunctions]
+] = {
+    "none": {
+        "jax": JaxDenseUnstableImplementation(),
+        "torch": TorchTranslation(),
+    },
+    "scaled": {
+        "jax": JaxDenseUnstableImplementation(),
+        "torch": TorchTranslation(),
+    },
+    "logspace": {
+        "jax": JaxDenseUnstableImplementation(),
+        "torch": TorchTranslation(),
+    },
 }
 
-BACKEND_TO_COMPILER: dict[str, BackendCompiler] = {
+BACKEND_TO_COMPILER: dict[Backend, BackendCompiler] = {
     "jax": JaxCompiler(),
+    "torch": TorchCompiler(),
 }

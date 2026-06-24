@@ -4,47 +4,12 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import permutations
-from typing import Any, Literal, Protocol, override
+from typing import Any, Protocol, override
 
 import numpy as np
 
-from extended_einsum.backend import (
-    BackendFunctions,
-    MultiFormatBackendFunctions,
-    SingleFormatBackendFunctions,
-    TBackendArrayCovariant,
-)
-from extended_einsum.format import (
-    DenseFormat,
-    DenseLogspaceFormat,
-    DenseScaledFormat,
-    TensorFormat,
-)
-from extended_einsum.language import (
-    BINARY_OPERATORS,
-    EINSUM_OPERATOR,
-    SELECT_OPERATOR,
-    SLICE_OPERATOR,
-    SOFTMAX_OPERATOR,
-    STACK_OPERATOR,
-    TAKE_OPERATOR,
-    UNARY_OPERATORS,
-    Instruction,
-    Program,
-    get_arguments,
-    get_einsum_format_string,
-    get_operator,
-    get_select_axis,
-    get_select_index,
-    get_slice_axis,
-    get_slice_start,
-    get_slice_stop,
-    get_softmax_axis,
-    get_stack_axis,
-    get_take_axis,
-    make_einsum_instruction,
-    map_instruction_arguments,
-)
+from extended_einsum.language.rich_operators import OperatorEinsum
+from extended_einsum.language.rich_program import RichInstruction, RichProgram
 from extended_einsum.shapes import (
     Shape,
     infer_binary_shape,
@@ -59,72 +24,6 @@ from extended_einsum.shapes import (
 from extended_einsum.utils import parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-
-def choose_single_format_backend_functions(
-    argument_tensor_format: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> SingleFormatBackendFunctions:
-    match argument_tensor_format:
-        case DenseFormat():
-            return backend_functions.unary_dense_only
-        case DenseLogspaceFormat():
-            return backend_functions.unary_logspace_only
-        case DenseScaledFormat():
-            return backend_functions.unary_scaled_only
-        case _:
-            raise NotImplementedError()
-
-
-def choose_multi_format_backend_functions(
-    tensor_format_1: TensorFormat,
-    tensor_format_2: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> MultiFormatBackendFunctions:
-    match (tensor_format_1, tensor_format_2):
-        case (DenseFormat(), DenseFormat()):
-            return backend_functions.binary_dense_only
-        case (DenseLogspaceFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_logspace_only
-        case (DenseScaledFormat(), DenseScaledFormat()):
-            return backend_functions.binary_scaled_only
-        case (DenseFormat(), DenseScaledFormat()):
-            return backend_functions.binary_dense_scaled
-        case (DenseScaledFormat(), DenseFormat()):
-            return backend_functions.binary_scaled_dense
-        case (DenseLogspaceFormat(), DenseFormat()):
-            return backend_functions.binary_logspace_dense
-        case (DenseFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_dense_logspace
-        case _:
-            raise NotImplementedError()
-
-
-@dataclass(frozen=True)
-class RichProgram(Program):
-    instructions: list[Instruction]
-    n_inputs: int
-
-    stability: Literal["none", "scaled", "logspace"]
-    shapes: list[Shape]
-    tensor_formats: list[TensorFormat]
-    parameter_indices: list[int]
-    consumers_of_ssa_id: list[list[int]]
-
-    def __post_init__(self) -> None:
-        n_ssa_ids = self.n_inputs + len(self.instructions)
-
-        if len(self.shapes) != n_ssa_ids:
-            raise ValueError(
-                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-        if len(self.tensor_formats) != n_ssa_ids:
-            raise ValueError(
-                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-
-    def strip(self) -> Program:
-        return Program(self.instructions, self.n_inputs)
 
 
 class PreprocessingRoutine(Protocol):
@@ -159,16 +58,14 @@ def extract_connected_einsum_components(
         if op_index in visited:
             continue
 
-        instruction = program.instructions[op_index]
-        if get_operator(instruction) != EINSUM_OPERATOR:
+        operator, arguments = program.instructions[op_index]
+        if not isinstance(operator, OperatorEinsum):
             visited.add(op_index)
-            pending_ssa_ids.extend(get_arguments(instruction))
+            pending_ssa_ids.extend(arguments)
             continue
 
         sink_op_index = op_index
-        _sink_inputs, sink_output = parse_format_string(
-            get_einsum_format_string(instruction)
-        )
+        _sink_inputs, sink_output = parse_format_string(operator.format_string)
         next_label = 0
 
         def new_label() -> str:
@@ -191,14 +88,15 @@ def extract_connected_einsum_components(
 
             visited.add(einsum_op_index)
             component.add(einsum_op_index)
-            einsum_instruction = program.instructions[einsum_op_index]
+            einsum_operator, einsum_arguments = program.instructions[einsum_op_index]
+            assert isinstance(einsum_operator, OperatorEinsum)
             input_strings, output_string = parse_format_string(
-                get_einsum_format_string(einsum_instruction)
+                einsum_operator.format_string
             )
             label_map = dict(zip(output_string, expected_output, strict=True))
 
             for argument, input_string in zip(
-                get_arguments(einsum_instruction), input_strings, strict=True
+                einsum_arguments, input_strings, strict=True
             ):
                 # Preserve labels shared with the output and allocate labels for
                 # contraction indices that are first encountered at this operation.
@@ -211,11 +109,11 @@ def extract_connected_einsum_components(
 
                 if argument >= program.n_inputs:
                     producer_op_index = argument - program.n_inputs
-                    producer = program.instructions[producer_op_index]
+                    producer_operator, _ = program.instructions[producer_op_index]
                     # A uniquely consumed einsum producer belongs to this component.
                     # Everything else is a boundary input and a new traversal root.
                     if (
-                        get_operator(producer) == EINSUM_OPERATOR
+                        isinstance(producer_operator, OperatorEinsum)
                         and len(program.consumers_of_ssa_id[argument]) == 1
                     ):
                         pending_einsum_ops.append((producer_op_index, relabeled_input))
@@ -245,7 +143,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         # Compute a replacement contraction path for each extracted component.
         blocks: dict[
             int,
-            tuple[frozenset[int], tuple[int, ...], tuple[Instruction, ...]],
+            tuple[frozenset[int], tuple[int, ...], tuple[RichInstruction, ...]],
         ] = {}
         for component in extract_connected_einsum_components(program):
             if len(component.boundary_arguments) < 2:
@@ -270,7 +168,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 continue
 
             planned_instructions = tuple(
-                make_einsum_instruction(step_format, first, second)
+                (OperatorEinsum(step_format), (first, second))
                 for first, second, step_format in to_annotated_ssa_path(
                     component.format_string,
                     path,
@@ -294,7 +192,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             for op_index in component
         }
         tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
-        instructions: list[Instruction] = []
+        instructions: list[RichInstruction] = []
         shapes = program.shapes[: program.n_inputs]
         tensor_formats = program.tensor_formats[: program.n_inputs]
 
@@ -314,21 +212,22 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 }
                 block_format = program.tensor_formats[result_id]
                 for step_index, planned_instruction in enumerate(planned_instructions):
-                    planned_arguments = get_arguments(planned_instruction)
+                    planned_operator, planned_arguments = planned_instruction
+                    assert isinstance(planned_operator, OperatorEinsum)
                     mapped_arguments = tuple(
                         local_tensor_map[argument] for argument in planned_arguments
                     )
                     argument_map = dict(
                         zip(planned_arguments, mapped_arguments, strict=True)
                     )
-                    mapped_instruction = map_instruction_arguments(
+                    mapped_instruction = _map_instruction_arguments(
                         planned_instruction, argument_map.__getitem__
                     )
                     planned_result_id = program.n_inputs + len(instructions)
                     instructions.append(mapped_instruction)
                     shapes.append(
                         infer_einsum_shape(
-                            get_einsum_format_string(mapped_instruction),
+                            planned_operator.format_string,
                             [shapes[argument] for argument in mapped_arguments],
                         )
                     )
@@ -342,31 +241,22 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             if op_index in block_ops:
                 continue
 
-            arguments = get_arguments(instruction)
+            _, arguments = instruction
             argument_map = {argument: tensor_map[argument] for argument in arguments}
             tensor_map[result_id] = program.n_inputs + len(instructions)
             instructions.append(
-                map_instruction_arguments(instruction, argument_map.__getitem__)
+                _map_instruction_arguments(instruction, argument_map.__getitem__)
             )
             shapes.append(program.shapes[result_id])
             tensor_formats.append(program.tensor_formats[result_id])
 
-        # Consumer IDs depend on instruction positions, so regenerate them after
-        # the rewritten instruction order and SSA IDs are final.
-        consumers_of_ssa_id = [[] for _ in shapes]
-        for op_index, instruction in enumerate(instructions):
-            consumer_ssa_id = program.n_inputs + op_index
-            for argument in get_arguments(instruction):
-                consumers_of_ssa_id[argument].append(consumer_ssa_id)
-
         return RichProgram(
             instructions=instructions,
             n_inputs=program.n_inputs,
-            stability=program.stability,
+            stability_mode=program.stability_mode,
             shapes=shapes,
             tensor_formats=tensor_formats,
             parameter_indices=program.parameter_indices,
-            consumers_of_ssa_id=consumers_of_ssa_id,
         )
 
 
@@ -383,7 +273,7 @@ class OptimizeMemoryLayout(PreprocessingRoutine):
 
 
 def fold_independent_einsums(
-    program: Program,
+    program: RichProgram,
     inputs: Sequence[Any],
     *,
     min_group_size: int = 2,
@@ -2456,10 +2346,8 @@ def _infer_instruction_tensor_format(
     return None
 
 
-def _parse_einsum(expression: str) -> ParsedEinsum:
-    index_strings, output_string = parse_format_string(expression)
-    return ParsedEinsum(tuple(index_strings), output_string)
-
-
-def _format_einsum(parsed: ParsedEinsum) -> str:
-    return f"{','.join(parsed.inputs)}->{parsed.output}"
+def _map_instruction_arguments(
+    instruction: RichInstruction, shift_argument: Callable[[int], int]
+) -> RichInstruction:
+    operator, argument_ssa_ids = instruction
+    return operator, tuple(shift_argument(argument) for argument in argument_ssa_ids)
