@@ -30,22 +30,22 @@ class JaxTranslation(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def sum(array: jax.Array, axis: int | None = None) -> jax.Array:
+    def sum(array: jax.Array, axis: int) -> jax.Array:
         return jnp.sum(array, axis=axis)
 
     @override
     @staticmethod
-    def max(array: jax.Array, axis: int | None = None) -> jax.Array:
+    def max(array: jax.Array, axis: int) -> jax.Array:
         return jnp.max(array, axis=axis)
 
     @override
     @staticmethod
-    def stack(arrays: Sequence[jax.Array], axis: int = 0) -> jax.Array:
+    def stack(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
         return jnp.stack(arrays, axis=axis)
 
     @override
     @staticmethod
-    def take(array: jax.Array, indices: jax.Array, axis: int = 0) -> jax.Array:
+    def take(array: jax.Array, indices: jax.Array, axis: int) -> jax.Array:
         return jnp.take(array, indices, axis=axis)
 
     @override
@@ -55,7 +55,7 @@ class JaxTranslation(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def slice(array: jax.Array, start: int, stop: int, axis: int = 0) -> jax.Array:
+    def slice(array: jax.Array, start: int, stop: int, axis: int) -> jax.Array:
         normalized_axis = normalize_axis(axis, len(array.shape))
         slices = [slice(None)] * array.ndim
         slices[normalized_axis] = slice(start, stop)
@@ -63,7 +63,7 @@ class JaxTranslation(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def softmax(array: jax.Array, axis: int = 0) -> jax.Array:
+    def softmax(array: jax.Array, axis: int) -> jax.Array:
         return jax.nn.softmax(array, axis=axis)
 
     @override
@@ -96,16 +96,15 @@ class JaxCompiler(BackendCompiler[jax.Array]):
     @override
     @staticmethod
     def compile(
-        program: RawProgram, arguments: Sequence[jax.Array]
+        program: RawProgram,
+        arguments: Sequence[jax.Array],
+        backend_functions_per_instruction: list[BackendFunctions[jax.Array]],
     ) -> Callable[[Sequence[jax.Array]], jax.Array]:
-        jax_translation = JaxTranslation()
         jit_prepared = jax.jit(
             partial(
                 run_program,
                 program,
-                backend_functions_per_instruction=[  # pyright: ignore[reportArgumentType]
-                    jax_translation for _ in program.instructions
-                ],
+                backend_functions_per_instruction=backend_functions_per_instruction,  # pyright: ignore[reportArgumentType]
             )
         )
         return jit_prepared.trace(arguments).lower().compile()

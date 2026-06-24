@@ -1,7 +1,11 @@
 from dataclasses import dataclass
 from typing import Generic, override
 
-from extended_einsum.backend import TBackendArray, get_backend_of_array
+import jax
+import numpy as np
+import torch
+
+from extended_einsum.backend import TBackendArray
 from extended_einsum.interface.tensor_expression import (
     Array,
     Parameter,
@@ -22,7 +26,7 @@ from extended_einsum.language.rich_operators import (
     OperatorTake,
     OperatorTan,
 )
-from extended_einsum.language.types import Backend, Shape, TensorFormat
+from extended_einsum.language.types import Backend, HasShape, Shape, TensorFormat
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 
@@ -39,12 +43,23 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
     @property
     @override
     def backend(self) -> Backend:
-        return get_backend_of_array(self.backend_array)
+        return _get_backend_of_array(self.backend_array)
 
     @property
     @override
     def format(self) -> TensorFormat:
         return self._format
+
+
+def _get_backend_of_array(array: HasShape) -> Backend:
+    if isinstance(array, torch.Tensor):
+        return "torch"
+    elif isinstance(array, np.ndarray):
+        return "numpy"
+    elif isinstance(array, jax.Array):
+        return "jax"
+    else:
+        raise ValueError(f"Unsupported array type: {type(array)}")
 
 
 def array(
