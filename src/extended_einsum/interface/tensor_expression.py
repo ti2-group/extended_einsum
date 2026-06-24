@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Generic, override
+from typing import Generic, override
 
 from extended_einsum.backend import BackendCompiler, BackendFunctions
+from extended_einsum.language.rich_instruction import map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
     OperatorCos,
@@ -104,15 +105,15 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
         backend_functions_per_instruction: list[BackendFunctions[TArray]] = [  # pyright: ignore[reportAssignmentType]
             choose_backend_functions(
-                operator,
+                instruction.operator,
                 stability_mode,
                 self.backend,
                 [
                     rich_program.tensor_formats[ssa_id]
-                    for ssa_id in instruction_arguments
+                    for ssa_id in instruction.argument_ssa_ids
                 ],
             )
-            for operator, instruction_arguments in rich_program.instructions
+            for instruction in rich_program.instructions
         ]
         backend_code = compiler.compile(
             raw_program, input_arguments, backend_functions_per_instruction
@@ -202,17 +203,10 @@ def _compile_recursive(
 
     # add the instruction to the program
     ssa_ids[expression_key] = len(ssa_ids)
-    instructions.append((tensor_expression.operator, argument_ssa_ids))
+    instructions.append(RichInstruction(tensor_expression.operator, argument_ssa_ids))
     shapes[ssa_ids[expression_key]] = tensor_expression.shape
     tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
     return ssa_ids[expression_key]
-
-
-def _map_instruction_arguments(
-    instruction: RichInstruction, shift_argument: Callable[[int], int]
-) -> RichInstruction:
-    operator, argument_ssa_ids = instruction
-    return operator, tuple(shift_argument(argument) for argument in argument_ssa_ids)
 
 
 def extract_program(
@@ -260,7 +254,7 @@ def extract_program(
 
     # shift ssa ids
     for i, instruction in enumerate(instructions):
-        instructions[i] = _map_instruction_arguments(instruction, shift_ssa_id)
+        instructions[i] = map_instruction_arguments(instruction, shift_ssa_id)
     parameter_positions = [shift_ssa_id(position) for position in parameter_positions]
     shapes = {shift_ssa_id(key): value for key, value in shapes.items()}
     tensor_formats = {shift_ssa_id(key): value for key, value in tensor_formats.items()}
