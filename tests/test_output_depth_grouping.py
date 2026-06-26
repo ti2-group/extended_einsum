@@ -4,7 +4,9 @@ from extended_einsum.format import DenseFormat
 from extended_einsum.language import Instruction, get_arguments, make_einsum_instruction
 from extended_einsum.preprocess import (
     RichProgram,
+    extract_connected_einsum_components,
     group_identical_ops_by_output_depth,
+    to_annotated_ssa_path,
 )
 from extended_einsum.shapes import Shape
 
@@ -336,7 +338,7 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
             ((2,), (0,), (1,)),
         )
 
-    def test_raises_when_unique_labels_exceed_canonical_capacity(self) -> None:
+    def test_canonicalizes_when_unique_labels_exceed_ascii_capacity(self) -> None:
         labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0"
         program = _program(
             instructions=[
@@ -349,8 +351,64 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
             ],
         )
 
-        with self.assertRaisesRegex(ValueError, "more unique labels"):
-            group_identical_ops_by_output_depth(program, min_group_size=1)
+        groups = group_identical_ops_by_output_depth(program, min_group_size=1)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(
+            groups[0].canonical_instruction_specific_arguments,
+            (f"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\u0100->a",),
+        )
+
+
+class EinsumLabelAllocationTests(unittest.TestCase):
+    def test_extract_connected_einsum_components_prefers_ascii_before_extended(self) -> None:
+        labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0"
+        program = _program(
+            instructions=[
+                make_einsum_instruction(f"{labels}->a", 0),
+                make_einsum_instruction("a,b->ab", 2, 1),
+            ],
+            n_inputs=2,
+            shapes=[
+                (1,) * len(labels),
+                (2,),
+                (1,),
+                (1, 2),
+            ],
+        )
+
+        components = extract_connected_einsum_components(program)
+
+        self.assertEqual(len(components), 1)
+        self.assertTrue(components[0].format_string.endswith("->ab"))
+        self.assertIn("\u0100", components[0].format_string)
+
+    def test_to_annotated_ssa_path_prefers_clean_ascii_per_expression(self) -> None:
+        annotated_path = to_annotated_ssa_path(
+            "pq,qr,rs->ps",
+            [(0, 1), (2, 3)],
+            prefer_ascii=True,
+        )
+
+        self.assertEqual(
+            annotated_path,
+            [
+                (0, 1, "ab,bc->ac"),
+                (2, 3, "ab,ca->cb"),
+            ],
+        )
+
+    def test_to_annotated_ssa_path_falls_back_to_extended_labels(self) -> None:
+        labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01"
+
+        annotated_path = to_annotated_ssa_path(
+            f"{labels},{labels}->{labels}",
+            [(0, 1)],
+            prefer_ascii=True,
+        )
+
+        self.assertEqual(len(annotated_path), 1)
+        self.assertIn("\u0100", annotated_path[0][2])
 
 
 if __name__ == "__main__":

@@ -38,6 +38,53 @@ _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _COMMUTATIVE_OPERATORS = frozenset({"+", "*"})
 
 
+class _EinsumLabelAllocator:
+    def __init__(
+        self,
+        *,
+        source_to_label: dict[str, str] | None = None,
+        next_label_index: int = 0,
+    ) -> None:
+        self._source_to_label = (
+            {} if source_to_label is None else source_to_label.copy()
+        )
+        self._next_label_index = next_label_index
+
+    def copy(self) -> _EinsumLabelAllocator:
+        return _EinsumLabelAllocator(
+            source_to_label=self._source_to_label,
+            next_label_index=self._next_label_index,
+        )
+
+    def new_label(self) -> str:
+        label_index = self._next_label_index
+        self._next_label_index += 1
+        if label_index < len(_LABELS):
+            return _LABELS[label_index]
+        return chr(0x100 + label_index - len(_LABELS))
+
+    def get_label(self, source_label: str) -> str:
+        if source_label not in self._source_to_label:
+            self._source_to_label[source_label] = self.new_label()
+        return self._source_to_label[source_label]
+
+    def normalize_subscript(self, subscript: str) -> str:
+        return "".join(self.get_label(label) for label in subscript)
+
+    def normalize_expression(self, expression: str) -> str:
+        parts: list[str] = []
+        for char in expression:
+            if char in ",->":
+                parts.append(char)
+                continue
+            parts.append(self.get_label(char))
+        return "".join(parts)
+
+    @classmethod
+    def remap_expression(cls, expression: str) -> str:
+        return cls().normalize_expression(expression)
+
+
 def choose_single_format_backend_functions(
     argument_tensor_format: TensorFormat,
     backend_functions: BackendFunctions[TBackendArrayCovariant],
@@ -337,14 +384,13 @@ def _canonicalize_einsum_string_from_output(
     if len(input_strings) != len(argument_sort_keys):
         raise ValueError("argument sort keys must match einsum inputs")
 
-    label_map: dict[str, str] = {}
-    normalized_output = _normalize_einsum_subscript(output_string, label_map)
+    label_allocator = _EinsumLabelAllocator()
+    normalized_output = label_allocator.normalize_subscript(output_string)
 
     def argument_sort_key(argument_position: int) -> tuple[Any, ...]:
         return (
-            _normalize_einsum_subscript(
-                input_strings[argument_position],
-                label_map.copy(),
+            label_allocator.copy().normalize_subscript(
+                input_strings[argument_position]
             ),
             argument_sort_keys[argument_position],
             argument_position,
@@ -354,30 +400,13 @@ def _canonicalize_einsum_string_from_output(
         sorted(range(len(input_strings)), key=argument_sort_key)
     )
     normalized_inputs = tuple(
-        _normalize_einsum_subscript(input_strings[index], label_map)
+        label_allocator.normalize_subscript(input_strings[index])
         for index in canonical_argument_order
     )
     return (
         f"{','.join(normalized_inputs)}->{normalized_output}",
         canonical_argument_order,
     )
-
-
-def _normalize_einsum_subscript(
-    subscript: str,
-    label_map: dict[str, str],
-) -> str:
-    normalized_labels: list[str] = []
-    for label in subscript:
-        if label not in label_map:
-            if len(label_map) >= len(_LABELS):
-                raise ValueError(
-                    "einsum expression uses more unique labels than can be "
-                    "represented for canonical grouping"
-                )
-            label_map[label] = _LABELS[len(label_map)]
-        normalized_labels.append(label_map[label])
-    return "".join(normalized_labels)
 
 
 def _split_dependency_safe_op_groups(
@@ -463,17 +492,11 @@ def extract_connected_einsum_components(
         _sink_inputs, sink_output = parse_format_string(
             get_einsum_format_string(instruction)
         )
-        next_label = 0
-
-        def new_label() -> str:
-            nonlocal next_label
-            label = chr(0x100 + next_label)
-            next_label += 1
-            return label
+        label_allocator = _EinsumLabelAllocator()
 
         # Every queued einsum carries the component-wide labels that its output
         # must use. This propagates consistent labels from consumers to producers.
-        relabeled_output = "".join(new_label() for _ in sink_output)
+        relabeled_output = "".join(label_allocator.new_label() for _ in sink_output)
         component: set[int] = set()
         boundary_arguments: list[int] = []
         boundary_strings: list[str] = []
@@ -499,7 +522,7 @@ def extract_connected_einsum_components(
                 relabeled_input_labels: list[str] = []
                 for label in input_string:
                     if label not in label_map:
-                        label_map[label] = new_label()
+                        label_map[label] = label_allocator.new_label()
                     relabeled_input_labels.append(label_map[label])
                 relabeled_input = "".join(relabeled_input_labels)
 
@@ -568,7 +591,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 for first, second, step_format in to_annotated_ssa_path(
                     component.format_string,
                     path,
-                    is_ascii=True,
+                    prefer_ascii=True,
                 )
             )
             blocks[component.sink_op_index] = (
@@ -681,7 +704,7 @@ class OptimizeMemoryLayout(PreprocessingRoutine):
 def to_annotated_ssa_path(
     format_string: str,
     ssa_path: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    is_ascii: bool = False,
+    prefer_ascii: bool = False,
 ) -> list[tuple[int, int, str]]:
     """Annotate an SSA path with the pairwise einsum string for each step."""
     inputs, output = format_string.replace(" ", "").split("->")
@@ -712,30 +735,12 @@ def to_annotated_ssa_path(
                 histogram[char] += 1
 
         pairwise_expression = f"{t1},{t2}->{t3}"
-        if is_ascii:
-            pairwise_expression = _to_ascii_einsum(pairwise_expression)
+        if prefer_ascii:
+            pairwise_expression = _EinsumLabelAllocator.remap_expression(
+                pairwise_expression
+            )
 
         annotated_ssa_path.append((first, second, pairwise_expression))
         inputs.append(t3)
 
     return annotated_ssa_path
-
-
-def _to_ascii_einsum(expression: str) -> str:
-    ascii_index = 0
-    char_mapping: dict[str, str] = {}
-    parts: list[str] = []
-    for char in expression:
-        if char in ",->":
-            parts.append(char)
-            continue
-        if char not in char_mapping:
-            if ascii_index == len(_LABELS):
-                raise RuntimeError(
-                    f"ERROR: {expression} cannot be converted to ASCII, "
-                    "it is too large."
-                )
-            char_mapping[char] = _LABELS[ascii_index]
-            ascii_index += 1
-        parts.append(char_mapping[char])
-    return "".join(parts)
