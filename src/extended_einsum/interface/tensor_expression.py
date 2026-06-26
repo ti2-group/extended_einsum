@@ -265,11 +265,11 @@ def _extract_program_recursive(
             instructions.append((operator, tuple(argument_ssa_ids), ()))
 
     # add shape and format information
-    shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
-    tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
+    shapes[ssa_ids[expression_key]] = tensor_expression.shape
+    tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
     # add this expression as a consumer of all its arguments
     for argument_ssa_id in argument_ssa_ids:
-        consumers_of_ssa_id[argument_ssa_id].append(input_ssa_ids[expression_key])
+        consumers_of_ssa_id[argument_ssa_id].append(ssa_ids[expression_key])
     return ssa_ids[expression_key]
 
 
@@ -318,13 +318,14 @@ def extract_program(
     }
 
     # turn dicts into lists
-    shapes_list: list[Shape] = [()] * n_inputs
+    n_ssa_ids = n_inputs + len(instructions)
+    shapes_list: list[Shape] = [()] * n_ssa_ids
     for i, shape in shapes.items():
         shapes_list[i] = shape
-    tensor_formats_list: list[TensorFormat] = [DenseFormat()] * n_inputs
+    tensor_formats_list: list[TensorFormat] = [DenseFormat()] * n_ssa_ids
     for i, tensor_format in tensor_formats.items():
         tensor_formats_list[i] = tensor_format
-    consumers_of_ssa_id_list = [[] for _ in range(n_inputs + len(instructions))]
+    consumers_of_ssa_id_list = [[] for _ in range(n_ssa_ids)]
     for i, consumers in consumers_of_ssa_id.items():
         consumers_of_ssa_id_list[i] = consumers
 

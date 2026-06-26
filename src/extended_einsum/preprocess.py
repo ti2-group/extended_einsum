@@ -47,6 +47,7 @@ from extended_einsum.language import (
     make_einsum_instruction,
     map_instruction_arguments,
 )
+from extended_einsum.scale import ScaledTensor
 from extended_einsum.shapes import (
     Shape,
     infer_binary_shape,
@@ -336,8 +337,7 @@ def _canonicalize_output_depth_einsum(
     # Labels alone do not identify indistinguishable operands; include tensor
     # format metadata so canonical permutations keep tensor slots aligned.
     argument_sort_keys = tuple(
-        (program.tensor_formats[argument].sort_key,)
-        for argument in arguments
+        (program.tensor_formats[argument].sort_key,) for argument in arguments
     )
     canonical_format_string, canonical_argument_order = (
         _canonicalize_einsum_string_from_output(
