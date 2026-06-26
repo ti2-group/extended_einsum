@@ -49,15 +49,8 @@ class RichProgram:
         object.__setattr__(self, "consumers_of_ssa_id", consumers_of_ssa_id)
 
     @property
-    def ssa_parents(self) -> dict[int, ArgumentSSAIds]:
-        """A dictionary that maps each SSA-IDs to the SSA-IDs of its parents."""
-
-        # the SSA-IDs 0 to program.n_inputs - 1 are occupied by the inputs, so the first intermediate tensor has SSA-ID program.n_inputs
-        parents: dict[int, ArgumentSSAIds] = {i: () for i in range(self.n_inputs)}
-        for i, (_, arguments) in enumerate(self.instructions):
-            # each instruction writes to a new SSA-ID, so we just fill the parents with the SSA-IDs of the arguments
-            parents[self.n_inputs + i] = arguments
-        return parents
+    def output_ssa(self) -> int:
+        return self.n_inputs + len(self.instructions) - 1
 
     def to_raw_program(self) -> RawProgram:
         return RawProgram(

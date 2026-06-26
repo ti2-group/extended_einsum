@@ -1,4 +1,4 @@
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 Shape = tuple[int, ...]
 
@@ -22,3 +22,9 @@ class HasBackend(Protocol):
 class HasFormat(Protocol):
     @property
     def format(self) -> TensorFormat: ...
+
+
+class Array(HasShape, HasBackend, HasFormat, Protocol): ...
+
+
+TArray = TypeVar("TArray", bound=Array)

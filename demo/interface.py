@@ -10,11 +10,11 @@ intermediate_2 = xe.log(intermediate_1)
 intermediate_3 = xe.exp(intermediate_1)
 result = intermediate_2 + intermediate_3
 
-program, inputs = xe.compile(result, stability_mode="scaled")
+program, inputs = xe.extract_program(result, stability_mode="scaled")
 print(program)
 print(result.materialize(stability_mode="none"))
 
 einsum_expr = xe.einsum("ij,jk->ik", x, w)
-einsum_program, einsum_inputs = xe.compile(einsum_expr, stability_mode="scaled")
+einsum_program, einsum_inputs = xe.extract_program(einsum_expr, stability_mode="scaled")
 print(einsum_program)
 print(einsum_expr.materialize(stability_mode="none"))

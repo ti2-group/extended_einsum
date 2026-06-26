@@ -33,18 +33,13 @@ from extended_einsum.language.types import (
     HasShape,
     Shape,
     StabilityMode,
+    TArray,
     TensorFormat,
 )
 from extended_einsum.translations.translations import (
     BACKEND_TO_COMPILER,
     STABILITY_AND_BACKEND_TO_TRANSLATION,
 )
-
-
-class Array(HasShape, HasBackend, HasFormat, Protocol): ...
-
-
-TArray = TypeVar("TArray", bound=Array)
 
 
 @dataclass(frozen=True)
@@ -105,12 +100,7 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         return self._format
 
     def materialize(self, stability_mode: StabilityMode) -> TArray:
-        rich_program, input_arguments = compile(self, stability_mode)
-        # TODO: this is a hack
-        input_arguments = [
-            argument.backend_array if hasattr(argument, "backend_array") else argument  # pyright: ignore[reportAttributeAccessIssue]
-            for argument in input_arguments
-        ]
+        rich_program, input_arguments = extract_program(self, stability_mode)
         raw_program = rich_program.to_raw_program()
         compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
         backend_functions_per_instruction: list[BackendFunctions[TArray]] = [  # pyright: ignore[reportAssignmentType]
@@ -216,13 +206,6 @@ def _compile_recursive(
     instructions.append(RichInstruction(tensor_expression.operator, argument_ssa_ids))
     shapes[ssa_ids[expression_key]] = tensor_expression.shape
     tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
-
-    # add shape and format information
-    shapes[ssa_ids[expression_key]] = tensor_expression.shape
-    tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
-    # add this expression as a consumer of all its arguments
-    for argument_ssa_id in argument_ssa_ids:
-        consumers_of_ssa_id[argument_ssa_id].append(ssa_ids[expression_key])
     return ssa_ids[expression_key]
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, override
+from typing import Any, Protocol, override
 
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import OperatorEinsum
@@ -62,72 +62,6 @@ class _EinsumLabelAllocator:
     @classmethod
     def remap_expression(cls, expression: str) -> str:
         return cls().normalize_expression(expression)
-
-
-def choose_single_format_backend_functions(
-    argument_tensor_format: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> SingleFormatBackendFunctions:
-    match argument_tensor_format:
-        case DenseFormat():
-            return backend_functions.unary_dense_only
-        case DenseLogspaceFormat():
-            return backend_functions.unary_logspace_only
-        case DenseScaledFormat():
-            return backend_functions.unary_scaled_only
-        case _:
-            raise NotImplementedError()
-
-
-def choose_multi_format_backend_functions(
-    tensor_format_1: TensorFormat,
-    tensor_format_2: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> MultiFormatBackendFunctions:
-    match (tensor_format_1, tensor_format_2):
-        case (DenseFormat(), DenseFormat()):
-            return backend_functions.binary_dense_only
-        case (DenseLogspaceFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_logspace_only
-        case (DenseScaledFormat(), DenseScaledFormat()):
-            return backend_functions.binary_scaled_only
-        case (DenseFormat(), DenseScaledFormat()):
-            return backend_functions.binary_dense_scaled
-        case (DenseScaledFormat(), DenseFormat()):
-            return backend_functions.binary_scaled_dense
-        case (DenseLogspaceFormat(), DenseFormat()):
-            return backend_functions.binary_logspace_dense
-        case (DenseFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_dense_logspace
-        case _:
-            raise NotImplementedError()
-
-
-@dataclass(frozen=True)
-class RichProgram(Program):
-    instructions: list[Instruction]
-    n_inputs: int
-
-    stability: Literal["none", "scaled", "logspace"]
-    shapes: list[Shape]
-    tensor_formats: list[TensorFormat]
-    parameter_indices: list[int]
-    consumers_of_ssa_id: list[list[int]]
-
-    def __post_init__(self) -> None:
-        n_ssa_ids = self.n_inputs + len(self.instructions)
-
-        if len(self.shapes) != n_ssa_ids:
-            raise ValueError(
-                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-        if len(self.tensor_formats) != n_ssa_ids:
-            raise ValueError(
-                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-
-    def strip(self) -> Program:
-        return Program(self.instructions, self.n_inputs)
 
 
 class PreprocessingRoutine(Protocol):
@@ -546,7 +480,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         # Compute a replacement contraction path for each extracted component.
         blocks: dict[
             int,
-            tuple[frozenset[int], tuple[int, ...], tuple[Instruction, ...]],
+            tuple[frozenset[int], tuple[int, ...], tuple[RichInstruction, ...]],
         ] = {}
         for component in extract_connected_einsum_components(program):
             if len(component.boundary_arguments) < 2:
@@ -598,7 +532,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             for op_index in component
         }
         tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
-        instructions: list[Instruction] = []
+        instructions: list[RichInstruction] = []
         shapes = program.shapes[: program.n_inputs]
         tensor_formats = program.tensor_formats[: program.n_inputs]
 
@@ -630,7 +564,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                             strict=True,
                         )
                     )
-                    mapped_instruction = map_instruction_arguments(
+                    mapped_instruction = _map_instruction_arguments(
                         planned_instruction, argument_map.__getitem__
                     )
                     planned_result_id = program.n_inputs + len(instructions)
@@ -657,27 +591,18 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             }
             tensor_map[result_id] = program.n_inputs + len(instructions)
             instructions.append(
-                map_instruction_arguments(instruction, argument_map.__getitem__)
+                _map_instruction_arguments(instruction, argument_map.__getitem__)
             )
             shapes.append(program.shapes[result_id])
             tensor_formats.append(program.tensor_formats[result_id])
 
-        # Consumer IDs depend on instruction positions, so regenerate them after
-        # the rewritten instruction order and SSA IDs are final.
-        consumers_of_ssa_id = [[] for _ in shapes]
-        for op_index, instruction in enumerate(instructions):
-            consumer_ssa_id = program.n_inputs + op_index
-            for argument in get_arguments(instruction):
-                consumers_of_ssa_id[argument].append(consumer_ssa_id)
-
         return RichProgram(
             instructions=instructions,
             n_inputs=program.n_inputs,
-            stability=program.stability,
+            stability_mode=program.stability_mode,
             shapes=shapes,
             tensor_formats=tensor_formats,
             parameter_indices=program.parameter_indices,
-            consumers_of_ssa_id=consumers_of_ssa_id,
         )
 
 

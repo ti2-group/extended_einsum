@@ -1,15 +1,10 @@
 from dataclasses import dataclass
 from typing import Generic, override
 
-import jax
-import numpy as np
-import torch
-
-from extended_einsum.backend import TBackendArray
+from extended_einsum.backend import TBackendArray, get_backend_of_array
+from extended_einsum.format import DenseArray, SparseArray
 from extended_einsum.interface.tensor_expression import (
-    Array,
     Parameter,
-    TArray,
     TensorExpression,
 )
 from extended_einsum.language.rich_operators import (
@@ -26,7 +21,7 @@ from extended_einsum.language.rich_operators import (
     OperatorTake,
     OperatorTan,
 )
-from extended_einsum.language.types import Backend, HasShape, Shape, TensorFormat
+from extended_einsum.language.types import Array, Backend, Shape, TArray, TensorFormat
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 
@@ -43,7 +38,7 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
     @property
     @override
     def backend(self) -> Backend:
-        return _get_backend_of_array(self.backend_array)
+        return get_backend_of_array(self.backend_array)
 
     @property
     @override
@@ -51,21 +46,16 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
         return self._format
 
 
-def _get_backend_of_array(array: HasShape) -> Backend:
-    if isinstance(array, torch.Tensor):
-        return "torch"
-    elif isinstance(array, np.ndarray):
-        return "numpy"
-    elif isinstance(array, jax.Array):
-        return "jax"
-    else:
-        raise ValueError(f"Unsupported array type: {type(array)}")
-
-
 def array(
     backend_array: TBackendArray, format: TensorFormat = "dense"
-) -> BackendArrayWrapper[TBackendArray]:
-    return BackendArrayWrapper(backend_array, format)
+) -> DenseArray[TBackendArray] | SparseArray[TBackendArray]:
+    match format:
+        case "dense":
+            return DenseArray(backend_array)
+        case "sparse":
+            return SparseArray(backend_array)
+        case _:
+            raise ValueError(f"Unsupported format: {format}")
 
 
 def exp(
@@ -112,8 +102,8 @@ def inverse(
 
 def einsum(
     format_string: str,
-    *operands: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
-) -> TensorExpression[TBackendArray]:
+    *operands: TensorExpression[TArray] | TArray,
+) -> TensorExpression[TArray]:
     index_strings, output_string = parse_format_string(format_string)
     if len(index_strings) != len(operands):
         raise ValueError(
@@ -131,7 +121,7 @@ def stack(
     operands: list[TensorExpression[TArray] | Parameter[TArray] | TArray],
     *,
     axis: int = 0,
-) -> TensorExpression[TBackendArray]:
+) -> TensorExpression[TArray]:
     axis = normalize_axis(axis, len(operands[0].shape))
     if len(operands) == 0:
         raise ValueError("stack requires at least one argument")
@@ -143,11 +133,11 @@ def stack(
 
 
 def take(
-    source: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
-    index: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+    source: TensorExpression[TArray] | TArray,
+    index: TensorExpression[TArray] | TArray,
     *,
     axis: int = 0,
-) -> TensorExpression[TBackendArray]:
+) -> TensorExpression[TArray]:
     axis = normalize_axis(axis, len(source.shape))
     if not source.shape:
         raise ValueError("The take operator requires an operand with a leading axis.")
@@ -157,20 +147,20 @@ def take(
 
 
 def slice(
-    source: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+    source: TensorExpression[TArray] | TArray,
     start: int,
     stop: int,
     *,
     axis: int = 0,
-) -> TensorExpression[TBackendArray]:
+) -> TensorExpression[TArray]:
     axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(OperatorSlice(start, stop, axis), [source])
 
 
 def softmax(
-    a: TensorExpression[TBackendArray] | Array[TBackendArray] | TBackendArray,
+    a: TensorExpression[TArray] | TArray,
     axis: int = 0,
-) -> TensorExpression[TBackendArray]:
+) -> TensorExpression[TArray]:
     """Applies the softmax function to the input tensor."""
 
     if not a.shape:

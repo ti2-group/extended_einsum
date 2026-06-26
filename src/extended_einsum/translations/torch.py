@@ -3,6 +3,7 @@ from functools import partial
 from typing import override
 
 import torch
+from extended_einsum.format import DenseArray
 
 from extended_einsum.backend import BackendCompiler, BackendFunctions
 from extended_einsum.language.core import RawProgram
@@ -16,88 +17,108 @@ from extended_einsum.utils import normalize_axis
 # )
 
 
-class TorchTranslation(BackendFunctions[torch.Tensor]):
+class TorchTranslation(BackendFunctions[DenseArray[torch.Tensor]]):
     @override
     @staticmethod
-    def exp(array: torch.Tensor) -> torch.Tensor:
-        return torch.exp(array)
+    def exp(array: DenseArray[torch.Tensor]) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.exp(array.backend_array))
 
     @override
     @staticmethod
-    def log(array: torch.Tensor) -> torch.Tensor:
-        return torch.log(array)
+    def log(array: DenseArray[torch.Tensor]) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.log(array.backend_array))
 
     @override
     @staticmethod
-    def sum(array: torch.Tensor, axis: int) -> torch.Tensor:
-        return torch.sum(array, dim=axis)
+    def sum(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.sum(array.backend_array, dim=axis))
 
     @override
     @staticmethod
-    def max(array: torch.Tensor, axis: int) -> torch.Tensor:
-        return torch.max(array, dim=axis)  # pyright: ignore[reportReturnType]
+    def max(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.max(array.backend_array, dim=axis))  # pyright: ignore[reportArgumentType]
 
     @override
     @staticmethod
-    def stack(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
-        return torch.stack(arrays, dim=axis)  # pyright: ignore[reportArgumentType]
+    def stack(
+        arrays: Sequence[DenseArray[torch.Tensor]], axis: int
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(
+            torch.stack([array.backend_array for array in arrays], dim=axis)
+        )
 
     @override
     @staticmethod
-    def take(array: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:
+    def take(
+        array: DenseArray[torch.Tensor], indices: DenseArray[torch.Tensor], axis: int
+    ) -> DenseArray[torch.Tensor]:
         # return torch.take(array, indices, dim=axis)
         raise NotImplementedError("Torch doesn't support take with an axis.")
 
     @override
     @staticmethod
-    def select(array: torch.Tensor, axis: int, index: int) -> torch.Tensor:
-        return torch.select(array, dim=axis, index=index)
+    def select(
+        array: DenseArray[torch.Tensor], axis: int, index: int
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.select(array.backend_array, dim=axis, index=index))
 
     @override
     @staticmethod
-    def slice(array: torch.Tensor, start: int, stop: int, axis: int) -> torch.Tensor:
+    def slice(
+        array: DenseArray[torch.Tensor], start: int, stop: int, axis: int
+    ) -> DenseArray[torch.Tensor]:
         normalized_axis = normalize_axis(axis, len(array.shape))
-        slices = [slice(None)] * array.ndim
+        slices = [slice(None)] * array.backend_array.ndim
         slices[normalized_axis] = slice(start, stop)
-        return array[tuple(slices)]
+        return DenseArray(array.backend_array[tuple(slices)])
 
     @override
     @staticmethod
-    def softmax(array: torch.Tensor, axis: int) -> torch.Tensor:
-        return torch.softmax(array, dim=axis)
+    def softmax(array: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.softmax(array.backend_array, dim=axis))
 
     @override
     @staticmethod
-    def einsum(format_string: str, *operands: torch.Tensor) -> torch.Tensor:
-        return torch.einsum(format_string, *operands)
+    def einsum(
+        format_string: str, *operands: DenseArray[torch.Tensor]
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(
+            torch.einsum(
+                format_string, *[operand.backend_array for operand in operands]
+            )
+        )
 
     @override
     @staticmethod
     def add(
-        summand_array_1: torch.Tensor, summand_array_2: torch.Tensor
-    ) -> torch.Tensor:
-        return summand_array_1 + summand_array_2
+        summand_array_1: DenseArray[torch.Tensor],
+        summand_array_2: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(summand_array_1.backend_array + summand_array_2.backend_array)
 
     @override
     @staticmethod
     def subtract(
-        minuend_array: torch.Tensor, subtrahend_array: torch.Tensor
-    ) -> torch.Tensor:
-        return minuend_array - subtrahend_array
+        minuend_array: DenseArray[torch.Tensor],
+        subtrahend_array: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(minuend_array.backend_array - subtrahend_array.backend_array)
 
     @override
     @staticmethod
     def multiply(
-        factor_array_1: torch.Tensor, factor_array_2: torch.Tensor
-    ) -> torch.Tensor:
-        return factor_array_1 * factor_array_2
+        factor_array_1: DenseArray[torch.Tensor],
+        factor_array_2: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(factor_array_1.backend_array * factor_array_2.backend_array)
 
     @override
     @staticmethod
     def divide(
-        dividend_array: torch.Tensor, divisor_array: torch.Tensor
-    ) -> torch.Tensor:
-        return dividend_array / divisor_array
+        dividend_array: DenseArray[torch.Tensor],
+        divisor_array: DenseArray[torch.Tensor],
+    ) -> DenseArray[torch.Tensor]:
+        return DenseArray(dividend_array.backend_array / divisor_array.backend_array)
 
 
 class TorchCompiler(BackendCompiler[torch.Tensor]):

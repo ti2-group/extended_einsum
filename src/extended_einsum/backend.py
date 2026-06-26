@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from typing import Callable, Protocol, TypeVar
 
 from extended_einsum.language.core import RawProgram
-from extended_einsum.language.types import HasShape
+from extended_einsum.language.types import Backend, HasShape
 
 TBackendArray = TypeVar("TBackendArray", bound=HasShape)
 
@@ -70,3 +70,14 @@ class BackendCompiler(Protocol[TBackendArray]):
         arguments: Sequence[TBackendArray],
         backend_functions_per_instruction: list[BackendFunctions[TBackendArray]],
     ) -> Callable[[Sequence[TBackendArray]], TBackendArray]: ...
+
+
+def get_backend_of_array(array: HasShape) -> Backend:
+    if isinstance(array, torch.Tensor):
+        return "torch"
+    elif isinstance(array, np.ndarray):
+        return "numpy"
+    elif isinstance(array, jax.Array):
+        return "jax"
+    else:
+        raise ValueError(f"Unsupported array type: {type(array)}")
