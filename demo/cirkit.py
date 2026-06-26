@@ -108,9 +108,7 @@ def translate_cirkit_to_xe(
     batch_size: int,
     stability: str,
 ) -> tuple[RichProgram, list[object]]:
-    input_layer = next(
-        layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer)
-    )
+    input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
     data_by_scope = tuple(
         torch.empty(
             (batch_size, input_layer.params["probs"].shape[0]),
@@ -153,12 +151,8 @@ def format_input_shapes(inputs, limit: int) -> str:
     return f"[{preview}]"
 
 
-def print_program_summary(
-    name: str, program: Program, inputs: Sequence[object], *, shape_preview: int
-) -> None:
-    op_counts = Counter(
-        get_operator(instruction) for instruction in program.instructions
-    )
+def print_program_summary(name: str, program: Program, inputs: Sequence[object], *, shape_preview: int) -> None:
+    op_counts = Counter(get_operator(instruction) for instruction in program.instructions)
     print(f"{name}:")
     print(f"  inputs:       {program.n_inputs}")
     print(f"  instructions: {len(program.instructions)}")
@@ -179,9 +173,7 @@ def print_instructions(program: Program, limit: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Translate a Cirkit symbolic image circuit to an XE program."
-    )
+    parser = argparse.ArgumentParser(description="Translate a Cirkit symbolic image circuit to an XE program.")
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--units", type=int, default=DEFAULT_UNITS)
@@ -234,16 +226,8 @@ def main() -> None:
         stability="logspace" if args.semiring == "lse-sum" else "scaled",
     )
 
-    print(
-        "symbolic circuit: "
-        f"layers={len(symbolic_circuit.layers)}, "
-        f"variables={symbolic_circuit.num_variables}, "
-        f"units={args.units}, "
-        f"sum_product_layer={args.sum_product_layer}"
-    )
-    print_program_summary(
-        "direct XE program", program, inputs, shape_preview=args.shape_preview
-    )
+    print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={args.units}, sum_product_layer={args.sum_product_layer}")
+    print_program_summary("direct XE program", program, inputs, shape_preview=args.shape_preview)
 
     final_program = program
     if not args.no_preprocess:
@@ -258,14 +242,8 @@ def main() -> None:
             print(f"preprocessing skipped: {error}")
             preprocessed_inputs = inputs
         else:
-            final_program = (
-                preprocessed.program
-                if hasattr(preprocessed, "program")
-                else preprocessed
-            )
-            preprocessed_inputs = (
-                preprocessed.inputs if hasattr(preprocessed, "inputs") else inputs
-            )
+            final_program = preprocessed.program if hasattr(preprocessed, "program") else preprocessed
+            preprocessed_inputs = preprocessed.inputs if hasattr(preprocessed, "inputs") else inputs
             print()
             print_program_summary(
                 "preprocessed XE program",

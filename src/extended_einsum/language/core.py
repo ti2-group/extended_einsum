@@ -10,16 +10,7 @@ SliceOperator = Literal["slice"]
 SelectOperator = Literal["select"]
 SoftmaxOperator = Literal["softmax"]
 
-OperatorName = (
-    UnaryOperator
-    | BinaryOperator
-    | EinsumOperator
-    | StackOperator
-    | TakeOperator
-    | SliceOperator
-    | SelectOperator
-    | SoftmaxOperator
-)
+OperatorName = UnaryOperator | BinaryOperator | EinsumOperator | StackOperator | TakeOperator | SliceOperator | SelectOperator | SoftmaxOperator
 ArgumentSSAIds = tuple[int, ...]
 ExtraArguments = tuple[Any, ...]
 

@@ -11,9 +11,7 @@ class RichInstruction:
     argument_ssa_ids: ArgumentSSAIds
 
 
-def map_instruction_arguments(
-    instruction: RichInstruction, shift_argument: Callable[[int], int]
-) -> RichInstruction:
+def map_instruction_arguments(instruction: RichInstruction, shift_argument: Callable[[int], int]) -> RichInstruction:
     return RichInstruction(
         operator=instruction.operator,
         argument_ssa_ids=tuple(map(shift_argument, instruction.argument_ssa_ids)),

@@ -24,13 +24,9 @@ class RichProgram:
         n_ssa_ids = self.n_inputs + len(self.instructions)
 
         if len(self.shapes) != n_ssa_ids:
-            raise ValueError(
-                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
+            raise ValueError(f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions).")
         if len(self.tensor_formats) != n_ssa_ids:
-            raise ValueError(
-                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
+            raise ValueError(f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions).")
 
         # map from ssa id to its arguments
         arguments_of_ssa_id: dict[int, ArgumentSSAIds] = defaultdict(tuple)

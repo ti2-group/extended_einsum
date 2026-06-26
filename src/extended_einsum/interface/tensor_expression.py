@@ -67,9 +67,7 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     ) -> None:
         self.operator = operator
         self.arguments = arguments
-        self._shape = operator.propagate_shapes(
-            [tuple(argument.shape) for argument in arguments]
-        )
+        self._shape = operator.propagate_shapes([tuple(argument.shape) for argument in arguments])
         self._format: TensorFormat = _propagate_tensor_format(
             operator,
             [argument.format for argument in arguments],
@@ -80,9 +78,7 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         self._backend: Backend = arguments[0].backend
         for argument in arguments[1:]:
             if argument.backend != self._backend:
-                raise ValueError(
-                    f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}."
-                )
+                raise ValueError(f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}.")
 
     @property
     @override
@@ -108,47 +104,30 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
                 instruction.operator,
                 stability_mode,
                 self.backend,
-                [
-                    rich_program.tensor_formats[ssa_id]
-                    for ssa_id in instruction.argument_ssa_ids
-                ],
+                [rich_program.tensor_formats[ssa_id] for ssa_id in instruction.argument_ssa_ids],
             )
             for instruction in rich_program.instructions
         ]
-        backend_code = compiler.compile(
-            raw_program, input_arguments, backend_functions_per_instruction
-        )
+        backend_code = compiler.compile(raw_program, input_arguments, backend_functions_per_instruction)
         return backend_code(input_arguments)
 
-    def __add__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+    def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorAdd(), [self, other])
 
-    def __sub__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+    def __sub__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorSubtract(), [self, other])
 
-    def __mul__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+    def __mul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorMultiply(), [self, other])
 
-    def __truediv__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+    def __truediv__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorDivide(), [self, other])
 
-    def __matmul__(
-        self, other: TensorExpression[TArray] | TArray
-    ) -> TensorExpression[TArray]:
+    def __matmul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorEinsum("ik, kj -> ij"), [self, other])
 
     def __getitem__(self, index: int | slice) -> TensorExpression[TArray]:
-        raise NotImplementedError(
-            "Indexing is not yet implemented. This should produce a select, take, or slice operator."
-        )
+        raise NotImplementedError("Indexing is not yet implemented. This should produce a select, take, or slice operator.")
 
 
 def _compile_recursive(
@@ -281,84 +260,54 @@ def extract_program(
     )
 
 
-def _propagate_tensor_format(
-    operator: RichOperator, argument_formats: list[TensorFormat]
-) -> TensorFormat:
+def _propagate_tensor_format(operator: RichOperator, argument_formats: list[TensorFormat]) -> TensorFormat:
     format_signature: list[TensorFormat]
     # find the argument signature
     match operator:
-        case (
-            OperatorSin()
-            | OperatorCos()
-            | OperatorTan()
-            | OperatorExp()
-            | OperatorLog()
-            | OperatorSqrt()
-            | OperatorInverse()
-        ):
+        case OperatorSin() | OperatorCos() | OperatorTan() | OperatorExp() | OperatorLog() | OperatorSqrt() | OperatorInverse():
             if len(argument_formats) != 1:
-                raise ValueError(
-                    f"The {operator} operator takes exactly one argument, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The {operator} operator takes exactly one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
 
         case OperatorAdd() | OperatorSubtract() | OperatorMultiply() | OperatorDivide():
             if len(argument_formats) != 2:
-                raise ValueError(
-                    f"The {operator} operator takes exactly two arguments, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The {operator} operator takes exactly two arguments, but {len(argument_formats)} were given.")
             if argument_formats[0] != argument_formats[1]:
-                raise ValueError(
-                    f"The {operator} operator requires arguments with the same format, but {argument_formats[0]} and {argument_formats[1]} were given."
-                )
+                raise ValueError(f"The {operator} operator requires arguments with the same format, but {argument_formats[0]} and {argument_formats[1]} were given.")
             format_signature = [argument_formats[0], argument_formats[1]]
 
         case OperatorStack(_):
             if len(argument_formats) < 1:
-                raise ValueError(
-                    f"The stack operator requires at least one argument, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The stack operator requires at least one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
             if any(format != argument_formats[0] for format in argument_formats[1:]):
-                raise ValueError(
-                    f"The stack operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
-                )
+                raise ValueError(f"The stack operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given.")
 
         case OperatorTake(_):
             if len(argument_formats) != 2:
-                raise ValueError(
-                    f"The take operator takes exactly two arguments, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The take operator takes exactly two arguments, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0], argument_formats[1]]
 
         case OperatorSelect(_, _):
             if len(argument_formats) != 1:
-                raise ValueError(
-                    f"The select operator takes exactly one argument, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The select operator takes exactly one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
 
         case OperatorSlice(_, _, _):
             if len(argument_formats) != 1:
-                raise ValueError(
-                    f"The slice operator takes exactly one argument, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The slice operator takes exactly one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
 
         case OperatorSoftmax(_):
             if len(argument_formats) != 1:
-                raise ValueError(
-                    f"The softmax operator takes exactly one argument, but {len(argument_formats)} were given."
-                )
+                raise ValueError(f"The softmax operator takes exactly one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
 
         case OperatorEinsum(_):
             # TODO: this is a hack
             format_signature = [argument_formats[0]]
             if any(format != argument_formats[0] for format in argument_formats[1:]):
-                raise ValueError(
-                    f"The einsum operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given."
-                )
+                raise ValueError(f"The einsum operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given.")
 
         case _:
             raise NotImplementedError(f"Operator {operator} is not yet supported.")

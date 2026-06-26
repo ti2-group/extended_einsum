@@ -37,7 +37,7 @@ demo = [
 dev = ["ruff>=0.6.0"]
 
 [tool.ruff]
-line-length = 88
+line-length = 200
 target-version = "py313"
 
 [tool.ruff.lint]

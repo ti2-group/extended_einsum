@@ -3,9 +3,7 @@ from extended_einsum.language.types import Backend, StabilityMode
 from extended_einsum.translations.jax import JaxCompiler, JaxDenseUnstableImplementation
 from extended_einsum.translations.torch import TorchCompiler, TorchTranslation
 
-STABILITY_AND_BACKEND_TO_TRANSLATION: dict[
-    StabilityMode, dict[Backend, BackendFunctions]
-] = {
+STABILITY_AND_BACKEND_TO_TRANSLATION: dict[StabilityMode, dict[Backend, BackendFunctions]] = {
     "none": {
         "jax": JaxDenseUnstableImplementation(),
         "torch": TorchTranslation(),

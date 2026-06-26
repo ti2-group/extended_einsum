@@ -24,9 +24,7 @@ def parse_format_string(format_string: str) -> tuple[list[str], str]:
     if len(arrow_split) != 2:
         raise ValueError(f'"{format_string}" is not a valid einsum format string.')
     index_string_part, output_string_part = arrow_split
-    index_strings = [
-        index_string.strip() for index_string in index_string_part.split(",")
-    ]
+    index_strings = [index_string.strip() for index_string in index_string_part.split(",")]
     output_string = output_string_part.strip()
 
     return index_strings, output_string

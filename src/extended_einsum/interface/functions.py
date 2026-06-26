@@ -46,9 +46,7 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
         return self._format
 
 
-def array(
-    backend_array: TBackendArray, format: TensorFormat = "dense"
-) -> DenseArray[TBackendArray] | SparseArray[TBackendArray]:
+def array(backend_array: TBackendArray, format: TensorFormat = "dense") -> DenseArray[TBackendArray] | SparseArray[TBackendArray]:
     match format:
         case "dense":
             return DenseArray(backend_array)
@@ -106,14 +104,10 @@ def einsum(
 ) -> TensorExpression[TArray]:
     index_strings, output_string = parse_format_string(format_string)
     if len(index_strings) != len(operands):
-        raise ValueError(
-            f"format string {format_string} has {len(index_strings)} indices, but {len(operands)} operands."
-        )
+        raise ValueError(f"format string {format_string} has {len(index_strings)} indices, but {len(operands)} operands.")
     all_input_symbols = frozenset("".join(index_strings))
     if any(output_symbol not in all_input_symbols for output_symbol in output_string):
-        raise ValueError(
-            f"format string {format_string} contains output symbols that are not present in the operands."
-        )
+        raise ValueError(f"format string {format_string} contains output symbols that are not present in the operands.")
     return TensorExpression(OperatorEinsum(format_string), list(operands))
 
 
@@ -126,9 +120,7 @@ def stack(
     if len(operands) == 0:
         raise ValueError("stack requires at least one argument")
     if any(operand.shape != operands[0].shape for operand in operands[1:]):
-        raise ValueError(
-            "The stack operator requires all arguments to have the same shape along the stack axis."
-        )
+        raise ValueError("The stack operator requires all arguments to have the same shape along the stack axis.")
     return TensorExpression(OperatorStack(axis), operands)
 
 

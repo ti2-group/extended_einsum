@@ -46,9 +46,7 @@ UNARY_OPERATOR_TO_NUMPY: dict[UnaryOperator, Callable[[npt.NDArray], npt.NDArray
     "sqrt": np.sqrt,
 }
 
-BINARY_OPERATOR_TO_NUMPY: dict[
-    BinaryOperator, Callable[[npt.NDArray, npt.NDArray], npt.NDArray]
-] = {
+BINARY_OPERATOR_TO_NUMPY: dict[BinaryOperator, Callable[[npt.NDArray, npt.NDArray], npt.NDArray]] = {
     "+": np.add,
     "-": np.subtract,
     "*": np.multiply,
@@ -57,9 +55,7 @@ BINARY_OPERATOR_TO_NUMPY: dict[
 }
 
 
-def numpy_einsum_helper(
-    format_string: str, operands: Sequence[npt.NDArray]
-) -> npt.NDArray:
+def numpy_einsum_helper(format_string: str, operands: Sequence[npt.NDArray]) -> npt.NDArray:
     return np.einsum(format_string, *operands)
 
 
@@ -102,9 +98,7 @@ def execute_program_numpy(program: Program, inputs: Sequence[Any]) -> Any:
         operator = instruction_operator(instruction)
         arguments = instruction_arguments(instruction)
         if operator == STACK_OPERATOR:
-            result = stack_values(
-                [tensors[argument] for argument in arguments], NUMPY_OPS
-            )
+            result = stack_values([tensors[argument] for argument in arguments], NUMPY_OPS)
         elif operator == TAKE_OPERATOR:
             result = take_value(
                 tensors[arguments[0]],

@@ -40,33 +40,23 @@ class TorchTranslation(BackendFunctions[DenseArray[torch.Tensor]]):
 
     @override
     @staticmethod
-    def stack(
-        arrays: Sequence[DenseArray[torch.Tensor]], axis: int
-    ) -> DenseArray[torch.Tensor]:
-        return DenseArray(
-            torch.stack([array.backend_array for array in arrays], dim=axis)
-        )
+    def stack(arrays: Sequence[DenseArray[torch.Tensor]], axis: int) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.stack([array.backend_array for array in arrays], dim=axis))
 
     @override
     @staticmethod
-    def take(
-        array: DenseArray[torch.Tensor], indices: DenseArray[torch.Tensor], axis: int
-    ) -> DenseArray[torch.Tensor]:
+    def take(array: DenseArray[torch.Tensor], indices: DenseArray[torch.Tensor], axis: int) -> DenseArray[torch.Tensor]:
         # return torch.take(array, indices, dim=axis)
         raise NotImplementedError("Torch doesn't support take with an axis.")
 
     @override
     @staticmethod
-    def select(
-        array: DenseArray[torch.Tensor], axis: int, index: int
-    ) -> DenseArray[torch.Tensor]:
+    def select(array: DenseArray[torch.Tensor], axis: int, index: int) -> DenseArray[torch.Tensor]:
         return DenseArray(torch.select(array.backend_array, dim=axis, index=index))
 
     @override
     @staticmethod
-    def slice(
-        array: DenseArray[torch.Tensor], start: int, stop: int, axis: int
-    ) -> DenseArray[torch.Tensor]:
+    def slice(array: DenseArray[torch.Tensor], start: int, stop: int, axis: int) -> DenseArray[torch.Tensor]:
         normalized_axis = normalize_axis(axis, len(array.shape))
         slices = [slice(None)] * array.backend_array.ndim
         slices[normalized_axis] = slice(start, stop)
@@ -79,14 +69,8 @@ class TorchTranslation(BackendFunctions[DenseArray[torch.Tensor]]):
 
     @override
     @staticmethod
-    def einsum(
-        format_string: str, *operands: DenseArray[torch.Tensor]
-    ) -> DenseArray[torch.Tensor]:
-        return DenseArray(
-            torch.einsum(
-                format_string, *[operand.backend_array for operand in operands]
-            )
-        )
+    def einsum(format_string: str, *operands: DenseArray[torch.Tensor]) -> DenseArray[torch.Tensor]:
+        return DenseArray(torch.einsum(format_string, *[operand.backend_array for operand in operands]))
 
     @override
     @staticmethod

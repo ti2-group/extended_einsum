@@ -43,34 +43,22 @@ class JaxDenseUnstableImplementation(
 
     @override
     @staticmethod
-    def stack(
-        arrays: Sequence[DenseArray[jax.Array]], axis: int
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(
-            jnp.stack([array.backend_array for array in arrays], axis=axis)
-        )
+    def stack(arrays: Sequence[DenseArray[jax.Array]], axis: int) -> DenseArray[jax.Array]:
+        return DenseArray(jnp.stack([array.backend_array for array in arrays], axis=axis))
 
     @override
     @staticmethod
-    def take(
-        array: DenseArray[jax.Array], indices: DenseArray[jax.Array], axis: int
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(
-            jnp.take(array.backend_array, indices.backend_array, axis=axis)
-        )
+    def take(array: DenseArray[jax.Array], indices: DenseArray[jax.Array], axis: int) -> DenseArray[jax.Array]:
+        return DenseArray(jnp.take(array.backend_array, indices.backend_array, axis=axis))
 
     @override
     @staticmethod
-    def select(
-        array: DenseArray[jax.Array], axis: int, index: int
-    ) -> DenseArray[jax.Array]:
+    def select(array: DenseArray[jax.Array], axis: int, index: int) -> DenseArray[jax.Array]:
         return DenseArray(jnp.take(array.backend_array, index, axis=axis))
 
     @override
     @staticmethod
-    def slice(
-        array: DenseArray[jax.Array], start: int, stop: int, axis: int
-    ) -> DenseArray[jax.Array]:
+    def slice(array: DenseArray[jax.Array], start: int, stop: int, axis: int) -> DenseArray[jax.Array]:
         normalized_axis = normalize_axis(axis, len(array.shape))
         slices = [slice(None)] * array.backend_array.ndim
         slices[normalized_axis] = slice(start, stop)
@@ -83,12 +71,8 @@ class JaxDenseUnstableImplementation(
 
     @override
     @staticmethod
-    def einsum(
-        format_string: str, *operands: DenseArray[jax.Array]
-    ) -> DenseArray[jax.Array]:
-        return DenseArray(
-            jnp.einsum(format_string, *[operand.backend_array for operand in operands])
-        )
+    def einsum(format_string: str, *operands: DenseArray[jax.Array]) -> DenseArray[jax.Array]:
+        return DenseArray(jnp.einsum(format_string, *[operand.backend_array for operand in operands]))
 
     @override
     @staticmethod
@@ -129,9 +113,7 @@ class JaxCompiler(BackendCompiler[DenseArray[jax.Array] | SparseArray[jax.Array]
     def compile(
         program: RawProgram,
         arguments: Sequence[DenseArray[jax.Array] | SparseArray[jax.Array]],
-        backend_functions_per_instruction: list[
-            BackendFunctions[DenseArray[jax.Array] | SparseArray[jax.Array]]
-        ],
+        backend_functions_per_instruction: list[BackendFunctions[DenseArray[jax.Array] | SparseArray[jax.Array]]],
     ) -> Callable[[Sequence[jax.Array]], jax.Array]:
         jit_prepared = jax.jit(
             partial(

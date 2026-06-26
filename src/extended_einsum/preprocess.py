@@ -4,28 +4,10 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Protocol, override
 
-from extended_einsum.backend import (
-    BackendFunctions,
-    MultiFormatBackendFunctions,
-    SingleFormatBackendFunctions,
-    TBackendArrayCovariant,
-)
-from extended_einsum.format import (
-    DenseFormat,
-    DenseLogspaceFormat,
-    DenseScaledFormat,
-    TensorFormat,
-)
-from extended_einsum.language import (
-    EINSUM_OPERATOR,
-    Instruction,
-    Operator,
-    Program,
-    get_arguments,
-    get_einsum_format_string,
-    get_instruction_specific_arguments,
-    get_operator,
-)
+from extended_einsum.language.rich_instruction import RichInstruction, map_instruction_arguments
+from extended_einsum.language.rich_operators import OperatorEinsum, RichOperator
+from extended_einsum.language.rich_program import RichProgram
+from extended_einsum.language.types import TensorFormat
 from extended_einsum.shapes import (
     Shape,
     infer_einsum_shape,
@@ -43,9 +25,7 @@ class _EinsumLabelAllocator:
         source_to_label: dict[str, str] | None = None,
         next_label_index: int = 0,
     ) -> None:
-        self._source_to_label = (
-            {} if source_to_label is None else source_to_label.copy()
-        )
+        self._source_to_label = {} if source_to_label is None else source_to_label.copy()
         self._next_label_index = next_label_index
 
     def copy(self) -> _EinsumLabelAllocator:
@@ -83,72 +63,6 @@ class _EinsumLabelAllocator:
         return cls().normalize_expression(expression)
 
 
-def choose_single_format_backend_functions(
-    argument_tensor_format: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> SingleFormatBackendFunctions:
-    match argument_tensor_format:
-        case DenseFormat():
-            return backend_functions.unary_dense_only
-        case DenseLogspaceFormat():
-            return backend_functions.unary_logspace_only
-        case DenseScaledFormat():
-            return backend_functions.unary_scaled_only
-        case _:
-            raise NotImplementedError()
-
-
-def choose_multi_format_backend_functions(
-    tensor_format_1: TensorFormat,
-    tensor_format_2: TensorFormat,
-    backend_functions: BackendFunctions[TBackendArrayCovariant],
-) -> MultiFormatBackendFunctions:
-    match (tensor_format_1, tensor_format_2):
-        case (DenseFormat(), DenseFormat()):
-            return backend_functions.binary_dense_only
-        case (DenseLogspaceFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_logspace_only
-        case (DenseScaledFormat(), DenseScaledFormat()):
-            return backend_functions.binary_scaled_only
-        case (DenseFormat(), DenseScaledFormat()):
-            return backend_functions.binary_dense_scaled
-        case (DenseScaledFormat(), DenseFormat()):
-            return backend_functions.binary_scaled_dense
-        case (DenseLogspaceFormat(), DenseFormat()):
-            return backend_functions.binary_logspace_dense
-        case (DenseFormat(), DenseLogspaceFormat()):
-            return backend_functions.binary_dense_logspace
-        case _:
-            raise NotImplementedError()
-
-
-@dataclass(frozen=True)
-class RichProgram(Program):
-    instructions: list[Instruction]
-    n_inputs: int
-
-    stability: Literal["none", "scaled", "logspace"]
-    shapes: list[Shape]
-    tensor_formats: list[TensorFormat]
-    parameter_indices: list[int]
-    consumers_of_ssa_id: list[list[int]]
-
-    def __post_init__(self) -> None:
-        n_ssa_ids = self.n_inputs + len(self.instructions)
-
-        if len(self.shapes) != n_ssa_ids:
-            raise ValueError(
-                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-        if len(self.tensor_formats) != n_ssa_ids:
-            raise ValueError(
-                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
-            )
-
-    def strip(self) -> Program:
-        return Program(self.instructions, self.n_inputs)
-
-
 class PreprocessingRoutine(Protocol):
     @staticmethod
     def apply(program: RichProgram) -> RichProgram: ...
@@ -165,8 +79,7 @@ class OutputDepthOpGroupMember:
 @dataclass(frozen=True)
 class _OutputDepthOpSignature:
     depth: int
-    operator: Operator
-    canonical_instruction_specific_arguments: tuple[Any, ...]
+    operator: RichOperator
     operand_shapes: tuple[Shape, ...]
     operand_tensor_formats: tuple[TensorFormat, ...]
 
@@ -189,7 +102,7 @@ def group_identical_ops_by_output_depth(
     result_dependencies = _instruction_result_dependencies(program)
     buckets: dict[_OutputDepthOpSignature, list[OutputDepthOpGroupMember]] = {}
 
-    for op_index, instruction in enumerate(program.instructions):
+    for op_index, _ in enumerate(program.instructions):
         result_id = program.n_inputs + op_index
         depth = output_depths.get(result_id)
         if depth is None:
@@ -206,12 +119,10 @@ def group_identical_ops_by_output_depth(
         ):
             if len(safe_group) < min_group_size:
                 continue
-            canonical_args = signature.canonical_instruction_specific_arguments
             groups.append(
                 OutputDepthOpGroup(
                     depth=signature.depth,
                     operator=signature.operator,
-                    canonical_instruction_specific_arguments=canonical_args,
                     operand_shapes=signature.operand_shapes,
                     operand_tensor_formats=signature.operand_tensor_formats,
                     members=safe_group,
@@ -221,7 +132,7 @@ def group_identical_ops_by_output_depth(
     return tuple(sorted(groups, key=_output_depth_group_sort_key))
 
 
-def _nearest_output_depths(program: Program) -> dict[int, int]:
+def _nearest_output_depths(program: RichProgram) -> dict[int, int]:
     depths: dict[int, int] = {}
     pending: deque[tuple[int, int]] = deque([(program.output_ssa, 0)])
 
@@ -236,21 +147,19 @@ def _nearest_output_depths(program: Program) -> dict[int, int]:
             continue
 
         instruction = program.instructions[ssa_id - program.n_inputs]
-        for argument in get_arguments(instruction):
+        for argument in instruction.argument_ssa_ids:
             pending.append((argument, depth + 1))
 
     return depths
 
 
-def _instruction_result_dependencies(program: Program) -> dict[int, frozenset[int]]:
-    dependencies: dict[int, frozenset[int]] = {
-        input_id: frozenset() for input_id in range(program.n_inputs)
-    }
+def _instruction_result_dependencies(program: RichProgram) -> dict[int, frozenset[int]]:
+    dependencies: dict[int, frozenset[int]] = {input_id: frozenset() for input_id in range(program.n_inputs)}
 
     for op_index, instruction in enumerate(program.instructions):
         result_id = program.n_inputs + op_index
         result_dependencies: set[int] = set()
-        for argument in get_arguments(instruction):
+        for argument in instruction.argument_ssa_ids:
             result_dependencies.update(dependencies[argument])
             if argument >= program.n_inputs:
                 result_dependencies.add(argument)
@@ -265,22 +174,19 @@ def _canonicalize_output_depth_op(
     depth: int,
 ) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
     instruction = program.instructions[op_index]
-    operator = get_operator(instruction)
-    if operator == EINSUM_OPERATOR:
+    if isinstance(instruction.operator, OperatorEinsum):
         return _canonicalize_output_depth_einsum(program, op_index, depth)
 
-    arguments = get_arguments(instruction)
     canonical_argument_order = _canonical_argument_order_for_operator(
-        operator,
-        arguments,
+        instruction.operator,
+        instruction.argument_ssa_ids,
         program,
     )
     return _make_output_depth_op_group_entry(
         program,
         op_index,
         depth,
-        operator,
-        get_instruction_specific_arguments(instruction),
+        instruction.operator,
         canonical_argument_order,
     )
 
@@ -289,36 +195,32 @@ def _make_output_depth_op_group_entry(
     program: RichProgram,
     op_index: int,
     depth: int,
-    operator: Operator,
-    canonical_args: tuple[Any, ...],
+    operator: RichOperator,
     canonical_argument_order: tuple[int, ...],
 ) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
-    arguments = get_arguments(program.instructions[op_index])
-    ordered_arguments = tuple(arguments[index] for index in canonical_argument_order)
+    argument_ssa_ids = program.instructions[op_index].argument_ssa_ids
+    ordered_arguments = tuple(argument_ssa_ids[index] for index in canonical_argument_order)
     operand_shapes = tuple(program.shapes[argument] for argument in ordered_arguments)
-    operand_tensor_formats = tuple(
-        program.tensor_formats[argument] for argument in ordered_arguments
-    )
+    operand_tensor_formats: tuple[TensorFormat, ...] = tuple(program.tensor_formats[argument] for argument in ordered_arguments)
 
     return (
         _OutputDepthOpSignature(
             depth=depth,
             operator=operator,
-            canonical_instruction_specific_arguments=canonical_args,
             operand_shapes=operand_shapes,
             operand_tensor_formats=operand_tensor_formats,
         ),
         OutputDepthOpGroupMember(
             op_index=op_index,
             result_id=program.n_inputs + op_index,
-            arguments=arguments,
+            arguments=argument_ssa_ids,
             canonical_argument_order=canonical_argument_order,
         ),
     )
 
 
 def _canonical_argument_order_for_operator(
-    operator: Operator,
+    operator: RichOperator,
     arguments: tuple[int, ...],
     program: RichProgram,
 ) -> tuple[int, ...]:
@@ -330,7 +232,7 @@ def _canonical_argument_order_for_operator(
             range(len(arguments)),
             key=lambda index: (
                 program.shapes[arguments[index]],
-                program.tensor_formats[arguments[index]].sort_key,
+                program.tensor_formats[arguments[index]],
                 index,
             ),
         )
@@ -343,33 +245,24 @@ def _canonicalize_output_depth_einsum(
     depth: int,
 ) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
     instruction = program.instructions[op_index]
-    arguments = get_arguments(instruction)
-
-    input_strings, output_string = parse_format_string(
-        get_einsum_format_string(instruction)
-    )
-
-    if len(input_strings) != len(arguments):
-        raise ValueError("einsum input count must match argument count")
+    assert isinstance(instruction.operator, OperatorEinsum)
+    input_strings, output_string = parse_format_string(instruction.operator.format_string)
+    if len(input_strings) != len(instruction.argument_ssa_ids):
+        raise ValueError(f"einsum input count {len(input_strings)} must match argument count {len(instruction.argument_ssa_ids)}")
 
     # Labels alone do not identify indistinguishable operands; include tensor
     # format metadata so canonical permutations keep tensor slots aligned.
-    argument_sort_keys = tuple(
-        (program.tensor_formats[argument].sort_key,) for argument in arguments
-    )
-    canonical_format_string, canonical_argument_order = (
-        _canonicalize_einsum_string_from_output(
-            input_strings,
-            output_string,
-            argument_sort_keys,
-        )
+    argument_sort_keys = tuple((program.tensor_formats[argument],) for argument in instruction.argument_ssa_ids)
+    canonical_format_string, canonical_argument_order = _canonicalize_einsum_string_from_output(
+        input_strings,
+        output_string,
+        argument_sort_keys,
     )
     return _make_output_depth_op_group_entry(
         program,
         op_index,
         depth,
-        EINSUM_OPERATOR,
-        (canonical_format_string,),
+        OperatorEinsum(canonical_format_string),
         canonical_argument_order,
     )
 
@@ -387,20 +280,13 @@ def _canonicalize_einsum_string_from_output(
 
     def argument_sort_key(argument_position: int) -> tuple[Any, ...]:
         return (
-            label_allocator.copy().normalize_subscript(
-                input_strings[argument_position]
-            ),
+            label_allocator.copy().normalize_subscript(input_strings[argument_position]),
             argument_sort_keys[argument_position],
             argument_position,
         )
 
-    canonical_argument_order = tuple(
-        sorted(range(len(input_strings)), key=argument_sort_key)
-    )
-    normalized_inputs = tuple(
-        label_allocator.normalize_subscript(input_strings[index])
-        for index in canonical_argument_order
-    )
+    canonical_argument_order = tuple(sorted(range(len(input_strings)), key=argument_sort_key))
+    normalized_inputs = tuple(label_allocator.normalize_subscript(input_strings[index]) for index in canonical_argument_order)
     return (
         f"{','.join(normalized_inputs)}->{normalized_output}",
         canonical_argument_order,
@@ -436,19 +322,15 @@ def _op_members_depend_on_each_other(
 ) -> bool:
     first_result_id = first.result_id
     second_result_id = second.result_id
-    return (
-        second_result_id in result_dependencies[first_result_id]
-        or first_result_id in result_dependencies[second_result_id]
-    )
+    return second_result_id in result_dependencies[first_result_id] or first_result_id in result_dependencies[second_result_id]
 
 
 def _output_depth_group_sort_key(group: OutputDepthOpGroup) -> tuple[Any, ...]:
     return (
         group.depth,
-        group.operator,
-        group.canonical_instruction_specific_arguments,
+        group.operator.name,
         group.operand_shapes,
-        tuple(tensor_format.sort_key for tensor_format in group.operand_tensor_formats),
+        tuple(group.operand_tensor_formats),
         tuple(member.op_index for member in group.members),
     )
 
@@ -487,9 +369,7 @@ def extract_connected_einsum_components(
             continue
 
         sink_op_index = instruction_index
-        _sink_inputs, sink_output = parse_format_string(
-            instruction.operator.format_string
-        )
+        _sink_inputs, sink_output = parse_format_string(instruction.operator.format_string)
         label_allocator = _EinsumLabelAllocator()
 
         # Every queued einsum carries the component-wide labels that its output
@@ -508,14 +388,10 @@ def extract_connected_einsum_components(
             component.add(einsum_op_index)
             einsum_instruction = program.instructions[einsum_op_index]
             assert isinstance(einsum_instruction.operator, OperatorEinsum)
-            input_strings, output_string = parse_format_string(
-                einsum_instruction.operator.format_string
-            )
+            input_strings, output_string = parse_format_string(einsum_instruction.operator.format_string)
             label_map = dict(zip(output_string, expected_output, strict=True))
 
-            for argument_ssa_id, input_string in zip(
-                einsum_instruction.argument_ssa_ids, input_strings, strict=True
-            ):
+            for argument_ssa_id, input_string in zip(einsum_instruction.argument_ssa_ids, input_strings, strict=True):
                 # Preserve labels shared with the output and allocate labels for
                 # contraction indices that are first encountered at this operation.
                 relabeled_input_labels: list[str] = []
@@ -536,9 +412,7 @@ def extract_connected_einsum_components(
                         )
                         and len(program.consumers_of_ssa_id[argument_ssa_id]) == 1
                     ):
-                        pending_einsum_instructions.append(
-                            (argument_instruction_index, relabeled_input)
-                        )
+                        pending_einsum_instructions.append((argument_instruction_index, relabeled_input))
                         continue
 
                 boundary_arguments.append(argument_ssa_id)
@@ -571,9 +445,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             if len(component.boundary_arguments) < 2:
                 continue
 
-            boundary_shapes = tuple(
-                program.shapes[argument] for argument in component.boundary_arguments
-            )
+            boundary_shapes = tuple(program.shapes[argument] for argument in component.boundary_arguments)
 
             from sesum import sr
 
@@ -611,11 +483,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
 
         # Operations in a planned component are omitted from the old program and
         # replaced by the new pairwise contractions when its sink is reached.
-        block_ops = {
-            op_index
-            for component, _arguments, _instructions in blocks.values()
-            for op_index in component
-        }
+        block_ops = {op_index for component, _arguments, _instructions in blocks.values() for op_index in component}
         tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
         instructions: list[RichInstruction] = []
         shapes = program.shapes[: program.n_inputs]
@@ -631,17 +499,11 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 # Planned paths use local IDs: boundary inputs first, followed by
                 # intermediate results. Translate those IDs as instructions are added.
                 _component, boundary_arguments, planned_instructions = block
-                local_tensor_map = {
-                    local_id: tensor_map[argument]
-                    for local_id, argument in enumerate(boundary_arguments)
-                }
+                local_tensor_map = {local_id: tensor_map[argument] for local_id, argument in enumerate(boundary_arguments)}
                 block_format = program.tensor_formats[result_id]
                 for step_index, planned_instruction in enumerate(planned_instructions):
                     assert isinstance(planned_instruction.operator, OperatorEinsum)
-                    mapped_arguments = tuple(
-                        local_tensor_map[argument]
-                        for argument in planned_instruction.argument_ssa_ids
-                    )
+                    mapped_arguments = tuple(local_tensor_map[argument] for argument in planned_instruction.argument_ssa_ids)
                     argument_map = dict(
                         zip(
                             planned_instruction.argument_ssa_ids,
@@ -649,9 +511,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                             strict=True,
                         )
                     )
-                    mapped_instruction = _map_instruction_arguments(
-                        planned_instruction, argument_map.__getitem__
-                    )
+                    mapped_instruction = map_instruction_arguments(planned_instruction, argument_map.__getitem__)
                     planned_result_id = program.n_inputs + len(instructions)
                     instructions.append(mapped_instruction)
                     shapes.append(
@@ -661,23 +521,16 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                         )
                     )
                     tensor_formats.append(block_format)
-                    local_tensor_map[len(boundary_arguments) + step_index] = (
-                        planned_result_id
-                    )
+                    local_tensor_map[len(boundary_arguments) + step_index] = planned_result_id
                 tensor_map[result_id] = planned_result_id
                 continue
 
             if op_index in block_ops:
                 continue
 
-            argument_map = {
-                argument: tensor_map[argument]
-                for argument in instruction.argument_ssa_ids
-            }
+            argument_map = {argument: tensor_map[argument] for argument in instruction.argument_ssa_ids}
             tensor_map[result_id] = program.n_inputs + len(instructions)
-            instructions.append(
-                _map_instruction_arguments(instruction, argument_map.__getitem__)
-            )
+            instructions.append(map_instruction_arguments(instruction, argument_map.__getitem__))
             shapes.append(program.shapes[result_id])
             tensor_formats.append(program.tensor_formats[result_id])
 
@@ -740,9 +593,7 @@ def to_annotated_ssa_path(
 
         pairwise_expression = f"{t1},{t2}->{t3}"
         if prefer_ascii:
-            pairwise_expression = _EinsumLabelAllocator.remap_expression(
-                pairwise_expression
-            )
+            pairwise_expression = _EinsumLabelAllocator.remap_expression(pairwise_expression)
 
         annotated_ssa_path.append((first, second, pairwise_expression))
         inputs.append(t3)
@@ -760,10 +611,7 @@ def _to_ascii_einsum(expression: str) -> str:
             continue
         if char not in char_mapping:
             if ascii_index == len(_LABELS):
-                raise RuntimeError(
-                    f"ERROR: {expression} cannot be converted to ASCII, "
-                    "it is too large."
-                )
+                raise RuntimeError(f"ERROR: {expression} cannot be converted to ASCII, it is too large.")
             char_mapping[char] = _LABELS[ascii_index]
             ascii_index += 1
         parts.append(char_mapping[char])

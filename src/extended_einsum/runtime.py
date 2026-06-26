@@ -18,9 +18,7 @@ def execute_operator(
             return backend_functions.stack(tensor_arguments, axis=axis)
         case "take":
             axis = instruction_specific_arguments[0]
-            return backend_functions.take(
-                tensor_arguments[0], tensor_arguments[1], axis
-            )
+            return backend_functions.take(tensor_arguments[0], tensor_arguments[1], axis)
         case "select":
             axis = instruction_specific_arguments[0]
             index = instruction_specific_arguments[1]
@@ -58,9 +56,7 @@ def run_program(
     backend_functions_per_instruction: list[BackendFunctions[HasShape]],
 ) -> HasShape:
     tensors: list[HasShape] = list(inputs)
-    for i, (operator, arguments, instruction_specific_arguments) in enumerate(
-        program.instructions
-    ):
+    for i, (operator, arguments, instruction_specific_arguments) in enumerate(program.instructions):
         argument_tensors = [tensors[argument] for argument in arguments]
         result = execute_operator(
             operator,
