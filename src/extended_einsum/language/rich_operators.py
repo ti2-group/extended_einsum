@@ -283,15 +283,14 @@ class OperatorSelect(RichOperator):
             raise ValueError(f"The select operator wants to select axis {self.axis} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}.")
         if not 0 <= self.index < operands[0].shape[self.axis]:
             raise ValueError(
-                f"The select operator wants to select index {self.index} but the operand only has {operands[0].shape[self.axis]} indices along axis {self.axis}. Bounds are 0 <= index < {operands[0].shape[self.axis]}."
+                f"The select operator wants to select index {self.index} but the operand only has {operands[0].shape[self.axis]} indices along axis {self.axis}. "
+                f"Bounds are 0 <= index < {operands[0].shape[self.axis]}."
             )
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
-        # TODO: is this the correct shape? or do we just delete the middle axis?
         return (
             *input_shapes[0][: self.axis],
-            1,
             *input_shapes[0][self.axis + 1 :],
         )
 

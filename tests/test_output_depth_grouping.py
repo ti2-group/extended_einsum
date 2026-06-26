@@ -1,4 +1,4 @@
-import unittest
+åimport unittest
 
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import (
@@ -6,10 +6,12 @@ from extended_einsum.language.rich_operators import (
     OperatorEinsum,
     OperatorLog,
     OperatorSoftmax,
+    OperatorStack,
     OperatorSubtract,
 )
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.preprocess import (
+    FoldSameShapedOperations,
     extract_connected_einsum_components,
     group_identical_ops_by_output_depth,
     to_annotated_ssa_path,
@@ -30,11 +32,15 @@ def _log_instruction(argument: int) -> RichInstruction:
 
 
 def _softmax_instruction(argument: int, axis: int) -> RichInstruction:
-    return RichInstruction(OperatorSoftmax(axis=axis), (argument,))
+    return RichInstruction(OperatorSoftmax(axis), (argument,))
 
+
+def _stack_instruction(*arguments: int, axis: int = 0) -> RichInstruction:
+    return RichInstruction(OperatorStack(axis), arguments)
+å
 
 def _einsum_instruction(format_string: str, *arguments: int) -> RichInstruction:
-    return RichInstruction(OperatorEinsum(format_string), tuple(arguments))
+    return RichInstruction(OperatorEinsum(format_string), arguments)
 
 
 def _program(
@@ -43,13 +49,12 @@ def _program(
     n_inputs: int,
     shapes: list[Shape],
 ) -> RichProgram:
-    n_ssa_ids = n_inputs + len(instructions)
     return RichProgram(
         instructions=instructions,
         n_inputs=n_inputs,
-        stability_mode="unstable",
+        stability_mode="none",
         shapes=shapes,
-        tensor_formats=["dense"] * n_ssa_ids,
+        tensor_formats=["dense" for _ in shapes],
         parameter_indices=frozenset(),
     )
 
@@ -354,8 +359,103 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(
             groups[0].operator.raw_extra_arguments,
-            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZĀ->a",),
+            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\u0100->a",),
         )
+
+    def test_splits_candidates_that_reuse_the_same_previous_result(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _add_instruction(2, 1),
+                _add_instruction(2, 1),
+                _stack_instruction(3, 4),
+            ],
+            n_inputs=2,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 2, 3),
+            ],
+        )
+
+        grouped_pairs = group_identical_ops_by_output_depth(program)
+        singleton_groups = group_identical_ops_by_output_depth(program, min_group_size=1)
+
+        self.assertEqual(grouped_pairs, ())
+        self.assertEqual(
+            tuple(tuple(member.op_index for member in group.members) for group in singleton_groups),
+            ((3,), (1,), (2,), (0,)),
+        )
+
+    def test_folds_identical_unary_operations_into_one_batched_operation(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _add_instruction(2, 3),
+            ],
+            n_inputs=2,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = FoldSameShapedOperations.apply(program)
+
+        self.assertEqual(
+            [instruction.operator.name for instruction in folded.instructions],
+            ["stack", "log", "select", "select", "+"],
+        )
+        self.assertEqual(result.program, folded)
+        self.assertEqual(result.batched_result_orders, ((2, 3),))
+        self.assertEqual(result.non_parameter_stack_orders, ((0, 1),))
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0, 1))
+        self.assertEqual(folded.instructions[1].argument_ssa_ids, (2,))
+        self.assertEqual(folded.shapes, [(2, 3), (2, 3), (2, 2, 3), (2, 2, 3), (2, 3), (2, 3), (2, 3)])
+
+    def test_orders_producer_batches_so_consumers_can_use_slices(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _log_instruction(2),
+                _add_instruction(7, 3),
+                _add_instruction(8, 4),
+                _subtract_instruction(6, 5),
+                _stack_instruction(9, 10, 11),
+            ],
+            n_inputs=6,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (3, 2, 3),
+            ],
+        )
+
+        folded = FoldSameShapedOperations.apply(program)
+        slice_instructions = [instruction for instruction in folded.instructions if instruction.operator.name == "slice"]
+
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (1, 2, 0))
+        self.assertEqual(len(slice_instructions), 1)
+        self.assertEqual(slice_instructions[0].operator.raw_extra_arguments, (0, 2, 0))
 
 
 class EinsumLabelAllocationTests(unittest.TestCase):

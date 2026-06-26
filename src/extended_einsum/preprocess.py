@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, override
 
 from extended_einsum.language.rich_instruction import RichInstruction, map_instruction_arguments
-from extended_einsum.language.rich_operators import OperatorEinsum, RichOperator
+from extended_einsum.language.rich_operators import (
+    OperatorEinsum,
+    OperatorSelect,
+    OperatorSlice,
+    OperatorSoftmax,
+    OperatorStack,
+    OperatorTake,
+    RichOperator,
+)
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import TensorFormat
 from extended_einsum.shapes import (
@@ -116,6 +125,7 @@ def group_identical_ops_by_output_depth(
         for safe_group in _split_dependency_safe_op_groups(
             members,
             result_dependencies,
+            program.n_inputs,
         ):
             if len(safe_group) < min_group_size:
                 continue
@@ -296,23 +306,51 @@ def _canonicalize_einsum_string_from_output(
 def _split_dependency_safe_op_groups(
     members: list[OutputDepthOpGroupMember],
     result_dependencies: dict[int, frozenset[int]],
+    n_inputs: int,
 ) -> list[tuple[OutputDepthOpGroupMember, ...]]:
     groups: list[list[OutputDepthOpGroupMember]] = []
     for member in sorted(members, key=lambda item: item.op_index):
         for group in groups:
-            if all(
-                not _op_members_depend_on_each_other(
-                    member,
-                    existing_member,
-                    result_dependencies,
-                )
-                for existing_member in group
-            ):
+            if _op_member_can_join_group(member, group, result_dependencies, n_inputs):
                 group.append(member)
                 break
         else:
             groups.append([member])
     return [tuple(group) for group in groups]
+
+
+def _op_member_can_join_group(
+    member: OutputDepthOpGroupMember,
+    group: list[OutputDepthOpGroupMember],
+    result_dependencies: dict[int, frozenset[int]],
+    n_inputs: int,
+) -> bool:
+    member_result_arguments = _member_result_arguments(member, n_inputs)
+    if len(member_result_arguments) != len(set(member_result_arguments)):
+        return False
+
+    if any(len(existing_result_arguments := _member_result_arguments(existing_member, n_inputs)) != len(set(existing_result_arguments)) for existing_member in group):
+        return False
+
+    used_result_arguments = {argument for existing_member in group for argument in _member_result_arguments(existing_member, n_inputs)}
+    if used_result_arguments.intersection(member_result_arguments):
+        return False
+
+    return all(
+        not _op_members_depend_on_each_other(
+            member,
+            existing_member,
+            result_dependencies,
+        )
+        for existing_member in group
+    )
+
+
+def _member_result_arguments(
+    member: OutputDepthOpGroupMember,
+    n_inputs: int,
+) -> tuple[int, ...]:
+    return tuple(argument for argument in member.arguments if argument >= n_inputs)
 
 
 def _op_members_depend_on_each_other(
@@ -544,11 +582,495 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         )
 
 
+_BATCHABLE_OPERATOR_NAMES = frozenset(
+    {
+        "sin",
+        "cos",
+        "tan",
+        "exp",
+        "log",
+        "sqrt",
+        "1/",
+        "+",
+        "-",
+        "*",
+        "/",
+        "einsum",
+        "stack",
+        "slice",
+        "select",
+        "softmax",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _TensorRef:
+    ssa_id: int
+
+
+@dataclass(frozen=True)
+class _BatchElementRef:
+    source_ssa_id: int
+    index: int
+
+
+@dataclass(frozen=True)
+class FoldSameShapedOperationsResult:
+    program: RichProgram
+    batched_result_orders: tuple[tuple[int, ...], ...]
+    non_parameter_stack_orders: tuple[tuple[int, ...], ...]
+
+
+_TensorValueRef = _TensorRef | _BatchElementRef
+_ScheduledOutputDepthEvent = int | OutputDepthOpGroup
+
+
 class FoldSameShapedOperations(PreprocessingRoutine):
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
-        return program  # TODO
+        return FoldSameShapedOperations.apply_with_metadata(program).program
+
+    @staticmethod
+    def apply_with_metadata(program: RichProgram) -> FoldSameShapedOperationsResult:
+        groups = tuple(group for group in group_identical_ops_by_output_depth(program) if _operator_can_be_batched(group.operator))
+        if not groups:
+            return FoldSameShapedOperationsResult(
+                program=program,
+                batched_result_orders=(),
+                non_parameter_stack_orders=(),
+            )
+
+        events = _schedule_output_depth_group_events(program, groups)
+        if not any(isinstance(event, OutputDepthOpGroup) for event in events):
+            return FoldSameShapedOperationsResult(
+                program=program,
+                batched_result_orders=(),
+                non_parameter_stack_orders=(),
+            )
+
+        ordered_events = _order_output_depth_group_events(events, program)
+        return _rewrite_output_depth_group_events(program, ordered_events)
+
+
+def _operator_can_be_batched(operator: RichOperator) -> bool:
+    return operator.name in _BATCHABLE_OPERATOR_NAMES and not isinstance(operator, OperatorTake)
+
+
+def _schedule_output_depth_group_events(
+    program: RichProgram,
+    groups: Sequence[OutputDepthOpGroup],
+) -> tuple[_ScheduledOutputDepthEvent, ...]:
+    group_index_by_op_index: dict[int, int] = {}
+    for group_index, group in enumerate(groups):
+        for member in group.members:
+            group_index_by_op_index[member.op_index] = group_index
+
+    remaining = set(range(len(program.instructions)))
+    available = set(range(program.n_inputs))
+    disabled_groups: set[int] = set()
+    events: list[_ScheduledOutputDepthEvent] = []
+
+    while remaining:
+        ready = [op_index for op_index in sorted(remaining) if all(argument in available for argument in program.instructions[op_index].argument_ssa_ids)]
+        if not ready:
+            raise ValueError("program contains instructions whose inputs are unavailable")
+
+        progress = False
+        for op_index in ready:
+            group_index = group_index_by_op_index.get(op_index)
+            if group_index is None or group_index in disabled_groups:
+                events.append(op_index)
+                remaining.remove(op_index)
+                available.add(program.n_inputs + op_index)
+                progress = True
+                break
+
+            group = groups[group_index]
+            if all(member.op_index in ready for member in group.members):
+                events.append(group)
+                for member in group.members:
+                    remaining.remove(member.op_index)
+                    available.add(member.result_id)
+                progress = True
+                break
+
+        if progress:
+            continue
+
+        # A partial group is ready but cannot be emitted as a whole. Keep the
+        # program moving by leaving that group unbatched.
+        disabled_groups.add(group_index_by_op_index[ready[0]])
+
+    return tuple(events)
+
+
+def _order_output_depth_group_events(
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    program: RichProgram,
+) -> tuple[_ScheduledOutputDepthEvent, ...]:
+    consumers = _result_consumers_with_positions(program)
+    event_index_by_op_index: dict[int, int] = {}
+    for event_index, event in enumerate(events):
+        if isinstance(event, int):
+            event_index_by_op_index[event] = event_index
+            continue
+        for member in event.members:
+            event_index_by_op_index[member.op_index] = event_index
+
+    ordered_groups: dict[int, OutputDepthOpGroup] = {}
+    for event_index in reversed(range(len(events))):
+        event = events[event_index]
+        if isinstance(event, int):
+            continue
+
+        ordered_members = tuple(
+            sorted(
+                event.members,
+                key=lambda member: _group_member_future_order_key(
+                    member,
+                    events,
+                    consumers,
+                    event_index_by_op_index,
+                    ordered_groups,
+                ),
+            )
+        )
+        ordered_groups[event_index] = replace(event, members=ordered_members)
+
+    return tuple(ordered_groups[event_index] if event_index in ordered_groups else event for event_index, event in enumerate(events))
+
+
+def _result_consumers_with_positions(
+    program: RichProgram,
+) -> dict[int, list[tuple[int, int]]]:
+    consumers: dict[int, list[tuple[int, int]]] = {}
+    for op_index, instruction in enumerate(program.instructions):
+        for argument_position, argument in enumerate(instruction.argument_ssa_ids):
+            consumers.setdefault(argument, []).append((op_index, argument_position))
+    return consumers
+
+
+def _group_member_future_order_key(
+    member: OutputDepthOpGroupMember,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    consumers: dict[int, list[tuple[int, int]]],
+    event_index_by_op_index: dict[int, int],
+    ordered_groups: dict[int, OutputDepthOpGroup],
+) -> tuple[int, ...]:
+    order_keys: list[tuple[int, ...]] = []
+    for consumer_op_index, argument_position in consumers.get(member.result_id, []):
+        consumer_event_index = event_index_by_op_index[consumer_op_index]
+        consumer_event = events[consumer_event_index]
+        if isinstance(consumer_event, int):
+            order_keys.append(
+                (
+                    consumer_event_index,
+                    0,
+                    consumer_op_index,
+                    argument_position,
+                )
+            )
+            continue
+
+        ordered_group = ordered_groups.get(consumer_event_index, consumer_event)
+        consumer_position_by_op_index = {consumer_member.op_index: position for position, consumer_member in enumerate(ordered_group.members)}
+        consumer_member = ordered_group.members[consumer_position_by_op_index[consumer_op_index]]
+        canonical_position = _canonical_operand_position(
+            consumer_member,
+            argument_position,
+        )
+        order_keys.append(
+            (
+                consumer_event_index,
+                0,
+                canonical_position,
+                consumer_position_by_op_index[consumer_op_index],
+                argument_position,
+            )
+        )
+
+    if not order_keys:
+        return (len(events), member.op_index)
+    return min(order_keys)
+
+
+def _canonical_operand_position(
+    member: OutputDepthOpGroupMember,
+    original_position: int,
+) -> int:
+    for canonical_position, member_original_position in enumerate(member.canonical_argument_order):
+        if member_original_position == original_position:
+            return canonical_position
+    raise ValueError("argument position is not part of the member's canonical argument order")
+
+
+def _rewrite_output_depth_group_events(
+    program: RichProgram,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+) -> FoldSameShapedOperationsResult:
+    instructions: list[RichInstruction] = []
+    shapes = program.shapes[: program.n_inputs]
+    tensor_formats = program.tensor_formats[: program.n_inputs]
+    tensor_map: dict[int, _TensorValueRef] = {input_id: _TensorRef(input_id) for input_id in range(program.n_inputs)}
+    materialized_elements: dict[_BatchElementRef, int] = {}
+    batched_result_orders: list[tuple[int, ...]] = []
+    non_parameter_stack_orders: list[tuple[int, ...]] = []
+
+    def append_instruction(
+        instruction: RichInstruction,
+        *,
+        output_shape: Shape | None = None,
+        output_format: TensorFormat | None = None,
+    ) -> int:
+        result_id = program.n_inputs + len(instructions)
+        instructions.append(instruction)
+        argument_shapes = [shapes[argument] for argument in instruction.argument_ssa_ids]
+        shapes.append(instruction.operator.propagate_shapes(argument_shapes) if output_shape is None else output_shape)
+        if output_format is None:
+            output_format = _infer_generated_tensor_format(
+                instruction.operator,
+                [tensor_formats[argument] for argument in instruction.argument_ssa_ids],
+            )
+        tensor_formats.append(output_format)
+        return result_id
+
+    def ref_shape(ref: _TensorValueRef) -> Shape:
+        if isinstance(ref, _TensorRef):
+            return shapes[ref.ssa_id]
+        source_shape = shapes[ref.source_ssa_id]
+        if not source_shape:
+            raise ValueError("batched tensor has no batch axis")
+        return source_shape[1:]
+
+    def ref_format(ref: _TensorValueRef) -> TensorFormat:
+        if isinstance(ref, _TensorRef):
+            return tensor_formats[ref.ssa_id]
+        return tensor_formats[ref.source_ssa_id]
+
+    def materialize_ref(ref: _TensorValueRef) -> int:
+        if isinstance(ref, _TensorRef):
+            return ref.ssa_id
+
+        cached = materialized_elements.get(ref)
+        if cached is not None:
+            return cached
+
+        result_id = append_instruction(
+            RichInstruction(
+                operator=OperatorSelect(axis=0, index=ref.index),
+                argument_ssa_ids=(ref.source_ssa_id,),
+            ),
+            output_shape=ref_shape(ref),
+            output_format=ref_format(ref),
+        )
+        materialized_elements[ref] = result_id
+        return result_id
+
+    def materialize_batch(refs: tuple[_TensorValueRef, ...]) -> int:
+        if not refs:
+            raise ValueError("cannot materialize an empty batch")
+
+        first_ref = refs[0]
+        if isinstance(first_ref, _BatchElementRef) and all(isinstance(ref, _BatchElementRef) and ref.source_ssa_id == first_ref.source_ssa_id for ref in refs):
+            indices = tuple(ref.index for ref in refs)
+            contiguous = _contiguous_range(indices)
+            if contiguous is not None:
+                start, stop = contiguous
+                if start == 0 and shapes[first_ref.source_ssa_id][0] == stop:
+                    return first_ref.source_ssa_id
+                return append_instruction(
+                    RichInstruction(
+                        operator=OperatorSlice(start=start, stop=stop, axis=0),
+                        argument_ssa_ids=(first_ref.source_ssa_id,),
+                    ),
+                    output_format=ref_format(first_ref),
+                )
+
+        input_order = _input_stack_order(refs, program.n_inputs)
+        if input_order is not None and any(input_id not in program.parameter_indices for input_id in input_order):
+            non_parameter_stack_orders.append(input_order)
+
+        materialized_arguments = tuple(materialize_ref(ref) for ref in refs)
+        return append_instruction(
+            RichInstruction(
+                operator=OperatorStack(axis=0),
+                argument_ssa_ids=materialized_arguments,
+            ),
+            output_format=ref_format(first_ref),
+        )
+
+    for event in events:
+        if not isinstance(event, int):
+            grouped_refs = _group_refs_by_canonical_operand(event, tensor_map)
+            batched_arguments = tuple(materialize_batch(refs) for refs in grouped_refs)
+            batched_operator = _make_batched_operator(event.operator)
+            batched_result_id = append_instruction(
+                RichInstruction(
+                    operator=batched_operator,
+                    argument_ssa_ids=batched_arguments,
+                ),
+                output_format=program.tensor_formats[event.members[0].result_id],
+            )
+            batched_result_orders.append(tuple(member.result_id for member in event.members))
+            for index, member in enumerate(event.members):
+                tensor_map[member.result_id] = _BatchElementRef(batched_result_id, index)
+            continue
+
+        instruction = program.instructions[event]
+        result_id = program.n_inputs + event
+        mapped_arguments = tuple(materialize_ref(tensor_map[argument]) for argument in instruction.argument_ssa_ids)
+        mapped_result_id = append_instruction(
+            RichInstruction(
+                operator=instruction.operator,
+                argument_ssa_ids=mapped_arguments,
+            ),
+            output_shape=program.shapes[result_id],
+            output_format=program.tensor_formats[result_id],
+        )
+        tensor_map[result_id] = _TensorRef(mapped_result_id)
+
+    output_id = materialize_ref(tensor_map[program.output_ssa])
+    if not _is_last_result(output_id, program.n_inputs, instructions):
+        output_id = _copy_to_last_result(
+            output_id,
+            append_instruction,
+            shapes,
+            tensor_formats,
+        )
+    if not _is_last_result(output_id, program.n_inputs, instructions):
+        raise RuntimeError("rewritten program output was not materialized as the last result")
+
+    rewritten_program = RichProgram(
+        instructions=instructions,
+        n_inputs=program.n_inputs,
+        stability_mode=program.stability_mode,
+        shapes=shapes,
+        tensor_formats=tensor_formats,
+        parameter_indices=program.parameter_indices,
+    )
+    return FoldSameShapedOperationsResult(
+        program=rewritten_program,
+        batched_result_orders=tuple(batched_result_orders),
+        non_parameter_stack_orders=tuple(non_parameter_stack_orders),
+    )
+
+
+def _group_refs_by_canonical_operand(
+    group: OutputDepthOpGroup,
+    tensor_map: dict[int, _TensorValueRef],
+) -> list[tuple[_TensorValueRef, ...]]:
+    operand_count = len(group.members[0].canonical_argument_order)
+    grouped: list[list[_TensorValueRef]] = [[] for _ in range(operand_count)]
+    for member in group.members:
+        for canonical_position, original_position in enumerate(member.canonical_argument_order):
+            grouped[canonical_position].append(tensor_map[member.arguments[original_position]])
+    return [tuple(refs) for refs in grouped]
+
+
+def _input_stack_order(
+    refs: tuple[_TensorValueRef, ...],
+    n_inputs: int,
+) -> tuple[int, ...] | None:
+    input_ids: list[int] = []
+    for ref in refs:
+        if not isinstance(ref, _TensorRef) or ref.ssa_id >= n_inputs:
+            return None
+        input_ids.append(ref.ssa_id)
+    return tuple(input_ids)
+
+
+def _contiguous_range(indices: tuple[int, ...]) -> tuple[int, int] | None:
+    if not indices:
+        return None
+    start = indices[0]
+    for offset, index in enumerate(indices):
+        if index != start + offset:
+            return None
+    return start, start + len(indices)
+
+
+def _make_batched_operator(operator: RichOperator) -> RichOperator:
+    match operator:
+        case OperatorEinsum(format_string):
+            input_strings, output_string = parse_format_string(format_string)
+            return OperatorEinsum(_batched_einsum_format(input_strings, output_string))
+        case OperatorStack(axis):
+            return OperatorStack(axis + 1)
+        case OperatorSlice(start, stop, axis):
+            return OperatorSlice(start, stop, axis + 1)
+        case OperatorSelect(axis, index):
+            return OperatorSelect(axis + 1, index)
+        case OperatorSoftmax(axis):
+            return OperatorSoftmax(axis + 1)
+        case OperatorTake(_):
+            raise ValueError("take cannot be batched with the current primitive")
+        case _:
+            return operator
+
+
+def _batched_einsum_format(input_strings: Sequence[str], output_string: str) -> str:
+    batch_label = _new_unused_einsum_label(f"{''.join(input_strings)}{output_string}")
+    batched_inputs = ",".join(f"{batch_label}{input_string}" for input_string in input_strings)
+    return f"{batched_inputs}->{batch_label}{output_string}"
+
+
+def _new_unused_einsum_label(used_labels: str) -> str:
+    used = set(used_labels)
+    for label in _LABELS:
+        if label not in used:
+            return label
+
+    extended_index = 0
+    while True:
+        label = chr(0x100 + extended_index)
+        if label not in used:
+            return label
+        extended_index += 1
+
+
+def _infer_generated_tensor_format(
+    operator: RichOperator,
+    argument_formats: Sequence[TensorFormat],
+) -> TensorFormat:
+    if not argument_formats:
+        raise ValueError(f"operator {operator.name} has no arguments")
+    first_format = argument_formats[0]
+    if isinstance(operator, (OperatorStack, OperatorEinsum)) and any(format != first_format for format in argument_formats[1:]):
+        raise ValueError(f"operator {operator.name} requires matching tensor formats")
+    return first_format
+
+
+def _is_last_result(
+    ssa_id: int,
+    n_inputs: int,
+    instructions: Sequence[RichInstruction],
+) -> bool:
+    return ssa_id == n_inputs + len(instructions) - 1
+
+
+def _copy_to_last_result(
+    ssa_id: int,
+    append_instruction: Any,
+    shapes: Sequence[Shape],
+    tensor_formats: Sequence[TensorFormat],
+) -> int:
+    stack_result = append_instruction(
+        RichInstruction(
+            operator=OperatorStack(axis=0),
+            argument_ssa_ids=(ssa_id,),
+        ),
+        output_format=tensor_formats[ssa_id],
+    )
+    return append_instruction(
+        RichInstruction(
+            operator=OperatorSelect(axis=0, index=0),
+            argument_ssa_ids=(stack_result,),
+        ),
+        output_shape=shapes[ssa_id],
+        output_format=tensor_formats[ssa_id],
+    )
 
 
 class OptimizeMemoryLayout(PreprocessingRoutine):
