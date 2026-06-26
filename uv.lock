@@ -361,6 +361,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "jax" },
+    { name = "libcirkit" },
     { name = "matplotlib" },
     { name = "networkx" },
     { name = "numpy" },
@@ -393,6 +394,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.10.1" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.10.1" },
     { name = "jax-triton", marker = "extra == 'cuda'", specifier = ">=0.3.1" },
+    { name = "libcirkit", specifier = ">=0.2.1" },
     { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "numpy", specifier = ">=2.1.6" },

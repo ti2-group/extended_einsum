@@ -4,9 +4,28 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Protocol, override
 
-from extended_einsum.language.rich_instruction import RichInstruction
-from extended_einsum.language.rich_operators import OperatorEinsum
-from extended_einsum.language.rich_program import RichProgram
+from extended_einsum.backend import (
+    BackendFunctions,
+    MultiFormatBackendFunctions,
+    SingleFormatBackendFunctions,
+    TBackendArrayCovariant,
+)
+from extended_einsum.format import (
+    DenseFormat,
+    DenseLogspaceFormat,
+    DenseScaledFormat,
+    TensorFormat,
+)
+from extended_einsum.language import (
+    EINSUM_OPERATOR,
+    Instruction,
+    Operator,
+    Program,
+    get_arguments,
+    get_einsum_format_string,
+    get_instruction_specific_arguments,
+    get_operator,
+)
 from extended_einsum.shapes import (
     Shape,
     infer_einsum_shape,

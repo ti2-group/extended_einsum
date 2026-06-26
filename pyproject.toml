@@ -12,6 +12,7 @@ dependencies = [
     "sesum>=0.4.0",
     "matplotlib>=3.10.9",
     "networkx>=3.6.1",
+    "libcirkit>=0.2.1",
 ]
 
 [project.optional-dependencies]

@@ -97,7 +97,6 @@ def _to_xe_recursive(symbolic_circuit, layer, data_by_scope):
         format_string = f"{child_indices},{weight_indices}->{out_indices}"
         weight_logits = torch.empty(weight_shape, dtype=torch.float32)
         weights = xe.softmax(weight_logits, axis=0)
-        xe.para
         return xe.einsum(format_string, child, weights)
 
     raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
@@ -108,7 +107,7 @@ def translate_cirkit_to_xe(
     *,
     batch_size: int,
     stability: str,
-) -> tuple[Program, list[object]]:
+) -> tuple[RichProgram, list[object]]:
     input_layer = next(
         layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer)
     )
