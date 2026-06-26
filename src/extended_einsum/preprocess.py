@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import permutations
 from typing import Any, Protocol, override
 
 import numpy as np
@@ -13,23 +12,429 @@ from extended_einsum.language.rich_operators import OperatorEinsum
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.shapes import (
     Shape,
-    infer_binary_shape,
     infer_einsum_shape,
-    infer_select_shape,
-    infer_slice_shape,
-    infer_softmax_shape,
-    infer_stack_shape,
-    infer_take_shape,
-    infer_unary_shape,
 )
 from extended_einsum.utils import parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_COMMUTATIVE_OPERATORS = frozenset({"+", "*"})
+
+
+class _EinsumLabelAllocator:
+    def __init__(
+        self,
+        *,
+        source_to_label: dict[str, str] | None = None,
+        next_label_index: int = 0,
+    ) -> None:
+        self._source_to_label = (
+            {} if source_to_label is None else source_to_label.copy()
+        )
+        self._next_label_index = next_label_index
+
+    def copy(self) -> _EinsumLabelAllocator:
+        return _EinsumLabelAllocator(
+            source_to_label=self._source_to_label,
+            next_label_index=self._next_label_index,
+        )
+
+    def new_label(self) -> str:
+        label_index = self._next_label_index
+        self._next_label_index += 1
+        if label_index < len(_LABELS):
+            return _LABELS[label_index]
+        return chr(0x100 + label_index - len(_LABELS))
+
+    def get_label(self, source_label: str) -> str:
+        if source_label not in self._source_to_label:
+            self._source_to_label[source_label] = self.new_label()
+        return self._source_to_label[source_label]
+
+    def normalize_subscript(self, subscript: str) -> str:
+        return "".join(self.get_label(label) for label in subscript)
+
+    def normalize_expression(self, expression: str) -> str:
+        parts: list[str] = []
+        for char in expression:
+            if char in ",->":
+                parts.append(char)
+                continue
+            parts.append(self.get_label(char))
+        return "".join(parts)
+
+    @classmethod
+    def remap_expression(cls, expression: str) -> str:
+        return cls().normalize_expression(expression)
+
+
+def choose_single_format_backend_functions(
+    argument_tensor_format: TensorFormat,
+    backend_functions: BackendFunctions[TBackendArrayCovariant],
+) -> SingleFormatBackendFunctions:
+    match argument_tensor_format:
+        case DenseFormat():
+            return backend_functions.unary_dense_only
+        case DenseLogspaceFormat():
+            return backend_functions.unary_logspace_only
+        case DenseScaledFormat():
+            return backend_functions.unary_scaled_only
+        case _:
+            raise NotImplementedError()
+
+
+def choose_multi_format_backend_functions(
+    tensor_format_1: TensorFormat,
+    tensor_format_2: TensorFormat,
+    backend_functions: BackendFunctions[TBackendArrayCovariant],
+) -> MultiFormatBackendFunctions:
+    match (tensor_format_1, tensor_format_2):
+        case (DenseFormat(), DenseFormat()):
+            return backend_functions.binary_dense_only
+        case (DenseLogspaceFormat(), DenseLogspaceFormat()):
+            return backend_functions.binary_logspace_only
+        case (DenseScaledFormat(), DenseScaledFormat()):
+            return backend_functions.binary_scaled_only
+        case (DenseFormat(), DenseScaledFormat()):
+            return backend_functions.binary_dense_scaled
+        case (DenseScaledFormat(), DenseFormat()):
+            return backend_functions.binary_scaled_dense
+        case (DenseLogspaceFormat(), DenseFormat()):
+            return backend_functions.binary_logspace_dense
+        case (DenseFormat(), DenseLogspaceFormat()):
+            return backend_functions.binary_dense_logspace
+        case _:
+            raise NotImplementedError()
+
+
+@dataclass(frozen=True)
+class RichProgram(Program):
+    instructions: list[Instruction]
+    n_inputs: int
+
+    stability: Literal["none", "scaled", "logspace"]
+    shapes: list[Shape]
+    tensor_formats: list[TensorFormat]
+    parameter_indices: list[int]
+    consumers_of_ssa_id: list[list[int]]
+
+    def __post_init__(self) -> None:
+        n_ssa_ids = self.n_inputs + len(self.instructions)
+
+        if len(self.shapes) != n_ssa_ids:
+            raise ValueError(
+                f"Number of shapes ({len(self.shapes)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
+            )
+        if len(self.tensor_formats) != n_ssa_ids:
+            raise ValueError(
+                f"Number of tensor formats ({len(self.tensor_formats)}) must match the expected number of SSA IDs ({self.n_inputs} inputs + {len(self.instructions)} instructions)."
+            )
+
+    def strip(self) -> Program:
+        return Program(self.instructions, self.n_inputs)
 
 
 class PreprocessingRoutine(Protocol):
     @staticmethod
     def apply(program: RichProgram) -> RichProgram: ...
+
+
+@dataclass(frozen=True)
+class OutputDepthOpGroupMember:
+    op_index: int
+    result_id: int
+    arguments: tuple[int, ...]
+    canonical_argument_order: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _OutputDepthOpSignature:
+    depth: int
+    operator: Operator
+    canonical_instruction_specific_arguments: tuple[Any, ...]
+    operand_shapes: tuple[Shape, ...]
+    operand_tensor_formats: tuple[TensorFormat, ...]
+
+
+@dataclass(frozen=True)
+class OutputDepthOpGroup(_OutputDepthOpSignature):
+    members: tuple[OutputDepthOpGroupMember, ...]
+
+
+def group_identical_ops_by_output_depth(
+    program: RichProgram,
+    *,
+    min_group_size: int = 2,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Group live, canonically identical ops by nearest output depth."""
+    if min_group_size < 1:
+        raise ValueError("min_group_size must be at least 1")
+
+    output_depths = _nearest_output_depths(program)
+    result_dependencies = _instruction_result_dependencies(program)
+    buckets: dict[_OutputDepthOpSignature, list[OutputDepthOpGroupMember]] = {}
+
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        depth = output_depths.get(result_id)
+        if depth is None:
+            continue
+
+        signature, member = _canonicalize_output_depth_op(program, op_index, depth)
+        buckets.setdefault(signature, []).append(member)
+
+    groups: list[OutputDepthOpGroup] = []
+    for signature, members in buckets.items():
+        for safe_group in _split_dependency_safe_op_groups(
+            members,
+            result_dependencies,
+        ):
+            if len(safe_group) < min_group_size:
+                continue
+            canonical_args = signature.canonical_instruction_specific_arguments
+            groups.append(
+                OutputDepthOpGroup(
+                    depth=signature.depth,
+                    operator=signature.operator,
+                    canonical_instruction_specific_arguments=canonical_args,
+                    operand_shapes=signature.operand_shapes,
+                    operand_tensor_formats=signature.operand_tensor_formats,
+                    members=safe_group,
+                )
+            )
+
+    return tuple(sorted(groups, key=_output_depth_group_sort_key))
+
+
+def _nearest_output_depths(program: Program) -> dict[int, int]:
+    depths: dict[int, int] = {}
+    pending: deque[tuple[int, int]] = deque([(program.output_ssa, 0)])
+
+    while pending:
+        ssa_id, depth = pending.popleft()
+        known_depth = depths.get(ssa_id)
+        if known_depth is not None and known_depth <= depth:
+            continue
+        depths[ssa_id] = depth
+
+        if ssa_id < program.n_inputs:
+            continue
+
+        instruction = program.instructions[ssa_id - program.n_inputs]
+        for argument in get_arguments(instruction):
+            pending.append((argument, depth + 1))
+
+    return depths
+
+
+def _instruction_result_dependencies(program: Program) -> dict[int, frozenset[int]]:
+    dependencies: dict[int, frozenset[int]] = {
+        input_id: frozenset() for input_id in range(program.n_inputs)
+    }
+
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        result_dependencies: set[int] = set()
+        for argument in get_arguments(instruction):
+            result_dependencies.update(dependencies[argument])
+            if argument >= program.n_inputs:
+                result_dependencies.add(argument)
+        dependencies[result_id] = frozenset(result_dependencies)
+
+    return dependencies
+
+
+def _canonicalize_output_depth_op(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    instruction = program.instructions[op_index]
+    operator = get_operator(instruction)
+    if operator == EINSUM_OPERATOR:
+        return _canonicalize_output_depth_einsum(program, op_index, depth)
+
+    arguments = get_arguments(instruction)
+    canonical_argument_order = _canonical_argument_order_for_operator(
+        operator,
+        arguments,
+        program,
+    )
+    return _make_output_depth_op_group_entry(
+        program,
+        op_index,
+        depth,
+        operator,
+        get_instruction_specific_arguments(instruction),
+        canonical_argument_order,
+    )
+
+
+def _make_output_depth_op_group_entry(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+    operator: Operator,
+    canonical_args: tuple[Any, ...],
+    canonical_argument_order: tuple[int, ...],
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    arguments = get_arguments(program.instructions[op_index])
+    ordered_arguments = tuple(arguments[index] for index in canonical_argument_order)
+    operand_shapes = tuple(program.shapes[argument] for argument in ordered_arguments)
+    operand_tensor_formats = tuple(
+        program.tensor_formats[argument] for argument in ordered_arguments
+    )
+
+    return (
+        _OutputDepthOpSignature(
+            depth=depth,
+            operator=operator,
+            canonical_instruction_specific_arguments=canonical_args,
+            operand_shapes=operand_shapes,
+            operand_tensor_formats=operand_tensor_formats,
+        ),
+        OutputDepthOpGroupMember(
+            op_index=op_index,
+            result_id=program.n_inputs + op_index,
+            arguments=arguments,
+            canonical_argument_order=canonical_argument_order,
+        ),
+    )
+
+
+def _canonical_argument_order_for_operator(
+    operator: Operator,
+    arguments: tuple[int, ...],
+    program: RichProgram,
+) -> tuple[int, ...]:
+    if operator not in _COMMUTATIVE_OPERATORS:
+        return tuple(range(len(arguments)))
+
+    return tuple(
+        sorted(
+            range(len(arguments)),
+            key=lambda index: (
+                program.shapes[arguments[index]],
+                program.tensor_formats[arguments[index]].sort_key,
+                index,
+            ),
+        )
+    )
+
+
+def _canonicalize_output_depth_einsum(
+    program: RichProgram,
+    op_index: int,
+    depth: int,
+) -> tuple[_OutputDepthOpSignature, OutputDepthOpGroupMember]:
+    instruction = program.instructions[op_index]
+    arguments = get_arguments(instruction)
+
+    input_strings, output_string = parse_format_string(
+        get_einsum_format_string(instruction)
+    )
+
+    if len(input_strings) != len(arguments):
+        raise ValueError("einsum input count must match argument count")
+
+    # Labels alone do not identify indistinguishable operands; include tensor
+    # format metadata so canonical permutations keep tensor slots aligned.
+    argument_sort_keys = tuple(
+        (program.tensor_formats[argument].sort_key,) for argument in arguments
+    )
+    canonical_format_string, canonical_argument_order = (
+        _canonicalize_einsum_string_from_output(
+            input_strings,
+            output_string,
+            argument_sort_keys,
+        )
+    )
+    return _make_output_depth_op_group_entry(
+        program,
+        op_index,
+        depth,
+        EINSUM_OPERATOR,
+        (canonical_format_string,),
+        canonical_argument_order,
+    )
+
+
+def _canonicalize_einsum_string_from_output(
+    input_strings: list[str],
+    output_string: str,
+    argument_sort_keys: tuple[tuple[Any, ...], ...],
+) -> tuple[str, tuple[int, ...]]:
+    if len(input_strings) != len(argument_sort_keys):
+        raise ValueError("argument sort keys must match einsum inputs")
+
+    label_allocator = _EinsumLabelAllocator()
+    normalized_output = label_allocator.normalize_subscript(output_string)
+
+    def argument_sort_key(argument_position: int) -> tuple[Any, ...]:
+        return (
+            label_allocator.copy().normalize_subscript(
+                input_strings[argument_position]
+            ),
+            argument_sort_keys[argument_position],
+            argument_position,
+        )
+
+    canonical_argument_order = tuple(
+        sorted(range(len(input_strings)), key=argument_sort_key)
+    )
+    normalized_inputs = tuple(
+        label_allocator.normalize_subscript(input_strings[index])
+        for index in canonical_argument_order
+    )
+    return (
+        f"{','.join(normalized_inputs)}->{normalized_output}",
+        canonical_argument_order,
+    )
+
+
+def _split_dependency_safe_op_groups(
+    members: list[OutputDepthOpGroupMember],
+    result_dependencies: dict[int, frozenset[int]],
+) -> list[tuple[OutputDepthOpGroupMember, ...]]:
+    groups: list[list[OutputDepthOpGroupMember]] = []
+    for member in sorted(members, key=lambda item: item.op_index):
+        for group in groups:
+            if all(
+                not _op_members_depend_on_each_other(
+                    member,
+                    existing_member,
+                    result_dependencies,
+                )
+                for existing_member in group
+            ):
+                group.append(member)
+                break
+        else:
+            groups.append([member])
+    return [tuple(group) for group in groups]
+
+
+def _op_members_depend_on_each_other(
+    first: OutputDepthOpGroupMember,
+    second: OutputDepthOpGroupMember,
+    result_dependencies: dict[int, frozenset[int]],
+) -> bool:
+    first_result_id = first.result_id
+    second_result_id = second.result_id
+    return (
+        second_result_id in result_dependencies[first_result_id]
+        or first_result_id in result_dependencies[second_result_id]
+    )
+
+
+def _output_depth_group_sort_key(group: OutputDepthOpGroup) -> tuple[Any, ...]:
+    return (
+        group.depth,
+        group.operator,
+        group.canonical_instruction_specific_arguments,
+        group.operand_shapes,
+        tuple(tensor_format.sort_key for tensor_format in group.operand_tensor_formats),
+        tuple(member.op_index for member in group.members),
+    )
 
 
 @dataclass(frozen=True)
@@ -69,17 +474,11 @@ def extract_connected_einsum_components(
         _sink_inputs, sink_output = parse_format_string(
             instruction.operator.format_string
         )
-        next_label = 0
-
-        def new_label() -> str:
-            nonlocal next_label
-            label = chr(0x100 + next_label)
-            next_label += 1
-            return label
+        label_allocator = _EinsumLabelAllocator()
 
         # Every queued einsum carries the component-wide labels that its output
         # must use. This propagates consistent labels from consumers to producers.
-        relabeled_output = "".join(new_label() for _ in sink_output)
+        relabeled_output = "".join(label_allocator.new_label() for _ in sink_output)
         component: set[int] = set()
         boundary_arguments: list[int] = []
         boundary_strings: list[str] = []
@@ -106,7 +505,7 @@ def extract_connected_einsum_components(
                 relabeled_input_labels: list[str] = []
                 for label in input_string:
                     if label not in label_map:
-                        label_map[label] = new_label()
+                        label_map[label] = label_allocator.new_label()
                     relabeled_input_labels.append(label_map[label])
                 relabeled_input = "".join(relabeled_input_labels)
 
@@ -182,7 +581,7 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 for first, second, step_format in to_annotated_ssa_path(
                     component.format_string,
                     path,
-                    is_ascii=True,
+                    prefer_ascii=True,
                 )
             )
             blocks[component.sink_op_index] = (
@@ -1412,7 +1811,7 @@ def _program_from_ssa_path(
 def to_annotated_ssa_path(
     format_string: str,
     ssa_path: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    is_ascii: bool = False,
+    prefer_ascii: bool = False,
 ) -> list[tuple[int, int, str]]:
     """Annotate an SSA path with the pairwise einsum string for each step."""
     inputs, output = format_string.replace(" ", "").split("->")
@@ -1443,927 +1842,12 @@ def to_annotated_ssa_path(
                 histogram[char] += 1
 
         pairwise_expression = f"{t1},{t2}->{t3}"
-        if is_ascii:
-            pairwise_expression = _to_ascii_einsum(pairwise_expression)
+        if prefer_ascii:
+            pairwise_expression = _EinsumLabelAllocator.remap_expression(
+                pairwise_expression
+            )
 
         annotated_ssa_path.append((first, second, pairwise_expression))
         inputs.append(t3)
 
     return annotated_ssa_path
-
-
-def _to_ascii_einsum(expression: str) -> str:
-    ascii_index = 0
-    char_mapping: dict[str, str] = {}
-    parts: list[str] = []
-    for char in expression:
-        if char in ",->":
-            parts.append(char)
-            continue
-        if char not in char_mapping:
-            if ascii_index == len(_LABELS):
-                raise RuntimeError(
-                    f"ERROR: {expression} cannot be converted to ASCII, "
-                    "it is too large."
-                )
-            char_mapping[char] = _LABELS[ascii_index]
-            ascii_index += 1
-        parts.append(char_mapping[char])
-    return "".join(parts)
-
-
-def _analyze_program(
-    program: Program,
-    input_shapes: list[Shape],
-    input_scale_states: list[ScaleState],
-    *,
-    fold_softmax_operations: bool,
-    reorder_inputs: bool,
-) -> tuple[list[Shape], dict[int, frozenset[int]], dict[int, int], list[_Candidate]]:
-    shapes = input_shapes.copy()
-    scale_states = list(input_scale_states)
-    depths = [-1] * len(input_shapes)
-    dependencies: dict[int, frozenset[int]] = {
-        tensor_id: frozenset() for tensor_id in range(len(input_shapes))
-    }
-    first_consumers: dict[int, int] = {}
-    candidates: list[_Candidate] = []
-
-    for op_index, instruction in enumerate(program.instructions):
-        arguments = get_arguments(instruction)
-        for argument in arguments:
-            if argument >= len(input_shapes):
-                first_consumers.setdefault(argument, op_index)
-
-        result_id = len(input_shapes) + op_index
-        depth = max((depths[argument] for argument in arguments), default=-1) + 1
-        dependency_set: set[int] = set()
-        for argument in arguments:
-            dependency_set.update(dependencies[argument])
-            if argument >= len(input_shapes):
-                dependency_set.add(argument)
-        dependencies[result_id] = frozenset(dependency_set)
-
-        argument_shapes = [shapes[argument] for argument in arguments]
-        argument_scale_states = [scale_states[argument] for argument in arguments]
-        output_shape = _infer_instruction_shape(instruction, argument_shapes)
-        shapes.append(output_shape)
-        output_scale_state = _infer_instruction_tensor_format(
-            instruction,
-            argument_scale_states,
-            output_shape,
-            argument_shapes,
-        )
-        scale_states.append(output_scale_state)
-        depths.append(depth)
-
-        canonical = _canonicalize_instruction(
-            instruction,
-            argument_shapes,
-            argument_scale_states,
-            output_shape,
-            fold_softmax_operations=fold_softmax_operations,
-            reorder_inputs=reorder_inputs,
-        )
-        if canonical is not None:
-            candidates.append(
-                _Candidate(
-                    op_index=op_index,
-                    result_id=result_id,
-                    depth=depth,
-                    instruction=instruction,
-                    arguments=tuple(arguments),
-                    dependencies=dependencies[result_id],
-                    canonical=canonical,
-                )
-            )
-
-    return shapes, dependencies, first_consumers, candidates
-
-
-def _schedule_ready_events(
-    program: Program,
-    input_count: int,
-    candidates: list[_Candidate],
-    min_group_size: int,
-    fold_same_depth_only: bool,
-) -> list[ScheduledEvent]:
-    candidate_by_index = {candidate.op_index: candidate for candidate in candidates}
-    softmax_future_keys = _softmax_future_keys(
-        program,
-        input_count,
-        candidate_by_index,
-    )
-    remaining = set(range(len(program.instructions)))
-    available = set(range(input_count))
-    events: list[ScheduledEvent] = []
-
-    while remaining:
-        ready = [
-            op_index
-            for op_index in sorted(remaining)
-            if all(
-                argument in available
-                for argument in get_arguments(program.instructions[op_index])
-            )
-        ]
-        if not ready:
-            raise ValueError(
-                "program contains instructions whose inputs are unavailable"
-            )
-
-        non_candidate = next(
-            (op_index for op_index in ready if op_index not in candidate_by_index),
-            None,
-        )
-        if non_candidate is not None:
-            events.append(non_candidate)
-            remaining.remove(non_candidate)
-            available.add(input_count + non_candidate)
-            continue
-
-        ready_group = _select_ready_group(
-            ready,
-            candidate_by_index,
-            min_group_size,
-            softmax_future_keys,
-            fold_same_depth_only,
-        )
-        if ready_group is not None:
-            events.append(ready_group)
-            for candidate in ready_group:
-                remaining.remove(candidate.op_index)
-                available.add(candidate.result_id)
-            continue
-
-        op_index = ready[0]
-        events.append(op_index)
-        remaining.remove(op_index)
-        available.add(input_count + op_index)
-
-    return events
-
-
-def _select_ready_group(
-    ready: list[int],
-    candidate_by_index: dict[int, _Candidate],
-    min_group_size: int,
-    softmax_future_keys: dict[int, int],
-    fold_same_depth_only: bool,
-) -> tuple[_Candidate, ...] | None:
-    grouped_candidates: dict[tuple[Any, ...], list[_Candidate]] = {}
-    for op_index in ready:
-        candidate = candidate_by_index.get(op_index)
-        if candidate is None:
-            continue
-        group_key = _candidate_group_key(
-            candidate,
-            softmax_future_keys,
-            fold_same_depth_only=fold_same_depth_only,
-        )
-        grouped_candidates.setdefault(group_key, []).append(candidate)
-
-    for group in grouped_candidates.values():
-        if len(group) >= min_group_size:
-            return tuple(group)
-    return None
-
-
-def _candidate_group_key(
-    candidate: _Candidate,
-    softmax_future_keys: dict[int, int],
-    *,
-    fold_same_depth_only: bool,
-) -> tuple[Any, ...]:
-    key: tuple[Any, ...]
-    if candidate.canonical.operator != SOFTMAX_OPERATOR:
-        key = candidate.canonical.signature
-    else:
-        key = (
-            *candidate.canonical.signature,
-            softmax_future_keys.get(candidate.result_id),
-        )
-    if fold_same_depth_only:
-        return (*key, ("depth", candidate.depth))
-    return key
-
-
-def _order_scheduled_groups(
-    events: list[ScheduledEvent],
-    program: Program,
-    input_count: int,
-) -> list[ScheduledEvent]:
-    consumers = _result_consumers(program, input_count)
-    event_index_by_op: dict[int, int] = {}
-
-    for event_index, event in enumerate(events):
-        if isinstance(event, int):
-            event_index_by_op[event] = event_index
-            continue
-        for candidate in event:
-            event_index_by_op[candidate.op_index] = event_index
-
-    ordered_groups: dict[int, tuple[_Candidate, ...]] = {}
-    for event_index in reversed(range(len(events))):
-        event = events[event_index]
-        if isinstance(event, int):
-            continue
-        ordered_groups[event_index] = tuple(
-            sorted(
-                event,
-                key=lambda candidate: _candidate_future_order_key(
-                    candidate,
-                    events,
-                    consumers,
-                    event_index_by_op,
-                    ordered_groups,
-                ),
-            )
-        )
-
-    return [
-        ordered_groups[event_index] if event_index in ordered_groups else event
-        for event_index, event in enumerate(events)
-    ]
-
-
-def _result_consumers(
-    program: Program, input_count: int
-) -> dict[int, list[tuple[int, int]]]:
-    consumers: dict[int, list[tuple[int, int]]] = {}
-    for op_index, instruction in enumerate(program.instructions):
-        arguments = get_arguments(instruction)
-        for argument_position, argument in enumerate(arguments):
-            if argument >= input_count:
-                consumers.setdefault(argument, []).append((op_index, argument_position))
-    return consumers
-
-
-def _softmax_future_keys(
-    program: Program,
-    input_count: int,
-    candidate_by_index: dict[int, _Candidate],
-) -> dict[int, int]:
-    consumers = _result_consumers(program, input_count)
-    interned_signatures: dict[tuple[Any, ...], int] = {}
-
-    def intern(signature: tuple[Any, ...]) -> int:
-        signature_id = interned_signatures.get(signature)
-        if signature_id is not None:
-            return signature_id
-        signature_id = len(interned_signatures)
-        interned_signatures[signature] = signature_id
-        return signature_id
-
-    def consumer_key(result_id: int) -> int:
-        uses = consumers.get(result_id, [])
-        if not uses:
-            return intern(("output",))
-        return intern(
-            tuple(
-                sorted(
-                    _consumer_key(
-                        program,
-                        candidate_by_index,
-                        consumer_op_index,
-                        argument_position,
-                    )
-                    for consumer_op_index, argument_position in uses
-                )
-            )
-        )
-
-    return {
-        candidate.result_id: consumer_key(candidate.result_id)
-        for candidate in candidate_by_index.values()
-        if candidate.canonical.operator == SOFTMAX_OPERATOR
-    }
-
-
-def _consumer_key(
-    program: Program,
-    candidate_by_index: dict[int, _Candidate],
-    consumer_op_index: int,
-    argument_position: int,
-) -> tuple[Any, ...]:
-    consumer_candidate = candidate_by_index.get(consumer_op_index)
-    if consumer_candidate is not None:
-        return (
-            "candidate",
-            consumer_candidate.canonical.signature,
-            _canonical_operand_position(consumer_candidate, argument_position),
-        )
-
-    return (
-        "instruction",
-        _instruction_future_signature(program.instructions[consumer_op_index]),
-    )
-
-
-def _instruction_future_signature(instruction: Instruction) -> tuple[Any, ...]:
-    operator = get_operator(instruction)
-    if is_einsum_instruction(instruction):
-        signature: tuple[Any, ...] = (
-            operator,
-            einsum_format(instruction),
-            len(get_arguments(instruction)),
-        )
-        if is_scaled_einsum_instruction(instruction):
-            return (*signature, scaled_einsum_output_axis(instruction))
-        return signature
-    if operator == SOFTMAX_OPERATOR:
-        return (operator, softmax_axis(instruction))
-    if operator == TAKE_OPERATOR:
-        return (operator, take_axis(instruction))
-    if operator == SELECT_OPERATOR:
-        return (operator, select_axis(instruction), select_index(instruction))
-    if operator == SLICE_OPERATOR:
-        return (
-            operator,
-            slice_axis(instruction),
-            slice_start(instruction),
-            slice_stop(instruction),
-        )
-    if operator == STACK_OPERATOR:
-        return (operator, len(get_arguments(instruction)))
-    return (operator, len(get_arguments(instruction)))
-
-
-def _candidate_future_order_key(
-    candidate: _Candidate,
-    events: list[ScheduledEvent],
-    consumers: dict[int, list[tuple[int, int]]],
-    event_index_by_op: dict[int, int],
-    ordered_groups: dict[int, tuple[_Candidate, ...]],
-) -> tuple[int, ...]:
-    order_keys: list[tuple[int, ...]] = []
-    for consumer_op_index, argument_position in consumers.get(candidate.result_id, []):
-        consumer_event_index = event_index_by_op[consumer_op_index]
-        consumer_event = events[consumer_event_index]
-        if isinstance(consumer_event, int):
-            order_keys.append(
-                (
-                    consumer_event_index,
-                    0,
-                    consumer_op_index,
-                    argument_position,
-                )
-            )
-            continue
-
-        ordered_group = ordered_groups.get(consumer_event_index, consumer_event)
-        consumer_position_by_op = {
-            consumer_candidate.op_index: position
-            for position, consumer_candidate in enumerate(ordered_group)
-        }
-        consumer_candidate = ordered_group[consumer_position_by_op[consumer_op_index]]
-        canonical_position = _canonical_operand_position(
-            consumer_candidate, argument_position
-        )
-        order_keys.append(
-            (
-                consumer_event_index,
-                0,
-                canonical_position,
-                consumer_position_by_op[consumer_op_index],
-                argument_position,
-            )
-        )
-
-    if not order_keys:
-        return (len(events), candidate.op_index)
-    return min(order_keys)
-
-
-def _canonical_operand_position(candidate: _Candidate, original_position: int) -> int:
-    for canonical_position, candidate_original_position in enumerate(
-        candidate.canonical.permutation
-    ):
-        if candidate_original_position == original_position:
-            return canonical_position
-    raise ValueError("candidate argument position is not part of its permutation")
-
-
-def _group_refs_by_canonical_operand(
-    group: tuple[_Candidate, ...],
-    tensor_map: dict[int, _TensorValueRef],
-) -> list[tuple[_TensorValueRef, ...]]:
-    operand_count = len(group[0].canonical.permutation)
-    grouped: list[list[_TensorValueRef]] = [[] for _ in range(operand_count)]
-    for candidate in group:
-        for canonical_position, original_position in enumerate(
-            candidate.canonical.permutation
-        ):
-            grouped[canonical_position].append(
-                tensor_map[candidate.arguments[original_position]]
-            )
-    return [tuple(arguments) for arguments in grouped]
-
-
-def _contiguous_range(indices: tuple[int, ...]) -> tuple[int, int] | None:
-    if not indices:
-        return None
-    start = indices[0]
-    for offset, index in enumerate(indices):
-        if index != start + offset:
-            return None
-    return start, start + len(indices)
-
-
-def _materialize_unoptimized_take_batch(
-    refs: tuple[_TensorValueRef, ...],
-    append_instruction: Callable[[_RawInstruction], _ResultArgument],
-    append_index_input: Callable[[np.ndarray], _IndexInputArgument],
-) -> _RawArgument | None:
-    first_ref = refs[0]
-    if isinstance(first_ref, _SliceRef) and all(
-        isinstance(ref, _SliceRef) and ref.source == first_ref.source for ref in refs
-    ):
-        index_argument = append_index_input(
-            np.asarray([ref.index for ref in refs], dtype=np.int64)
-        )
-        return append_instruction((TAKE_OPERATOR, (first_ref.source, index_argument)))
-
-    if (
-        isinstance(first_ref, _TakeRef)
-        and first_ref.axis == 0
-        and all(
-            isinstance(ref, _TakeRef)
-            and ref.source == first_ref.source
-            and ref.axis == first_ref.axis
-            for ref in refs
-        )
-    ):
-        index_argument = append_index_input(
-            np.asarray([ref.index for ref in refs], dtype=np.int64)
-        )
-        return append_instruction(
-            (TAKE_OPERATOR, (first_ref.source, index_argument), first_ref.axis)
-        )
-
-    if (
-        isinstance(first_ref, _SliceRangeRef)
-        and first_ref.axis == 0
-        and all(
-            isinstance(ref, _SliceRangeRef)
-            and ref.source == first_ref.source
-            and ref.axis == first_ref.axis
-            and ref.stop - ref.start == first_ref.stop - first_ref.start
-            for ref in refs
-        )
-    ):
-        length = first_ref.stop - first_ref.start
-        if length < 0:
-            return None
-        indices = np.asarray(
-            [np.arange(ref.start, ref.stop, dtype=np.int64) for ref in refs],
-            dtype=np.int64,
-        )
-        index_argument = append_index_input(indices)
-        return append_instruction(
-            (TAKE_OPERATOR, (first_ref.source, index_argument), first_ref.axis)
-        )
-
-    return None
-
-
-def _materialize_take_batch(
-    refs: tuple[_TensorValueRef, ...],
-    first_ref: _TakeRef,
-    source_shape: Shape,
-    raw_instructions: list[_RawInstruction],
-    append_instruction: Callable[[_RawInstruction], _ResultArgument],
-    append_index_input: Callable[[np.ndarray], _IndexInputArgument],
-) -> _RawArgument | None:
-    if first_ref.axis != 0:
-        return None
-
-    indices = tuple(ref.index for ref in refs if isinstance(ref, _TakeRef))
-    if len(indices) != len(refs):
-        return None
-
-    contiguous = _contiguous_range(indices)
-    if contiguous is not None:
-        start, stop = contiguous
-        if start == 0 and stop == source_shape[0]:
-            return first_ref.source
-        return append_instruction(
-            (SLICE_OPERATOR, (first_ref.source,), first_ref.axis, start, stop)
-        )
-
-    index_argument = append_index_input(np.asarray(indices, dtype=np.int64))
-    commuted = _commute_take_batch_through_softmax(
-        first_ref,
-        index_argument,
-        raw_instructions,
-        append_instruction,
-    )
-    if commuted is not None:
-        return commuted
-    return append_instruction(
-        (TAKE_OPERATOR, (first_ref.source, index_argument), first_ref.axis)
-    )
-
-
-def _commute_take_batch_through_softmax(
-    take_ref: _TakeRef,
-    index_argument: _IndexInputArgument,
-    raw_instructions: list[_RawInstruction],
-    append_instruction: Callable[[_RawInstruction], _ResultArgument],
-) -> _RawArgument | None:
-    if not isinstance(take_ref.source, _ResultArgument):
-        return None
-    source_instruction = raw_instructions[take_ref.source.instruction_index]
-    if get_operator(source_instruction) != SOFTMAX_OPERATOR:
-        return None
-    (softmax_source,) = get_arguments(source_instruction)
-    source_axis = softmax_axis(source_instruction)
-    if take_ref.axis == source_axis:
-        return None
-
-    index_rank = 1
-    target_axis = source_axis
-    if take_ref.axis < source_axis:
-        target_axis = source_axis - 1 + index_rank
-
-    taken = append_instruction(
-        (TAKE_OPERATOR, (softmax_source, index_argument), take_ref.axis)
-    )
-    return append_instruction((SOFTMAX_OPERATOR, (taken,), target_axis))
-
-
-def _is_last_result(
-    argument: _RawArgument, raw_instructions: list[_RawInstruction]
-) -> bool:
-    return (
-        isinstance(argument, _ResultArgument)
-        and argument.instruction_index == len(raw_instructions) - 1
-    )
-
-
-def _copy_to_last_result(
-    argument: _RawArgument,
-    append_instruction: Callable[[_RawInstruction], _ResultArgument],
-    append_index_input: Callable[[np.ndarray], _IndexInputArgument],
-) -> _RawArgument:
-    stack_result = append_instruction((STACK_OPERATOR, (argument,)))
-    return append_instruction((SELECT_OPERATOR, (stack_result,), 0, 0))
-
-
-def _resolve_raw_instructions(
-    raw_instructions: list[_RawInstruction],
-    input_count: int,
-    index_input_count: int,
-) -> list[Instruction]:
-    def resolve_argument(argument: _RawArgument) -> int:
-        if isinstance(argument, _InputArgument):
-            return argument.input_id
-        if isinstance(argument, _IndexInputArgument):
-            return input_count + argument.input_index
-        return input_count + index_input_count + argument.instruction_index
-
-    return [
-        map_instruction_arguments(instruction, resolve_argument)
-        for instruction in raw_instructions
-    ]
-
-
-def _batched_operator(inputs: tuple[str, ...], output: str) -> str:
-    used_labels = set(output + "".join(inputs))
-    batch_label = next((label for label in _LABELS if label not in used_labels), None)
-    if batch_label is None:
-        raise ValueError("could not allocate batch label for fused einsum")
-    batched_inputs = ",".join(f"{batch_label}{subscript}" for subscript in inputs)
-    return f"{batched_inputs}->{batch_label}{output}"
-
-
-def _make_batched_instruction(
-    canonical: CanonicalEinsum,
-    arguments: tuple[_RawArgument, ...],
-) -> _RawInstruction:
-    if canonical.operator == EINSUM_OPERATOR:
-        batched_format = _batched_operator(canonical.inputs, canonical.output)
-        return make_einsum_instruction(batched_format, *arguments)
-    if canonical.operator == LSE_SUM_EINSUM_OPERATOR:
-        batched_format = _batched_operator(canonical.inputs, canonical.output)
-        return make_logspace_einsum_instruction(
-            batched_format,
-            *arguments,
-        )
-    if canonical.operator in SCALED_EINSUM_OPERATORS:
-        if len(arguments) != 2:
-            raise ValueError("scaled batched einsum folding requires binary einsums")
-        if canonical.output_scale_axis is None:
-            raise ValueError("scaled batched einsum requires an output scale axis")
-        batched_format = _batched_operator(canonical.inputs, canonical.output)
-        return make_scaled_einsum_instruction(
-            canonical.operator,
-            batched_format,
-            arguments[0],
-            arguments[1],
-            canonical.output_scale_axis + 1,
-        )
-    if canonical.operator == SOFTMAX_OPERATOR:
-        if len(arguments) != 1:
-            raise ValueError("batched softmax folding requires one operand")
-        if canonical.output_scale_axis is None:
-            raise ValueError("batched softmax requires an axis")
-        return (SOFTMAX_OPERATOR, (arguments[0],), canonical.output_scale_axis + 1)
-    raise ValueError(f"unsupported batched operator: {canonical.operator!r}")
-
-
-def _canonicalize_instruction(
-    instruction: Instruction,
-    operand_shapes: list[Shape],
-    operand_scale_states: list[ScaleState],
-    output_shape: Shape,
-    *,
-    fold_softmax_operations: bool,
-    reorder_inputs: bool,
-) -> CanonicalEinsum | None:
-    canonical = _canonicalize_instruction_einsum(
-        instruction,
-        operand_shapes,
-        operand_scale_states,
-        output_shape,
-        reorder_inputs=reorder_inputs,
-    )
-    if canonical is not None:
-        return canonical
-    if not fold_softmax_operations:
-        return None
-    return _canonicalize_instruction_softmax(
-        instruction,
-        operand_shapes,
-        operand_scale_states,
-        output_shape,
-    )
-
-
-def _canonicalize_instruction_einsum(
-    instruction: Instruction,
-    operand_shapes: list[Shape],
-    operand_scale_states: list[ScaleState],
-    output_shape: Shape,
-    *,
-    reorder_inputs: bool,
-) -> CanonicalEinsum | None:
-    if not is_einsum_instruction(instruction):
-        return None
-    operator = get_operator(instruction)
-    parsed = _parse_einsum(einsum_format(instruction))
-    if parsed is None or len(parsed.inputs) != len(operand_shapes):
-        return None
-    if is_scaled_einsum_instruction(instruction) and not parsed.output:
-        return None
-
-    if (
-        is_normal_einsum_instruction(instruction)
-        or is_logspace_einsum_instruction(instruction)
-    ) and any(scale_state is not None for scale_state in operand_scale_states):
-        return None
-
-    output_scale_axis = (
-        normalize_axis(scaled_einsum_output_axis(instruction), len(parsed.output))
-        if is_scaled_einsum_instruction(instruction)
-        else None
-    )
-    best: CanonicalEinsum | None = None
-    if not reorder_inputs:
-        candidate_permutations = (tuple(range(len(parsed.inputs))),)
-    elif is_logspace_einsum_instruction(instruction):
-        candidate_permutations = (
-            (0, *permutation)
-            for permutation in permutations(range(1, len(parsed.inputs)))
-        )
-    else:
-        candidate_permutations = permutations(range(len(parsed.inputs)))
-
-    for permutation in candidate_permutations:
-        permuted_inputs = tuple(parsed.inputs[index] for index in permutation)
-        permuted_shapes = tuple(operand_shapes[index] for index in permutation)
-        permuted_scale_states = tuple(
-            operand_scale_states[index] for index in permutation
-        )
-        normalized = _normalize_labels(permuted_inputs, parsed.output)
-        if normalized is None:
-            return None
-        normalized_inputs, normalized_output = normalized
-        signature = (
-            operator,
-            normalized_inputs,
-            normalized_output,
-            permuted_shapes,
-            tuple(
-                _scale_axis_key(scale_state) for scale_state in permuted_scale_states
-            ),
-            output_shape,
-            _scale_axis_key(output_scale_axis),
-        )
-        canonical = CanonicalEinsum(
-            signature=signature,
-            operator=operator,
-            inputs=normalized_inputs,
-            output=normalized_output,
-            permutation=tuple(permutation),
-            operand_shapes=permuted_shapes,
-            operand_scale_states=permuted_scale_states,
-            output_shape=output_shape,
-            output_scale_axis=output_scale_axis,
-        )
-        if best is None or canonical.signature < best.signature:
-            best = canonical
-
-    return best
-
-
-def _canonicalize_instruction_softmax(
-    instruction: Instruction,
-    operand_shapes: list[Shape],
-    operand_scale_states: list[ScaleState],
-    output_shape: Shape,
-) -> CanonicalEinsum | None:
-    if get_operator(instruction) != SOFTMAX_OPERATOR:
-        return None
-    if len(operand_shapes) != 1 or len(operand_scale_states) != 1:
-        return None
-    if operand_scale_states[0] is not None:
-        return None
-    if not operand_shapes[0] or output_shape != operand_shapes[0]:
-        return None
-
-    axis = get_softmax_axis(instruction)
-    return CanonicalEinsum(
-        signature=(
-            SOFTMAX_OPERATOR,
-            operand_shapes[0],
-            output_shape,
-            axis,
-        ),
-        operator=SOFTMAX_OPERATOR,
-        inputs=(),
-        output="",
-        permutation=(0,),
-        operand_shapes=operand_shapes,
-        operand_scale_states=operand_scale_states,
-        output_shape=output_shape,
-        output_scale_axis=axis,
-    )
-
-
-def _scale_axis_key(scale_state: ScaleState | int) -> ScaleAxisKey:
-    if scale_state is None:
-        return (0, -1)
-    if isinstance(scale_state, _ScaleState):
-        return (1, scale_state.axis)
-    return (1, scale_state)
-
-
-def _normalize_labels(
-    inputs: tuple[str, ...], output: str
-) -> tuple[tuple[str, ...], str] | None:
-    label_map: dict[str, str] = {}
-
-    def normalize_subscript(subscript: str) -> str | None:
-        normalized_labels: list[str] = []
-        for label in subscript:
-            if label not in label_map:
-                if len(label_map) >= len(_LABELS):
-                    return None
-                label_map[label] = _LABELS[len(label_map)]
-            normalized_labels.append(label_map[label])
-        return "".join(normalized_labels)
-
-    normalized_inputs = []
-    for subscript in inputs:
-        normalized = normalize_subscript(subscript)
-        if normalized is None:
-            return None
-        normalized_inputs.append(normalized)
-    normalized_output = normalize_subscript(output)
-    if normalized_output is None:
-        return None
-    return tuple(normalized_inputs), normalized_output
-
-
-def _infer_instruction_shape(
-    instruction: Instruction,
-    operand_shapes: list[Shape],
-) -> Shape:
-    operator = get_operator(instruction)
-    match operator:
-        case "einsum":
-            format_string = get_einsum_format_string(instruction)
-            return infer_einsum_shape(format_string, operand_shapes)
-        case "stack":
-            axis = get_stack_axis(instruction)
-            return infer_stack_shape(operand_shapes, axis)
-        case "take":
-            axis = get_take_axis(instruction)
-            return infer_take_shape(operand_shapes[0], operand_shapes[1], axis)
-        case "softmax":
-            return infer_softmax_shape(operand_shapes[0])
-        case "select":
-            axis = get_select_axis(instruction)
-            return infer_select_shape(operand_shapes[0], axis)
-        case "slice":
-            start = get_slice_start(instruction)
-            stop = get_slice_stop(instruction)
-            axis = get_slice_axis(instruction)
-            return infer_slice_shape(operand_shapes[0], start, stop, axis)
-        case operator if operator in UNARY_OPERATORS:
-            return infer_unary_shape(operand_shapes[0])
-        case operator if operator in BINARY_OPERATORS:
-            return infer_binary_shape(*operand_shapes)
-        case _:
-            raise ValueError(f"unsupported operator for shape inference: {operator!r}")
-
-
-def _infer_instruction_tensor_format(
-    instruction: Instruction,
-    operand_tensor_formats: list[ScaleState],
-    output_shape: Shape,
-    operand_shapes: list[Shape],
-) -> ScaleState:
-    operator = get_operator(instruction)
-    if is_normal_einsum_instruction(instruction):
-        if any(scale_state is not None for scale_state in operand_tensor_formats):
-            raise ValueError("normal einsum does not accept scaled inputs")
-        return None
-    if is_logspace_einsum_instruction(instruction):
-        if any(scale_state is not None for scale_state in operand_tensor_formats):
-            raise ValueError("logspace einsum does not accept scaled inputs")
-        return None
-    if is_scaled_einsum_instruction(instruction):
-        return _ScaleState(
-            normalize_axis(scaled_einsum_output_axis(instruction), len(output_shape))
-        )
-    if operator == "log":
-        return None
-    if operator in UNARY_OPERATORS:
-        if any(scale_state is not None for scale_state in operand_tensor_formats):
-            raise ValueError(f"unary operator {operator!r} does not support scaling")
-        return None
-    if operator == SOFTMAX_OPERATOR:
-        if any(scale_state is not None for scale_state in operand_tensor_formats):
-            raise ValueError("softmax does not support scaled tensors")
-        return None
-    if operator in BINARY_OPERATORS:
-        scaled = [
-            scale_state
-            for scale_state in operand_tensor_formats
-            if scale_state is not None
-        ]
-        if not scaled:
-            return None
-        if operator != "*":
-            raise ValueError(f"binary operator {operator!r} does not support scaling")
-        first_axis = scaled[0].axis
-        if any(scale_state.axis != first_axis for scale_state in scaled):
-            raise ValueError("scaled multiplication requires matching scale axes")
-        return _ScaleState(first_axis)
-    if operator == STACK_OPERATOR:
-        scaled = [
-            scale_state
-            for scale_state in operand_tensor_formats
-            if scale_state is not None
-        ]
-        if not scaled:
-            return None
-        if len(scaled) != len(operand_tensor_formats):
-            raise ValueError("cannot stack mixed scaled and unscaled tensors")
-        first_axis = scaled[0].axis
-        if any(scale_state.axis != first_axis for scale_state in scaled):
-            raise ValueError("cannot stack scaled tensors with different scale axes")
-        return _ScaleState(first_axis + 1)
-    if operator == TAKE_OPERATOR:
-        source_scale_state = operand_tensor_formats[0]
-        if source_scale_state is None:
-            return None
-        axis = normalize_axis(take_axis(instruction), len(operand_shapes[0]))
-        if source_scale_state.axis == axis:
-            raise ValueError("cannot take away the scale axis")
-        index_rank = len(operand_shapes[1])
-        if source_scale_state.axis < axis:
-            return source_scale_state
-        return _ScaleState(source_scale_state.axis - 1 + index_rank)
-    if operator == SELECT_OPERATOR:
-        source_scale_state = operand_tensor_formats[0]
-        if source_scale_state is None:
-            return None
-        axis = normalize_axis(select_axis(instruction), len(operand_shapes[0]))
-        if source_scale_state.axis == axis:
-            raise ValueError("cannot select away the scale axis")
-        if source_scale_state.axis < axis:
-            return source_scale_state
-        return _ScaleState(source_scale_state.axis - 1)
-    if operator == SLICE_OPERATOR:
-        return operand_tensor_formats[0]
-    return None
-
-
-def _map_instruction_arguments(
-    instruction: RichInstruction, shift_argument: Callable[[int], int]
-) -> RichInstruction:
-    operator, argument_ssa_ids = instruction
-    return operator, tuple(shift_argument(argument) for argument in argument_ssa_ids)
