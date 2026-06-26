@@ -18,7 +18,6 @@ from cirkit.templates import data_modalities, utils
 
 import extended_einsum.interface as xe
 from extended_einsum.language import Program, get_operator
-from extended_einsum.preprocess import RichProgram, fold_independent_einsums
 
 WIDTH = 4
 HEIGHT = 4
@@ -108,7 +107,7 @@ def translate_cirkit_to_xe(
     *,
     batch_size: int,
     stability: str,
-) -> tuple[RichProgram, list[object]]:
+) -> tuple[Program, list[object]]:
     input_layer = next(
         layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer)
     )
@@ -135,13 +134,8 @@ def preprocess_xe_program(
     inputs: Sequence[object],
     *,
     optimize_stacking: bool,
-):
-    return fold_independent_einsums(
-        program,
-        inputs,
-        fold_same_depth_only=True,
-        optimize_stacking=optimize_stacking,
-    )
+) -> Program:
+    return program
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -202,12 +196,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-preprocess",
         action="store_true",
-        help="Only emit the direct XE program; skip merge/replan and folding passes.",
+        help="Skip the preprocessing compatibility hook.",
     )
     parser.add_argument(
         "--no-optimize-stacking",
         action="store_true",
-        help="Disable optimized stacking when preprocessing is enabled.",
+        help="Retained for compatibility; has no effect.",
     )
     parser.add_argument(
         "--dump-instructions",
