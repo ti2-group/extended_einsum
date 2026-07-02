@@ -1,14 +1,20 @@
 from collections.abc import Sequence
-from typing import Callable, Protocol, TypeVar
+from dataclasses import dataclass
+from typing import Callable, Generic, Protocol, TypeVar
 
 import jax
 import numpy as np
 import torch
 
-from extended_einsum.language.core import RawProgram
 from extended_einsum.language.types import Backend, HasShape
 
-TBackendArray = TypeVar("TBackendArray", bound=HasShape)
+
+class BackendArray(Protocol):
+    @property
+    def shape(self) -> tuple[int, ...] | torch.Size: ...
+
+
+TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
 
 class BackendFunctions(Protocol[TBackendArray]):
@@ -19,10 +25,10 @@ class BackendFunctions(Protocol[TBackendArray]):
     def log(array: TBackendArray) -> TBackendArray: ...
 
     @staticmethod
-    def sum(array: TBackendArray, axis: int) -> TBackendArray: ...
+    def sum(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
 
     @staticmethod
-    def max(array: TBackendArray, axis: int) -> TBackendArray: ...
+    def max(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
 
     @staticmethod
     def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
@@ -55,12 +61,18 @@ class BackendFunctions(Protocol[TBackendArray]):
     def divide(dividend_array: TBackendArray, divisor_array: TBackendArray) -> TBackendArray: ...
 
 
+@dataclass(frozen=True)
+class BackendProgram(Generic[TBackendArray]):
+    backend_calls: list[Callable[[Sequence[TBackendArray]], TBackendArray]]
+    call_arguments: list[tuple[int, ...]]
+    n_inputs: int
+
+
 class BackendCompiler(Protocol[TBackendArray]):
     @staticmethod
     def compile(
-        program: RawProgram,
-        arguments: Sequence[TBackendArray],
-        backend_functions_per_instruction: list[BackendFunctions[TBackendArray]],
+        program: BackendProgram[TBackendArray],
+        inputs: Sequence[TBackendArray],
     ) -> Callable[[Sequence[TBackendArray]], TBackendArray]: ...
 
 

@@ -4,7 +4,7 @@ Shape = tuple[int, ...]
 
 TensorFormat = Literal["dense", "sparse"]
 
-StabilityMode = Literal["none", "scaled", "logspace"]
+StabilityMode = Literal["unstable", "scaled", "logspace"]
 
 Backend = Literal["torch", "numpy", "jax"]
 
