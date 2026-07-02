@@ -39,6 +39,7 @@ def _to_backend_call(backend_function: Callable[..., TBackendArray]) -> Callable
 
 def _operator_to_backend_call(operator: RichOperator, backend_functions: BackendFunctions[TBackendArray]) -> Callable[[Sequence[TBackendArray]], TBackendArray]:
     """Binds an operator to its backend function, resulting in a call that takes only the tensor arguments."""
+
     match operator:
         case OperatorExp():
             backend_function = backend_functions.exp
@@ -240,5 +241,120 @@ def _append_scaled_instruction(builder: _ProgramBuilder, backend_functions: Back
             raise NotImplementedError(f"The operator {instruction.operator.name} has no scaled backend translation.")
 
 
+# in the logspace translation, an SSA value is available in some of two parts:
+# "raw" is the value itself and "logspace" is its natural logarithm, with raw = exp(logspace)
+_LogspacePart = Literal["raw", "logspace"]
+_LogspacePositions = dict[tuple[int, _LogspacePart], int]
+
+
 def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFunctions) -> BackendProgram:
-    raise NotImplementedError("The logspace translation is not implemented yet.")
+    """Translates a rich program into a backend program whose intermediate values are the natural logarithms of the actual values.
+
+    Conversion is lazy: a value stays a raw tensor until an operator consumes it in logspace, then it is converted with log,
+    which assumes non-negative values. The exp and log operators only move values between the raw and logspace parts, so a
+    chain like log(einsum(exp(a), exp(b))) never materializes the raw exponentials.
+    """
+    builder = _ProgramBuilder(rich_program.n_inputs)
+    positions: _LogspacePositions = {(ssa_id, "raw"): ssa_id for ssa_id in range(rich_program.n_inputs)}
+    for instruction_index, instruction in enumerate(rich_program.instructions):
+        _append_logspace_instruction(builder, backend_functions, positions, instruction, rich_program.n_inputs + instruction_index)
+    output_position = _as_raw_position(builder, backend_functions, positions, rich_program.output_ssa)
+    if output_position != builder.last_position:
+        raise ValueError("The raw value of the program's output must be the last computed tensor, because the runtime returns the last tensor.")
+    return builder.build()
+
+
+def _as_raw_position(builder: _ProgramBuilder, backend_functions: BackendFunctions, positions: _LogspacePositions, ssa_id: int) -> int:
+    """Position of the value as a raw tensor, converting it from its logspace part at most once."""
+    if (ssa_id, "raw") not in positions:
+        positions[ssa_id, "raw"] = builder.wrap_and_append(backend_functions.exp, (positions[ssa_id, "logspace"],))
+    return positions[ssa_id, "raw"]
+
+
+def _as_logspace_position(builder: _ProgramBuilder, backend_functions: BackendFunctions, positions: _LogspacePositions, ssa_id: int) -> int:
+    """Position of the value's natural logarithm, converting it from its raw tensor at most once, which assumes non-negative values."""
+    if (ssa_id, "logspace") not in positions:
+        positions[ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.log, (positions[ssa_id, "raw"],))
+    return positions[ssa_id, "logspace"]
+
+
+def _append_max_shifted(builder: _ProgramBuilder, backend_functions: BackendFunctions, logspace_positions: list[int]) -> tuple[list[int], int]:
+    """Shifts logspace values by the scalar maximum over all of them, returning the positions of the shifted logspace values and of the shift."""
+
+    max_positions = tuple(builder.wrap_and_append(backend_functions.max, (logspace_position,)) for logspace_position in logspace_positions)
+    # TODO: maybe don't stack and aggregate but just aggregate here? we may need to add another backend function for this
+    stacked_maxima_position = builder.append(partial(backend_functions.stack, axis=0), max_positions)
+    shift_position = builder.wrap_and_append(backend_functions.max, (stacked_maxima_position,))
+    shifted_logspace_positions: list[int] = []
+    for logspace_position in logspace_positions:
+        shifted_logspace_positions.append(builder.wrap_and_append(backend_functions.subtract, (logspace_position, shift_position)))
+    return shifted_logspace_positions, shift_position
+
+
+def _append_logspace_einsum(
+    builder: _ProgramBuilder, backend_functions: BackendFunctions, positions: _LogspacePositions, format_string: str, argument_ssa_ids: tuple[int, ...], result_ssa_id: int
+) -> None:
+    """Einsum on the exponentials of the operands, each shifted by its scalar maximum to prevent overflow; the shifts add back onto the logarithm of the result."""
+    logspace_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+    shift_positions = [builder.wrap_and_append(backend_functions.max, (logspace_position,)) for logspace_position in logspace_positions]
+    shifted_value_positions: list[int] = []
+    for logspace_position, shift_position in zip(logspace_positions, shift_positions):
+        shifted_logspace_position = builder.wrap_and_append(backend_functions.subtract, (logspace_position, shift_position))
+        shifted_value_positions.append(builder.wrap_and_append(backend_functions.exp, (shifted_logspace_position,)))
+    value_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(shifted_value_positions))
+    result_position = builder.wrap_and_append(backend_functions.log, (value_position,))
+    for shift_position in shift_positions:
+        result_position = builder.wrap_and_append(backend_functions.add, (result_position, shift_position))
+    positions[result_ssa_id, "logspace"] = result_position
+
+
+def _append_logspace_instruction(builder: _ProgramBuilder, backend_functions: BackendFunctions, positions: _LogspacePositions, instruction: RichInstruction, result_ssa_id: int) -> None:
+    argument_ssa_ids = instruction.argument_ssa_ids
+    match instruction.operator:
+        case OperatorExp():
+            # log(exp(a)) = a: the raw argument already is the logarithm of the result, so no computation is needed
+            positions[result_ssa_id, "logspace"] = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[0])
+        case OperatorLog():
+            # log(a) is the logspace part of a, so the result is available as a raw tensor without computation
+            positions[result_ssa_id, "raw"] = _as_logspace_position(builder, backend_functions, positions, argument_ssa_ids[0])
+        case OperatorSoftmax(_):
+            # softmax is shifted by its maximum internally and takes arguments of arbitrary sign, so raw in and raw out is safe
+            raw_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[0])
+            positions[result_ssa_id, "raw"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (raw_position,))
+        case OperatorAdd() | OperatorSubtract():
+            # TODO: maybe use minimum instead of maximum here to completely prevent underflow?
+            # log(e^a ± e^b) = log(e^(a - m) ± e^(b - m)) + m with the scalar m = max(a, b), so only values far below the maximum underflow
+            # (a subtraction whose result is negative cannot be represented in logspace and produces NaN)
+            aggregate = backend_functions.add if isinstance(instruction.operator, OperatorAdd) else backend_functions.subtract
+            log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+            # add -m
+            log_shifted_positions, shift_position = _append_max_shifted(builder, backend_functions, log_argument_positions)
+            # exponentiate
+            raw_shifted_positions = [builder.wrap_and_append(backend_functions.exp, (shifted_logspace_position,)) for shifted_logspace_position in log_shifted_positions]
+            # ±
+            raw_aggregated_position = builder.wrap_and_append(aggregate, tuple(raw_shifted_positions))
+            # log
+            log_aggregated_position = builder.wrap_and_append(backend_functions.log, (raw_aggregated_position,))
+            # add m
+            positions[result_ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.add, (log_aggregated_position, shift_position))
+        case OperatorMultiply():
+            # log(a * b) = log(a) + log(b)
+            logspace_1, logspace_2 = (_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids)
+            positions[result_ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.add, (logspace_1, logspace_2))
+        case OperatorDivide():
+            # log(a / b) = log(a) - log(b)
+            logspace_1, logspace_2 = (_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids)
+            positions[result_ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.subtract, (logspace_1, logspace_2))
+        case OperatorStack(_) | OperatorSelect(_, _) | OperatorSlice(_, _, _):
+            # stacking and indexing commute with the elementwise logarithm
+            log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+            positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), tuple(log_argument_positions))
+        case OperatorTake(_):
+            # indexing commutes with the elementwise logarithm; the indices are integer positions and always used raw
+            logspace_position = _as_logspace_position(builder, backend_functions, positions, argument_ssa_ids[0])
+            indices_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
+            positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (logspace_position, indices_position))
+        case OperatorEinsum(format_string):
+            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id)
+        case _:
+            raise NotImplementedError(f"The operator {instruction.operator.name} has no logspace backend translation.")

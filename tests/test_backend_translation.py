@@ -102,7 +102,7 @@ def test_unstable_translation_produces_one_call_per_instruction() -> None:
     assert backend_program.call_arguments == [(0, 1), (2, 0)]
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled"])
+@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
 def test_translation_rejects_operator_without_backend_function(stability_mode: StabilityMode) -> None:
     rich_program = _single_instruction_program(OperatorSin(), 1, stability_mode)
 
@@ -191,11 +191,46 @@ def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials() -
     np.testing.assert_allclose(result, huge_matrix, rtol=1e-9)
 
 
-def test_logspace_translation_is_not_implemented_yet() -> None:
-    rich_program = _single_instruction_program(OperatorExp(), 1, "logspace")
+################################
+# translation of single instructions (logspace)
+################################
 
-    with pytest.raises(NotImplementedError, match="logspace"):
-        translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+
+def test_logspace_translation_of_exp_and_log_is_free() -> None:
+    # exp and log only move values between the raw and logspace parts, so the roundtrip compiles to no backend calls at all
+    huge_matrix = 800.0 + MATRIX
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 1
+            RichInstruction(OperatorLog(), (1,)),  # ssa id 2
+        ],
+        n_inputs=1,
+        stability_mode="logspace",
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [huge_matrix])
+
+    assert len(backend_program.backend_calls) == 0
+    np.testing.assert_array_equal(result, huge_matrix)
+
+
+def test_logspace_translation_converts_each_value_at_most_once() -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorMultiply(), (0, 1)),  # ssa id 2
+            RichInstruction(OperatorMultiply(), (2, 0)),  # ssa id 3, consumes input 0 in logspace a second time
+        ],
+        n_inputs=2,
+        stability_mode="logspace",
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
+
+    # converting the two inputs to logspace, two logspace multiplications, and the raw conversion of the output
+    assert len(backend_program.backend_calls) == 5
+    np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
 
 
 ################################
@@ -203,7 +238,7 @@ def test_logspace_translation_is_not_implemented_yet() -> None:
 ################################
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled"])
+@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
 def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) -> None:
     left_matrix = np.abs(_RNG.standard_normal((3, 4))) + 0.5
     right_matrix = np.abs(_RNG.standard_normal((4, 5))) + 0.5
@@ -228,7 +263,7 @@ def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) 
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled"])
+@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
 def test_translate_to_backend_program_with_mixed_representations(stability_mode: StabilityMode) -> None:
     # in scaled mode this program mixes representations: the einsum introduces a scale, the multiplication
     # and addition combine it with raw inputs, and the logarithm eliminates it again
@@ -272,8 +307,9 @@ RAW_CHAIN_FACTORS = [0.5 + _RNG.random((3, 3)) for _ in range(N_HUGE_FACTORS)]
 HUGE_CHAIN_FACTORS = [1.0e70 * raw_factor for raw_factor in RAW_CHAIN_FACTORS]
 
 
-def test_scaled_mode_survives_huge_intermediate_values() -> None:
-    rich_program = _huge_chain_program("scaled", N_HUGE_FACTORS)
+@pytest.mark.parametrize("stability_mode", ["scaled", "logspace"])
+def test_stable_modes_survive_huge_intermediate_values(stability_mode: StabilityMode) -> None:
+    rich_program = _huge_chain_program(stability_mode, N_HUGE_FACTORS)
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
     result = run_program(backend_program, HUGE_CHAIN_FACTORS)
@@ -292,7 +328,7 @@ def test_scaled_mode_survives_huge_intermediate_values() -> None:
 ################################
 
 # every stability mode must compute the same result as the unstable baseline, up to numeric error
-COMPARED_STABILITY_MODES: list[StabilityMode] = ["scaled"]  # logspace joins once its translation is implemented
+COMPARED_STABILITY_MODES: list[StabilityMode] = ["scaled", "logspace"]
 
 POSITIVE_BIAS_MATRIX = np.abs(_RNG.standard_normal((3, 5))) + 0.5
 POSITIVE_VALUE_MATRIX = np.abs(_RNG.standard_normal((5, 2))) + 0.5
@@ -359,6 +395,9 @@ AGREEMENT_CASE_IDS = [case_name for case_name, _, _ in AGREEMENT_CASES]
 @pytest.mark.parametrize("stability_mode", COMPARED_STABILITY_MODES)
 @pytest.mark.parametrize(("case_name", "instructions", "tensor_arguments"), AGREEMENT_CASES, ids=AGREEMENT_CASE_IDS)
 def test_stability_modes_compute_same_result(case_name: str, instructions: list[RichInstruction], tensor_arguments: list[npt.NDArray], stability_mode: StabilityMode) -> None:
+    if stability_mode == "logspace" and case_name == "subtract-with-mixed-sign-result":
+        pytest.skip("logspace cannot represent the negative values in the subtraction result")
+
     def run_in_mode(mode: StabilityMode) -> npt.NDArray:
         rich_program = _dense_program(instructions, n_inputs=len(tensor_arguments), stability_mode=mode)
         backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
