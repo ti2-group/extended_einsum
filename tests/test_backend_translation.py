@@ -287,6 +287,90 @@ def test_scaled_mode_survives_huge_intermediate_values() -> None:
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
+################################
+# agreement between stability modes
+################################
+
+# every stability mode must compute the same result as the unstable baseline, up to numeric error
+COMPARED_STABILITY_MODES: list[StabilityMode] = ["scaled"]  # logspace joins once its translation is implemented
+
+POSITIVE_BIAS_MATRIX = np.abs(_RNG.standard_normal((3, 5))) + 0.5
+POSITIVE_VALUE_MATRIX = np.abs(_RNG.standard_normal((5, 2))) + 0.5
+POSITIVE_SQUARE_MATRICES = [np.abs(_RNG.standard_normal((3, 3))) + 0.5 for _ in range(3)]
+
+# single-operator programs covering every translated operator, plus composite programs that mix representations.
+# inputs that the scaled translation consumes as scaled pairs are positive, because it normalizes them by their total sum
+AGREEMENT_CASES: list[tuple[str, list[RichInstruction], list[npt.NDArray]]] = [
+    ("exp", [RichInstruction(OperatorExp(), (0,))], [MATRIX]),
+    ("log", [RichInstruction(OperatorLog(), (0,))], [POSITIVE_MATRIX]),
+    ("add", [RichInstruction(OperatorAdd(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
+    ("subtract-with-mixed-sign-result", [RichInstruction(OperatorSubtract(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
+    ("multiply", [RichInstruction(OperatorMultiply(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
+    ("divide", [RichInstruction(OperatorDivide(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
+    ("stack-with-mismatched-scales", [RichInstruction(OperatorStack(axis=0), (0, 1, 2))], [POSITIVE_MATRIX, 1.0e6 * OTHER_POSITIVE_MATRIX, 1.0e-6 * POSITIVE_MATRIX]),
+    ("take", [RichInstruction(OperatorTake(axis=1), (0, 1))], [POSITIVE_MATRIX, INDICES]),
+    ("select", [RichInstruction(OperatorSelect(axis=0, index=1), (0,))], [POSITIVE_MATRIX]),
+    ("slice", [RichInstruction(OperatorSlice(start=1, stop=3, axis=1), (0,))], [POSITIVE_MATRIX]),
+    ("softmax", [RichInstruction(OperatorSoftmax(axis=1), (0,))], [MATRIX]),
+    ("einsum-matmul", [RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1))], [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX]),
+    ("einsum-total-sum", [RichInstruction(OperatorEinsum("ik ->"), (0,))], [POSITIVE_MATRIX]),
+    (
+        "attention-block",
+        [
+            RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1)),  # ssa id 4
+            RichInstruction(OperatorAdd(), (4, 2)),  # ssa id 5
+            RichInstruction(OperatorSoftmax(axis=1), (5,)),  # ssa id 6
+            RichInstruction(OperatorEinsum("ij, jk -> ik"), (6, 3)),  # ssa id 7
+        ],
+        [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX, POSITIVE_BIAS_MATRIX, POSITIVE_VALUE_MATRIX],
+    ),
+    (
+        "logsumexp",
+        [
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 1
+            RichInstruction(OperatorEinsum("ij ->"), (1,)),  # ssa id 2
+            RichInstruction(OperatorLog(), (2,)),  # ssa id 3
+        ],
+        [MATRIX],
+    ),
+    (
+        "reused-input",
+        [
+            RichInstruction(OperatorMultiply(), (0, 1)),  # ssa id 2
+            RichInstruction(OperatorAdd(), (2, 0)),  # ssa id 3, consumes input 0 a second time
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
+    (
+        "normalized-chain-product",
+        [
+            RichInstruction(OperatorEinsum("ij, jk -> ik"), (0, 1)),  # ssa id 3
+            RichInstruction(OperatorEinsum("ij, jk -> ik"), (3, 2)),  # ssa id 4
+            RichInstruction(OperatorEinsum("ij ->"), (4,)),  # ssa id 5
+            RichInstruction(OperatorDivide(), (4, 5)),  # ssa id 6
+        ],
+        [1.0e3 * square_matrix for square_matrix in POSITIVE_SQUARE_MATRICES],
+    ),
+]
+AGREEMENT_CASE_IDS = [case_name for case_name, _, _ in AGREEMENT_CASES]
+
+
+@pytest.mark.parametrize("stability_mode", COMPARED_STABILITY_MODES)
+@pytest.mark.parametrize(("case_name", "instructions", "tensor_arguments"), AGREEMENT_CASES, ids=AGREEMENT_CASE_IDS)
+def test_stability_modes_compute_same_result(case_name: str, instructions: list[RichInstruction], tensor_arguments: list[npt.NDArray], stability_mode: StabilityMode) -> None:
+    def run_in_mode(mode: StabilityMode) -> npt.NDArray:
+        rich_program = _dense_program(instructions, n_inputs=len(tensor_arguments), stability_mode=mode)
+        backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+        return run_program(backend_program, tensor_arguments)
+
+    baseline_result = run_in_mode("unstable")
+    result = run_in_mode(stability_mode)
+
+    assert result.shape == baseline_result.shape
+    np.testing.assert_allclose(result, baseline_result, rtol=1e-9)
+
+
 def test_unstable_mode_overflows_on_huge_intermediate_values() -> None:
     rich_program = _huge_chain_program("unstable", N_HUGE_FACTORS)
 
