@@ -18,6 +18,7 @@ from cirkit.templates import data_modalities, utils
 
 import extended_einsum.interface as xe
 from extended_einsum.language import Program, get_operator
+from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
 
 WIDTH = 4
 HEIGHT = 4
@@ -133,7 +134,11 @@ def preprocess_xe_program(
     *,
     optimize_stacking: bool,
 ) -> Program:
-    return program
+    if not optimize_stacking:
+        return program
+
+    folded = FoldSameShapedOperations.apply(program)
+    return OptimizeContractionPaths.apply(folded)
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -193,7 +198,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-optimize-stacking",
         action="store_true",
-        help="Retained for compatibility; has no effect.",
+        help="Disable folding and contraction-path optimization preprocessing.",
     )
     parser.add_argument(
         "--dump-instructions",
