@@ -5,12 +5,13 @@ UnaryOperator = Literal["sin", "cos", "tan", "exp", "log", "sqrt", "1/"]
 BinaryOperator = Literal["+", "-", "*", "/", "**"]
 EinsumOperator = Literal["einsum"]
 StackOperator = Literal["stack"]
+ConcatOperator = Literal["concat"]
 TakeOperator = Literal["take"]
 SliceOperator = Literal["slice"]
 SelectOperator = Literal["select"]
 SoftmaxOperator = Literal["softmax"]
 
-OperatorName = UnaryOperator | BinaryOperator | EinsumOperator | StackOperator | TakeOperator | SliceOperator | SelectOperator | SoftmaxOperator
+OperatorName = UnaryOperator | BinaryOperator | EinsumOperator | StackOperator | ConcatOperator | TakeOperator | SliceOperator | SelectOperator | SoftmaxOperator
 ArgumentSSAIds = tuple[int, ...]
 ExtraArguments = tuple[Any, ...]
 

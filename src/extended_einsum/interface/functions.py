@@ -13,6 +13,7 @@ from extended_einsum.language.rich_operators import (
     OperatorExp,
     OperatorInverse,
     OperatorLog,
+    OperatorSelect,
     OperatorSin,
     OperatorSlice,
     OperatorSoftmax,
@@ -143,6 +144,16 @@ def slice(
 ) -> TensorExpression[TArray]:
     axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(OperatorSlice(start, stop, axis), [source])
+
+
+def select(
+    source: TensorExpression[TArray] | TArray,
+    index: int,
+    *,
+    axis: int = 0,
+) -> TensorExpression[TArray]:
+    axis = normalize_axis(axis, len(source.shape))
+    return TensorExpression(OperatorSelect(axis, index), [source])
 
 
 def softmax(

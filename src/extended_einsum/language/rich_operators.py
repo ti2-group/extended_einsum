@@ -191,6 +191,56 @@ class OperatorStack(RichOperator):
 
 
 @dataclass(frozen=True)
+class OperatorConcat(RichOperator):
+    axis: int
+
+    @property
+    @override
+    def name(self) -> OperatorName:
+        return "concat"
+
+    @property
+    @override
+    def raw_extra_arguments(self) -> tuple[Any, ...]:
+        return (self.axis,)
+
+    @override
+    def check_inputs(self, operands: list[HasShape]) -> None:
+        if len(operands) == 0:
+            raise ValueError("concat requires at least one argument")
+        first_shape = operands[0].shape
+        if len(first_shape) == 0:
+            raise ValueError("concat requires non-scalar operands")
+        if not 0 <= self.axis < len(first_shape):
+            raise ValueError(f"The concat operator wants to concatenate axis {self.axis} but the operands only have {len(first_shape)} axes. Bounds are 0 <= axis < {len(first_shape)}.")
+        for operand in operands[1:]:
+            if len(operand.shape) != len(first_shape):
+                raise ValueError("concat requires operands with the same rank")
+            if operand.shape[: self.axis] != first_shape[: self.axis] or operand.shape[self.axis + 1 :] != first_shape[self.axis + 1 :]:
+                raise ValueError("concat requires operands with matching non-concatenated dimensions")
+
+    @override
+    def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
+        if len(input_shapes) == 0:
+            raise ValueError("concat requires at least one argument")
+        first_shape = input_shapes[0]
+        if len(first_shape) == 0:
+            raise ValueError("concat requires non-scalar operands")
+        if not 0 <= self.axis < len(first_shape):
+            raise ValueError(f"The concat operator wants to concatenate axis {self.axis} but the operands only have {len(first_shape)} axes. Bounds are 0 <= axis < {len(first_shape)}.")
+        for shape in input_shapes[1:]:
+            if len(shape) != len(first_shape):
+                raise ValueError("concat requires operands with the same rank")
+            if shape[: self.axis] != first_shape[: self.axis] or shape[self.axis + 1 :] != first_shape[self.axis + 1 :]:
+                raise ValueError("concat requires operands with matching non-concatenated dimensions")
+        concat_size = sum(shape[self.axis] for shape in input_shapes)
+        return (
+            *first_shape[: self.axis],
+            concat_size,
+            *first_shape[self.axis + 1 :],
+        )
+
+@dataclass(frozen=True)
 class OperatorTake(RichOperator):
     axis: int
 

@@ -37,6 +37,9 @@ class BackendFunctions(Protocol[TBackendArray]):
     def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
 
     @staticmethod
+    def concat(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
+
+    @staticmethod
     def take(array: TBackendArray, indices: TBackendArray, axis: int) -> TBackendArray: ...
 
     @staticmethod

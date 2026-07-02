@@ -2,6 +2,7 @@ from .functions import array as array
 from .functions import einsum as einsum
 from .functions import exp as exp
 from .functions import log as log
+from .functions import select as select
 from .functions import slice as slice
 from .functions import softmax as softmax
 from .functions import stack as stack

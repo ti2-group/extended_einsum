@@ -9,6 +9,7 @@ from extended_einsum.backends.registry import BACKEND_TO_COMPILER, BACKEND_TO_FU
 from extended_einsum.language.rich_instruction import map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
+    OperatorConcat,
     OperatorCos,
     OperatorDivide,
     OperatorEinsum,
@@ -273,12 +274,12 @@ def _propagate_tensor_format(operator: RichOperator, argument_formats: list[Tens
                 raise ValueError(f"The {operator} operator requires arguments with the same format, but {argument_formats[0]} and {argument_formats[1]} were given.")
             format_signature = [argument_formats[0], argument_formats[1]]
 
-        case OperatorStack(_):
+        case OperatorStack(_) | OperatorConcat(_):
             if len(argument_formats) < 1:
-                raise ValueError(f"The stack operator requires at least one argument, but {len(argument_formats)} were given.")
+                raise ValueError(f"The {operator.name} operator requires at least one argument, but {len(argument_formats)} were given.")
             format_signature = [argument_formats[0]]
             if any(format != argument_formats[0] for format in argument_formats[1:]):
-                raise ValueError(f"The stack operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given.")
+                raise ValueError(f"The {operator.name} operator requires all arguments to have the same format, but {argument_formats[0]} and {argument_formats[1:]} were given.")
 
         case OperatorTake(_):
             if len(argument_formats) != 2:

@@ -1,10 +1,17 @@
-åimport unittest
+import unittest
+from unittest.mock import patch
+
+import torch
+from extended_einsum.format import DenseArray
 
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
+    OperatorConcat,
     OperatorEinsum,
+    OperatorExp,
     OperatorLog,
+    OperatorSelect,
     OperatorSoftmax,
     OperatorStack,
     OperatorSubtract,
@@ -12,11 +19,14 @@ from extended_einsum.language.rich_operators import (
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.preprocess import (
     FoldSameShapedOperations,
+    OptimizeContractionPaths,
     extract_connected_einsum_components,
     group_identical_ops_by_output_depth,
     to_annotated_ssa_path,
 )
+from extended_einsum.runtime import run_program
 from extended_einsum.shapes import Shape
+from extended_einsum.translations.torch import TorchTranslation
 
 
 def _add_instruction(first: int, second: int) -> RichInstruction:
@@ -31,13 +41,21 @@ def _log_instruction(argument: int) -> RichInstruction:
     return RichInstruction(OperatorLog(), (argument,))
 
 
+def _exp_instruction(argument: int) -> RichInstruction:
+    return RichInstruction(OperatorExp(), (argument,))
+
+
 def _softmax_instruction(argument: int, axis: int) -> RichInstruction:
     return RichInstruction(OperatorSoftmax(axis), (argument,))
 
 
+def _select_instruction(argument: int, index: int, axis: int = 0) -> RichInstruction:
+    return RichInstruction(OperatorSelect(axis, index), (argument,))
+
+
 def _stack_instruction(*arguments: int, axis: int = 0) -> RichInstruction:
     return RichInstruction(OperatorStack(axis), arguments)
-å
+
 
 def _einsum_instruction(format_string: str, *arguments: int) -> RichInstruction:
     return RichInstruction(OperatorEinsum(format_string), arguments)
@@ -48,6 +66,7 @@ def _program(
     instructions: list[RichInstruction],
     n_inputs: int,
     shapes: list[Shape],
+    parameter_indices: frozenset[int] = frozenset(),
 ) -> RichProgram:
     return RichProgram(
         instructions=instructions,
@@ -55,8 +74,38 @@ def _program(
         stability_mode="none",
         shapes=shapes,
         tensor_formats=["dense" for _ in shapes],
-        parameter_indices=frozenset(),
+        parameter_indices=parameter_indices,
     )
+
+
+class ConcatOperatorTests(unittest.TestCase):
+    def test_concat_propagates_axis_shape(self) -> None:
+        operator = OperatorConcat(axis=0)
+
+        self.assertEqual(operator.propagate_shapes([(2, 3), (4, 3)]), (6, 3))
+
+    def test_concat_runs_on_torch_backend(self) -> None:
+        program = RichProgram(
+            instructions=[RichInstruction(OperatorConcat(axis=0), (0, 1))],
+            n_inputs=2,
+            stability_mode="none",
+            shapes=[(2, 3), (1, 3), (3, 3)],
+            tensor_formats=["dense", "dense", "dense"],
+            parameter_indices=frozenset(),
+        )
+        first = DenseArray(torch.ones((2, 3)))
+        second = DenseArray(torch.zeros((1, 3)))
+
+        result = run_program(
+            program.to_raw_program(),
+            [first, second],
+            [TorchTranslation()],
+        )
+
+        torch.testing.assert_close(
+            result.backend_array,
+            torch.cat([first.backend_array, second.backend_array], dim=0),
+        )
 
 
 class OutputDepthOpGroupingTests(unittest.TestCase):
@@ -80,7 +129,7 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         groups = group_identical_ops_by_output_depth(program)
 
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0].depth, 1)
+        self.assertEqual(groups[0].depth, -1)
         self.assertEqual(groups[0].operator.name, "log")
         self.assertEqual(groups[0].operator.raw_extra_arguments, ())
         self.assertEqual(
@@ -108,6 +157,32 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         groups = group_identical_ops_by_output_depth(program)
 
         self.assertEqual(groups, ())
+
+    def test_ignores_non_batchable_ops(self) -> None:
+        program = _program(
+            instructions=[
+                _take_instruction(0, 1),
+                _take_instruction(2, 3),
+                _add_instruction(4, 5),
+            ],
+            n_inputs=4,
+            shapes=[
+                (2, 3),
+                (1,),
+                (2, 3),
+                (1,),
+                (1, 3),
+                (1, 3),
+                (1, 3),
+            ],
+        )
+
+        groups = group_identical_ops_by_output_depth(program, min_group_size=1)
+
+        self.assertEqual(
+            tuple((group.operator.name, tuple(member.op_index for member in group.members)) for group in groups),
+            (("+", (2,)),),
+        )
 
     def test_canonicalizes_commutative_binary_operand_order(self) -> None:
         program = _program(
@@ -284,6 +359,62 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
 
         self.assertEqual(groups, ())
 
+    def test_splits_ops_with_input_and_einsum_operand_sources(self) -> None:
+        program = _program(
+            instructions=[
+                _select_instruction(0, 1),
+                _einsum_instruction("ab,bc->ac", 1, 2),
+                _add_instruction(5, 3),
+                _add_instruction(6, 4),
+                _stack_instruction(7, 8),
+            ],
+            n_inputs=5,
+            shapes=[
+                (2, 2, 3),
+                (2, 3),
+                (3, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 2, 3),
+            ],
+        )
+
+        groups = group_identical_ops_by_output_depth(program)
+
+        self.assertEqual(groups, ())
+
+    def test_groups_input_pointwise_operations_across_output_depths(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _log_instruction(2),
+                _add_instruction(3, 4),
+                _add_instruction(6, 5),
+            ],
+            n_inputs=3,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+        )
+
+        groups = group_identical_ops_by_output_depth(program)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].depth, -1)
+        self.assertEqual(tuple(member.op_index for member in groups[0].members), (0, 1, 2))
+
     def test_ignores_unreachable_ops(self) -> None:
         program = _program(
             instructions=[
@@ -421,6 +552,190 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         self.assertEqual(folded.instructions[1].argument_ssa_ids, (2,))
         self.assertEqual(folded.shapes, [(2, 3), (2, 3), (2, 2, 3), (2, 2, 3), (2, 3), (2, 3), (2, 3)])
 
+    def test_uses_packed_parameter_input_instead_of_stack_instruction(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _add_instruction(2, 3),
+            ],
+            n_inputs=2,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+            parameter_indices=frozenset({0, 1}),
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = result.program
+
+        self.assertEqual(
+            [instruction.operator.name for instruction in folded.instructions],
+            ["log", "select", "select", "+"],
+        )
+        self.assertEqual(folded.n_inputs, 1)
+        self.assertEqual(folded.parameter_indices, frozenset({0}))
+        self.assertEqual(result.parameter_stack_orders, ((0, 1),))
+        self.assertEqual(result.non_parameter_stack_orders, ())
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0,))
+        self.assertEqual(folded.shapes, [(2, 2, 3), (2, 2, 3), (2, 3), (2, 3), (2, 3)])
+
+    def test_reuses_packed_parameter_input_for_later_scalar_parameter_use(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _add_instruction(2, 0),
+                _add_instruction(4, 3),
+            ],
+            n_inputs=2,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+            parameter_indices=frozenset({0, 1}),
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = result.program
+
+        self.assertEqual(folded.n_inputs, 1)
+        self.assertEqual(folded.parameter_indices, frozenset({0}))
+        self.assertEqual(result.parameter_stack_orders, ((0, 1),))
+        self.assertNotIn("stack", [instruction.operator.name for instruction in folded.instructions])
+        self.assertTrue(any(instruction.operator.name == "select" and instruction.argument_ssa_ids == (0,) for instruction in folded.instructions))
+
+    def test_schedules_group_after_ungrouped_producers(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _log_instruction(4),
+                _add_instruction(3, 5),
+            ],
+            n_inputs=3,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+        )
+
+        folded = FoldSameShapedOperations.apply(program)
+
+        self.assertEqual(
+            [instruction.operator.name for instruction in folded.instructions],
+            ["stack", "log", "select", "log", "select", "+"],
+        )
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0, 1))
+        self.assertEqual(folded.instructions[1].argument_ssa_ids, (2,))
+
+    def test_splits_producer_batches_for_partial_stack_consumer(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _exp_instruction(2),
+                _exp_instruction(3),
+                _add_instruction(8, 4),
+                _add_instruction(9, 5),
+                _add_instruction(10, 6),
+                _add_instruction(11, 7),
+                _stack_instruction(12, 13, 14, 15),
+            ],
+            n_inputs=8,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (4, 2, 3),
+            ],
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = result.program
+
+        self.assertEqual(
+            [instruction.operator.name for instruction in folded.instructions],
+            [
+                "stack",
+                "log",
+                "stack",
+                "exp",
+                "select",
+                "+",
+                "select",
+                "+",
+                "select",
+                "+",
+                "select",
+                "+",
+                "stack",
+            ],
+        )
+        self.assertEqual(result.concatenated_batch_orders, ())
+        self.assertNotIn("concat", [instruction.operator.name for instruction in folded.instructions])
+        self.assertEqual(folded.shapes[-1], (4, 2, 3))
+
+    def test_reuses_identical_slice_segments_for_multiple_operands(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _log_instruction(1),
+                _log_instruction(2),
+                _log_instruction(3),
+                _add_instruction(4, 4),
+                _add_instruction(5, 5),
+                _stack_instruction(8, 9, 6, 7),
+            ],
+            n_inputs=4,
+            shapes=[
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 2, 3),
+            ],
+        )
+
+        folded = FoldSameShapedOperations.apply(program)
+        add_instruction = next(instruction for instruction in folded.instructions if instruction.operator.name == "+")
+
+        self.assertNotIn("concat", [instruction.operator.name for instruction in folded.instructions])
+        self.assertNotIn("slice", [instruction.operator.name for instruction in folded.instructions])
+        self.assertEqual(add_instruction.argument_ssa_ids[0], add_instruction.argument_ssa_ids[1])
+
     def test_orders_producer_batches_so_consumers_can_use_slices(self) -> None:
         program = _program(
             instructions=[
@@ -451,11 +766,81 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         )
 
         folded = FoldSameShapedOperations.apply(program)
-        slice_instructions = [instruction for instruction in folded.instructions if instruction.operator.name == "slice"]
 
-        self.assertEqual(folded.instructions[0].argument_ssa_ids, (1, 2, 0))
-        self.assertEqual(len(slice_instructions), 1)
-        self.assertEqual(slice_instructions[0].operator.raw_extra_arguments, (0, 2, 0))
+        self.assertNotIn("concat", [instruction.operator.name for instruction in folded.instructions])
+        self.assertNotIn("slice", [instruction.operator.name for instruction in folded.instructions])
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0, 1, 2))
+
+    def test_replaces_stacked_ordered_selects_with_slice(self) -> None:
+        program = _program(
+            instructions=[
+                _select_instruction(0, 1),
+                _select_instruction(0, 2),
+                _log_instruction(1),
+                _log_instruction(2),
+                _add_instruction(3, 4),
+            ],
+            n_inputs=1,
+            shapes=[
+                (3, 2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+            ],
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = result.program
+
+        self.assertEqual(
+            [instruction.operator.name for instruction in folded.instructions],
+            ["slice", "log", "select", "select", "+"],
+        )
+        self.assertEqual(result.input_axis0_orders, {0: (1, 2, 0)})
+        self.assertEqual(folded.instructions[0].operator.raw_extra_arguments, (0, 2, 0))
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0,))
+
+    def test_orders_direct_select_inputs_before_future_consumers(self) -> None:
+        program = _program(
+            instructions=[
+                _select_instruction(0, 0),
+                _select_instruction(0, 1),
+                _select_instruction(0, 2),
+                _select_instruction(0, 3),
+                _log_instruction(1),
+                _log_instruction(2),
+                _log_instruction(3),
+                _log_instruction(4),
+                _add_instruction(5, 7),
+                _add_instruction(6, 8),
+                _stack_instruction(9, 10),
+            ],
+            n_inputs=1,
+            shapes=[
+                (4, 2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 3),
+                (2, 2, 3),
+            ],
+        )
+
+        result = FoldSameShapedOperations.apply_with_metadata(program)
+        folded = result.program
+
+        self.assertEqual(result.input_axis0_orders, {})
+        self.assertEqual(folded.instructions[0].operator.name, "log")
+        self.assertEqual(folded.instructions[0].argument_ssa_ids, (0,))
+        self.assertNotEqual(folded.instructions[0].operator.name, "stack")
 
 
 class EinsumLabelAllocationTests(unittest.TestCase):
@@ -509,6 +894,68 @@ class EinsumLabelAllocationTests(unittest.TestCase):
 
         self.assertEqual(len(annotated_path), 1)
         self.assertIn("Ā", annotated_path[0][2])
+
+
+class OptimizeContractionPathsTests(unittest.TestCase):
+    def test_retries_until_path_does_not_increase_dag_depth(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _einsum_instruction("bc,cd->bd", 1, 2),
+                _einsum_instruction("ab,bd->ad", 3, 4),
+            ],
+            n_inputs=3,
+            shapes=[
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (2, 3),
+                (3, 5),
+                (2, 5),
+            ],
+        )
+
+        with patch(
+            "sesum.sr.compute_path",
+            side_effect=[
+                ([(0, 1), (3, 2)], 0.0, 0.0),
+                ([(1, 2), (0, 3)], 0.0, 0.0),
+            ],
+        ) as compute_path:
+            optimized = OptimizeContractionPaths.apply(program)
+
+        self.assertEqual(compute_path.call_count, 2)
+        self.assertEqual(
+            [instruction.argument_ssa_ids for instruction in optimized.instructions],
+            [(0,), (1, 2), (3, 4)],
+        )
+
+    def test_keeps_program_when_all_candidate_paths_increase_dag_depth(self) -> None:
+        program = _program(
+            instructions=[
+                _log_instruction(0),
+                _einsum_instruction("bc,cd->bd", 1, 2),
+                _einsum_instruction("ab,bd->ad", 3, 4),
+            ],
+            n_inputs=3,
+            shapes=[
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (2, 3),
+                (3, 5),
+                (2, 5),
+            ],
+        )
+
+        with patch(
+            "sesum.sr.compute_path",
+            return_value=([(0, 1), (3, 2)], 0.0, 0.0),
+        ) as compute_path:
+            optimized = OptimizeContractionPaths.apply(program)
+
+        self.assertEqual(compute_path.call_count, 8)
+        self.assertEqual(optimized, program)
 
 
 if __name__ == "__main__":
