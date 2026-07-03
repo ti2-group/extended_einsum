@@ -33,6 +33,11 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
+    def min(array: jax.Array, axis: int | None = None) -> jax.Array:
+        return jnp.min(array, axis=axis)
+
+    @override
+    @staticmethod
     def stack(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
         return jnp.stack(list(arrays), axis=axis)
 
@@ -92,5 +97,7 @@ class JaxCompiler(BackendCompiler[jax.Array]):
         program: BackendProgram[jax.Array],
         inputs: Sequence[jax.Array],
     ) -> Callable[[Sequence[jax.Array]], jax.Array]:
+        if len(inputs) != program.n_inputs:
+            raise ValueError(f"The number of inputs ({len(inputs)}) does not match the number of inputs ({program.n_inputs}) in the program.")
         jit_prepared = jax.jit(partial(run_program, program))
         return jit_prepared.trace(list(inputs)).lower().compile()

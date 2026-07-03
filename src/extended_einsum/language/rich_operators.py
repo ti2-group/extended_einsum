@@ -366,10 +366,14 @@ class OperatorEinsum(RichOperator):
 
 def _get_axis_sizes(index_strings: list[str], tensor_shapes: list[Shape]) -> dict[str, int]:
     axis_sizes: dict[str, int] = {}
-    for index_string, tensor_shape in zip(index_strings, tensor_shapes):
+    size_sources: dict[str, int] = {}
+    for i, (index_string, tensor_shape) in enumerate(zip(index_strings, tensor_shapes)):
         for index in index_string:
             if index not in axis_sizes:
                 axis_sizes[index] = tensor_shape[index_string.index(index)]
+                size_sources[index] = i
             elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
-                raise RuntimeError(f"Incompatible shapes for index {index_string}: {tensor_shape} and {axis_sizes[index]}.")
+                raise RuntimeError(
+                    f"Incompatible axis sizes for index {index}: argument {i} says {tensor_shape[index_string.index(index)]} ({index_string} and {tensor_shape}) but tensor {size_sources[index]} says {axis_sizes[index]} ({tensor_shapes[size_sources[index]]} and {index_strings[size_sources[index]]})."
+                )
     return axis_sizes

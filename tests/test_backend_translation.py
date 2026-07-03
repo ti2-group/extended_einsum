@@ -44,6 +44,13 @@ def _single_instruction_program(operator: RichOperator, n_arguments: int, stabil
     return _dense_program([RichInstruction(operator, tuple(range(n_arguments)))], n_inputs=n_arguments, stability_mode=stability_mode)
 
 
+# the scaled and logspace translations each come in two normalizing variants
+SCALED_MODES: list[StabilityMode] = ["scaled_min", "scaled_sum"]
+LOGSPACE_MODES: list[StabilityMode] = ["logspace_min", "logspace_max"]
+STABLE_MODES: list[StabilityMode] = [*SCALED_MODES, *LOGSPACE_MODES]
+ALL_MODES: list[StabilityMode] = ["unstable", *STABLE_MODES]
+
+
 _RNG = np.random.default_rng(seed=0)
 MATRIX = _RNG.standard_normal((3, 4))
 OTHER_MATRIX = _RNG.standard_normal((3, 4))
@@ -102,7 +109,7 @@ def test_unstable_translation_produces_one_call_per_instruction() -> None:
     assert backend_program.call_arguments == [(0, 1), (2, 0)]
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
+@pytest.mark.parametrize("stability_mode", ALL_MODES)
 def test_translation_rejects_operator_without_backend_function(stability_mode: StabilityMode) -> None:
     rich_program = _single_instruction_program(OperatorSin(), 1, stability_mode)
 
@@ -134,9 +141,10 @@ SCALED_TRANSLATION_CASES: list[tuple[RichOperator, list[npt.NDArray], npt.NDArra
 SCALED_TRANSLATION_CASE_IDS = [f"{operator.name}-{case_index}" for case_index, (operator, _, _) in enumerate(SCALED_TRANSLATION_CASES)]
 
 
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
 @pytest.mark.parametrize(("operator", "tensor_arguments", "expected_result"), SCALED_TRANSLATION_CASES, ids=SCALED_TRANSLATION_CASE_IDS)
-def test_scaled_translation_computes_actual_result(operator: RichOperator, tensor_arguments: list[npt.NDArray], expected_result: npt.NDArray) -> None:
-    rich_program = _single_instruction_program(operator, len(tensor_arguments), "scaled")
+def test_scaled_translation_computes_actual_result(operator: RichOperator, tensor_arguments: list[npt.NDArray], expected_result: npt.NDArray, stability_mode: StabilityMode) -> None:
+    rich_program = _single_instruction_program(operator, len(tensor_arguments), stability_mode)
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
     result = run_program(backend_program, tensor_arguments)
@@ -144,9 +152,10 @@ def test_scaled_translation_computes_actual_result(operator: RichOperator, tenso
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
-def test_scaled_translation_leaves_raw_only_values_unscaled() -> None:
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_translation_leaves_raw_only_values_unscaled(stability_mode: StabilityMode) -> None:
     # softmax consumes its argument raw and produces a raw result, so the input must not be scaled at all
-    rich_program = _single_instruction_program(OperatorSoftmax(axis=1), 1, "scaled")
+    rich_program = _single_instruction_program(OperatorSoftmax(axis=1), 1, stability_mode)
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
 
@@ -154,14 +163,15 @@ def test_scaled_translation_leaves_raw_only_values_unscaled() -> None:
     assert backend_program.call_arguments == [(0,)]
 
 
-def test_scaled_translation_scales_each_value_at_most_once() -> None:
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_translation_scales_each_value_at_most_once(stability_mode: StabilityMode) -> None:
     rich_program = _dense_program(
         instructions=[
             RichInstruction(OperatorMultiply(), (0, 1)),  # ssa id 2
             RichInstruction(OperatorMultiply(), (2, 0)),  # ssa id 3, consumes input 0 as a scaled pair a second time
         ],
         n_inputs=2,
-        stability_mode="scaled",
+        stability_mode=stability_mode,
     )
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
@@ -172,8 +182,10 @@ def test_scaled_translation_scales_each_value_at_most_once() -> None:
     np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
 
 
-def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials() -> None:
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials(stability_mode: StabilityMode) -> None:
     # exp moves the maximum of its raw argument into the log scale and log adds it back, so the roundtrip survives exponentials that overflow raw tensors
+    # (exp stores its result directly as a scaled pair and log reads it back, so no min/sum normalization runs and both scaled variants agree here)
     huge_matrix = 800.0 + MATRIX
     rich_program = _dense_program(
         instructions=[
@@ -181,7 +193,7 @@ def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials() -
             RichInstruction(OperatorLog(), (1,)),  # ssa id 2
         ],
         n_inputs=1,
-        stability_mode="scaled",
+        stability_mode=stability_mode,
     )
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
@@ -196,7 +208,8 @@ def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials() -
 ################################
 
 
-def test_logspace_translation_of_exp_and_log_is_free() -> None:
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+def test_logspace_translation_of_exp_and_log_is_free(stability_mode: StabilityMode) -> None:
     # exp and log only move values between the raw and logspace parts, so the roundtrip compiles to no backend calls at all
     huge_matrix = 800.0 + MATRIX
     rich_program = _dense_program(
@@ -205,7 +218,7 @@ def test_logspace_translation_of_exp_and_log_is_free() -> None:
             RichInstruction(OperatorLog(), (1,)),  # ssa id 2
         ],
         n_inputs=1,
-        stability_mode="logspace",
+        stability_mode=stability_mode,
     )
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
@@ -215,14 +228,15 @@ def test_logspace_translation_of_exp_and_log_is_free() -> None:
     np.testing.assert_array_equal(result, huge_matrix)
 
 
-def test_logspace_translation_converts_each_value_at_most_once() -> None:
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+def test_logspace_translation_converts_each_value_at_most_once(stability_mode: StabilityMode) -> None:
     rich_program = _dense_program(
         instructions=[
             RichInstruction(OperatorMultiply(), (0, 1)),  # ssa id 2
             RichInstruction(OperatorMultiply(), (2, 0)),  # ssa id 3, consumes input 0 in logspace a second time
         ],
         n_inputs=2,
-        stability_mode="logspace",
+        stability_mode=stability_mode,
     )
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
@@ -238,7 +252,7 @@ def test_logspace_translation_converts_each_value_at_most_once() -> None:
 ################################
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
+@pytest.mark.parametrize("stability_mode", ALL_MODES)
 def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) -> None:
     left_matrix = np.abs(_RNG.standard_normal((3, 4))) + 0.5
     right_matrix = np.abs(_RNG.standard_normal((4, 5))) + 0.5
@@ -263,7 +277,7 @@ def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) 
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
-@pytest.mark.parametrize("stability_mode", ["unstable", "scaled", "logspace"])
+@pytest.mark.parametrize("stability_mode", ALL_MODES)
 def test_translate_to_backend_program_with_mixed_representations(stability_mode: StabilityMode) -> None:
     # in scaled mode this program mixes representations: the einsum introduces a scale, the multiplication
     # and addition combine it with raw inputs, and the logarithm eliminates it again
@@ -307,7 +321,7 @@ RAW_CHAIN_FACTORS = [0.5 + _RNG.random((3, 3)) for _ in range(N_HUGE_FACTORS)]
 HUGE_CHAIN_FACTORS = [1.0e70 * raw_factor for raw_factor in RAW_CHAIN_FACTORS]
 
 
-@pytest.mark.parametrize("stability_mode", ["scaled", "logspace"])
+@pytest.mark.parametrize("stability_mode", STABLE_MODES)
 def test_stable_modes_survive_huge_intermediate_values(stability_mode: StabilityMode) -> None:
     rich_program = _huge_chain_program(stability_mode, N_HUGE_FACTORS)
 
@@ -328,7 +342,7 @@ def test_stable_modes_survive_huge_intermediate_values(stability_mode: Stability
 ################################
 
 # every stability mode must compute the same result as the unstable baseline, up to numeric error
-COMPARED_STABILITY_MODES: list[StabilityMode] = ["scaled", "logspace"]
+COMPARED_STABILITY_MODES = STABLE_MODES
 
 POSITIVE_BIAS_MATRIX = np.abs(_RNG.standard_normal((3, 5))) + 0.5
 POSITIVE_VALUE_MATRIX = np.abs(_RNG.standard_normal((5, 2))) + 0.5
@@ -395,7 +409,7 @@ AGREEMENT_CASE_IDS = [case_name for case_name, _, _ in AGREEMENT_CASES]
 @pytest.mark.parametrize("stability_mode", COMPARED_STABILITY_MODES)
 @pytest.mark.parametrize(("case_name", "instructions", "tensor_arguments"), AGREEMENT_CASES, ids=AGREEMENT_CASE_IDS)
 def test_stability_modes_compute_same_result(case_name: str, instructions: list[RichInstruction], tensor_arguments: list[npt.NDArray], stability_mode: StabilityMode) -> None:
-    if stability_mode == "logspace" and case_name == "subtract-with-mixed-sign-result":
+    if stability_mode in LOGSPACE_MODES and case_name == "subtract-with-mixed-sign-result":
         pytest.skip("logspace cannot represent the negative values in the subtraction result")
 
     def run_in_mode(mode: StabilityMode) -> npt.NDArray:

@@ -33,6 +33,11 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
+    def min(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
+        return np.min(array, axis=axis)
+
+    @override
+    @staticmethod
     def stack(arrays: Sequence[npt.NDArray], axis: int) -> npt.NDArray:
         return np.stack(list(arrays), axis=axis)
 
@@ -94,5 +99,7 @@ class NumpyCompiler(BackendCompiler[npt.NDArray]):
         program: BackendProgram[npt.NDArray],
         inputs: Sequence[npt.NDArray],
     ) -> Callable[[Sequence[npt.NDArray]], npt.NDArray]:
+        if len(inputs) != program.n_inputs:
+            raise ValueError(f"The number of inputs ({len(inputs)}) does not match the number of inputs ({program.n_inputs}) in the program.")
         # numpy has no JIT compilation, so the program is simply interpreted
         return partial(run_program, program)

@@ -36,6 +36,13 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
+    def min(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+        if axis is None:
+            return torch.min(array)
+        return torch.amin(array, dim=axis)
+
+    @override
+    @staticmethod
     def stack(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
         return torch.stack(list(arrays), dim=axis)
 
@@ -95,4 +102,6 @@ class TorchCompiler(BackendCompiler[torch.Tensor]):
         program: BackendProgram[torch.Tensor],
         inputs: Sequence[torch.Tensor],
     ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+        if len(inputs) != program.n_inputs:
+            raise ValueError(f"The number of inputs ({len(inputs)}) does not match the number of inputs ({program.n_inputs}) in the program.")
         return torch.compile(partial(run_program, program))

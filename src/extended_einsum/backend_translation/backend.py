@@ -31,6 +31,9 @@ class BackendFunctions(Protocol[TBackendArray]):
     def max(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
 
     @staticmethod
+    def min(array: TBackendArray, axis: int | None = None) -> TBackendArray: ...
+
+    @staticmethod
     def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
 
     @staticmethod

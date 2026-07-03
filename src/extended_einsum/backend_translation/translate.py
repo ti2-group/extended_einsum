@@ -25,6 +25,18 @@ from extended_einsum.language.rich_program import RichProgram
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
 
+def translate_to_backend_program(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
+    match rich_program.stability_mode:
+        case "unstable":
+            return _translate_unstable(rich_program, backend_functions)
+        case "scaled_min" | "scaled_sum":
+            return _translate_scaled(rich_program, backend_functions, rich_program.stability_mode)
+        case "logspace_min" | "logspace_max":
+            return _translate_logspace(rich_program, backend_functions, rich_program.stability_mode)
+        case _:
+            raise NotImplementedError(f"The translation of rich programs to backend programs is not implemented for stability mode {rich_program.stability_mode}.")
+
+
 def _unwrap_and_execute(backend_function: Callable[..., TBackendArray], tensor_arguments: Sequence[TBackendArray]) -> TBackendArray:
     return backend_function(*tensor_arguments)
 
@@ -91,18 +103,6 @@ class _ProgramBuilder(Generic[TBackendArray]):
         return BackendProgram(self.backend_calls, self.call_arguments, self.n_inputs)
 
 
-def translate_to_backend_program(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
-    match rich_program.stability_mode:
-        case "unstable":
-            return _translate_unstable(rich_program, backend_functions)
-        case "scaled":
-            return _translate_scaled(rich_program, backend_functions)
-        case "logspace":
-            return _translate_logspace(rich_program, backend_functions)
-        case _:
-            raise NotImplementedError(f"The translation of rich programs to backend programs is not implemented for stability mode {rich_program.stability_mode}.")
-
-
 def _translate_unstable(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
     builder = _ProgramBuilder(rich_program.n_inputs)
     for instruction in rich_program.instructions:
@@ -117,17 +117,25 @@ _ScaledPart = Literal["raw", "normalized", "log_scale"]
 _ScaledPositions = dict[tuple[int, _ScaledPart], int]
 
 
-def _translate_scaled(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
+def _translate_scaled(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray], stability_mode: Literal["scaled_min", "scaled_sum"]) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are scaled pairs of a normalized tensor and a scalar log scale.
 
-    Scaling is lazy: a value stays a raw tensor until an operator consumes it as a scaled pair, then it is normalized by its total sum,
-    which assumes non-negative values. The log and softmax operators eliminate the scale again, so their results are stored as raw tensors.
+    Scaling is lazy: a value stays a raw tensor until an operator consumes it as a scaled pair, then it is normalized by its total sum
+    (scaled_sum) or its minimum (scaled_min), which assumes non-negative values. The log and softmax operators eliminate the scale again,
+    so their results are stored as raw tensors.
     """
 
     builder = _ProgramBuilder(rich_program.n_inputs)
     positions: _ScaledPositions = {(ssa_id, "raw"): ssa_id for ssa_id in range(rich_program.n_inputs)}
     for instruction_index, instruction in enumerate(rich_program.instructions):
-        _append_scaled_instruction(builder, backend_functions, positions, instruction, rich_program.n_inputs + instruction_index)
+        _append_scaled_instruction(
+            builder,
+            backend_functions,
+            positions,
+            instruction,
+            rich_program.n_inputs + instruction_index,
+            stability_mode,
+        )
     output_position = _raw_position(builder, backend_functions, positions, rich_program.output_ssa)
     if output_position != builder.last_position:
         raise ValueError("The raw value of the program's output must be the last computed tensor, because the runtime returns the last tensor.")
@@ -143,12 +151,18 @@ def _raw_position(builder: _ProgramBuilder[TBackendArray], backend_functions: Ba
     return positions[ssa_id, "raw"]
 
 
-def _scaled_positions(builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _ScaledPositions, ssa_id: int) -> tuple[int, int]:
-    """Positions of the value as a scaled pair, converting it from its raw tensor at most once by normalizing with its total sum."""
+def _scaled_positions(
+    builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _ScaledPositions, ssa_id: int, stability_mode: Literal["scaled_min", "scaled_sum"]
+) -> tuple[int, int]:
+    """Positions of the value as a scaled pair, converting it from its raw tensor at most once by normalizing with its total sum (scaled_sum) or its minimum (scaled_min)."""
 
     if (ssa_id, "normalized") not in positions:
         raw_position = positions[ssa_id, "raw"]
-        total_position = builder.wrap_and_append(backend_functions.sum, (raw_position,))
+        match stability_mode:
+            case "scaled_min":
+                total_position = builder.wrap_and_append(backend_functions.min, (raw_position,))
+            case "scaled_sum":
+                total_position = builder.wrap_and_append(backend_functions.sum, (raw_position,))
         positions[ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_position, total_position))
         positions[ssa_id, "log_scale"] = builder.wrap_and_append(backend_functions.log, (total_position,))
     return positions[ssa_id, "normalized"], positions[ssa_id, "log_scale"]
@@ -168,22 +182,37 @@ def _append_rescaled_values(builder: _ProgramBuilder[TBackendArray], backend_fun
 
 
 def _append_scaled_einsum(
-    builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _ScaledPositions, format_string: str, argument_ssa_ids: tuple[int, ...], result_ssa_id: int
+    builder: _ProgramBuilder[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArray],
+    positions: _ScaledPositions,
+    format_string: str,
+    argument_ssa_ids: tuple[int, ...],
+    result_ssa_id: int,
+    stability_mode: Literal["scaled_min", "scaled_sum"],
 ) -> None:
     """Einsum on the normalized operands, renormalized by the total sum of its result; the operand log scales add up in the result's log scale."""
 
-    scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
-    value_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(normalized_position for normalized_position, _ in scaled_pairs))
-    total_position = builder.wrap_and_append(backend_functions.sum, (value_position,))
-    positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (value_position, total_position))
-    log_scale_position = builder.wrap_and_append(backend_functions.log, (total_position,))
+    scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
+    raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(normalized_position for normalized_position, _ in scaled_pairs))
+    match stability_mode:
+        case "scaled_min":
+            raw_norm_position = builder.wrap_and_append(backend_functions.min, (raw_einsum_position,))
+        case "scaled_sum":
+            raw_norm_position = builder.wrap_and_append(backend_functions.sum, (raw_einsum_position,))
+    positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
+    log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
     for _, operand_scale_position in scaled_pairs:
         log_scale_position = builder.wrap_and_append(backend_functions.add, (log_scale_position, operand_scale_position))
     positions[result_ssa_id, "log_scale"] = log_scale_position
 
 
 def _append_scaled_instruction(
-    builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _ScaledPositions, instruction: RichInstruction, result_ssa_id: int
+    builder: _ProgramBuilder[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArray],
+    positions: _ScaledPositions,
+    instruction: RichInstruction,
+    result_ssa_id: int,
+    stability_mode: Literal["scaled_min", "scaled_sum"],
 ) -> None:
     argument_ssa_ids = instruction.argument_ssa_ids
     match instruction.operator:
@@ -197,7 +226,7 @@ def _append_scaled_instruction(
             positions[result_ssa_id, "log_scale"] = log_scale_position
         case OperatorLog():
             # log(n * e^s) = log(n) + s, which is safe to store as a raw tensor
-            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0])
+            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0], stability_mode)
             log_position = builder.wrap_and_append(backend_functions.log, (normalized_position,))
             positions[result_ssa_id, "raw"] = builder.wrap_and_append(backend_functions.add, (log_position, log_scale_position))
         case OperatorSoftmax(_):
@@ -207,39 +236,43 @@ def _append_scaled_instruction(
         case OperatorAdd() | OperatorSubtract():
             # n1 * e^s1 ± n2 * e^s2 = (n1 * e^(s1 - m) ± n2 * e^(s2 - m)) * e^m with m = max(s1, s2)
             combine = backend_functions.add if isinstance(instruction.operator, OperatorAdd) else backend_functions.subtract
-            scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+            scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
             rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
             positions[result_ssa_id, "normalized"] = builder.wrap_and_append(combine, tuple(rescaled_positions))
             positions[result_ssa_id, "log_scale"] = common_scale_position
         case OperatorMultiply():
             # the normalized values multiply and the log scales add up
-            (normalized_1, log_scale_1), (normalized_2, log_scale_2) = (_scaled_positions(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids)
+            (normalized_1, log_scale_1), (normalized_2, log_scale_2) = (
+                _scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids
+            )
             positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.multiply, (normalized_1, normalized_2))
             positions[result_ssa_id, "log_scale"] = builder.wrap_and_append(backend_functions.add, (log_scale_1, log_scale_2))
         case OperatorDivide():
             # the normalized values divide and the divisor's log scale is subtracted from the dividend's
-            (normalized_1, log_scale_1), (normalized_2, log_scale_2) = (_scaled_positions(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids)
+            (normalized_1, log_scale_1), (normalized_2, log_scale_2) = (
+                _scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids
+            )
             positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (normalized_1, normalized_2))
             positions[result_ssa_id, "log_scale"] = builder.wrap_and_append(backend_functions.subtract, (log_scale_1, log_scale_2))
         case OperatorStack(axis):
             # bring all operands to a common log scale, then stack the rescaled values
-            scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+            scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
             rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
             positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.stack, axis=axis), tuple(rescaled_positions))
             positions[result_ssa_id, "log_scale"] = common_scale_position
         case OperatorTake(_):
             # indexing the normalized values does not change the scalar log scale; the indices are integer positions and always used raw
-            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0])
+            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0], stability_mode)
             indices_position = _raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
             positions[result_ssa_id, "normalized"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (normalized_position, indices_position))
             positions[result_ssa_id, "log_scale"] = log_scale_position
         case OperatorSelect(_, _) | OperatorSlice(_, _, _):
             # indexing the normalized values does not change the scalar log scale
-            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0])
+            normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0], stability_mode)
             positions[result_ssa_id, "normalized"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (normalized_position,))
             positions[result_ssa_id, "log_scale"] = log_scale_position
         case OperatorEinsum(format_string):
-            _append_scaled_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id)
+            _append_scaled_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode)
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no scaled backend translation.")
 
@@ -250,7 +283,7 @@ _LogspacePart = Literal["raw", "logspace"]
 _LogspacePositions = dict[tuple[int, _LogspacePart], int]
 
 
-def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
+def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray], stability_mode: Literal["logspace_min", "logspace_max"]) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are the natural logarithms of the actual values.
 
     Conversion is lazy: a value stays a raw tensor until an operator consumes it in logspace, then it is converted with log,
@@ -261,7 +294,14 @@ def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFun
     builder = _ProgramBuilder(rich_program.n_inputs)
     positions: _LogspacePositions = {(ssa_id, "raw"): ssa_id for ssa_id in range(rich_program.n_inputs)}
     for instruction_index, instruction in enumerate(rich_program.instructions):
-        _append_logspace_instruction(builder, backend_functions, positions, instruction, rich_program.n_inputs + instruction_index)
+        _append_logspace_instruction(
+            builder,
+            backend_functions,
+            positions,
+            instruction,
+            rich_program.n_inputs + instruction_index,
+            stability_mode,
+        )
     output_position = _as_raw_position(builder, backend_functions, positions, rich_program.output_ssa)
     if output_position != builder.last_position:
         raise ValueError("The raw value of the program's output must be the last computed tensor, because the runtime returns the last tensor.")
@@ -284,13 +324,16 @@ def _as_logspace_position(builder: _ProgramBuilder[TBackendArray], backend_funct
     return positions[ssa_id, "logspace"]
 
 
-def _append_max_shifted(builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], log_positions: list[int]) -> tuple[list[int], int]:
-    """Shifts logspace values by the scalar maximum over all of them, returning the positions of the shifted logspace values and of the shift."""
+def _append_shifted(
+    builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], log_positions: list[int], stability_mode: Literal["logspace_min", "logspace_max"]
+) -> tuple[list[int], int]:
+    """Shifts logspace values by the scalar minimum/maximum over all of them, returning the positions of the shifted logspace values and of the shift."""
 
-    max_positions = tuple(builder.wrap_and_append(backend_functions.max, (log_position,)) for log_position in log_positions)
+    norm_backend_function = backend_functions.max if stability_mode == "logspace_max" else backend_functions.min
+    norm_positions = tuple(builder.wrap_and_append(norm_backend_function, (log_position,)) for log_position in log_positions)
     # TODO: maybe don't stack and aggregate but just aggregate here? we may need to add another backend function for this
-    stacked_maxima_position = builder.append(partial(backend_functions.stack, axis=0), max_positions)
-    shift_position = builder.wrap_and_append(backend_functions.max, (stacked_maxima_position,))
+    stacked_maxima_position = builder.append(partial(backend_functions.stack, axis=0), norm_positions)
+    shift_position = builder.wrap_and_append(norm_backend_function, (stacked_maxima_position,))
     log_shifted_positions: list[int] = []
     for log_position in log_positions:
         log_shifted_positions.append(builder.wrap_and_append(backend_functions.subtract, (log_position, shift_position)))
@@ -304,24 +347,35 @@ def _append_logspace_einsum(
     format_string: str,
     argument_ssa_ids: tuple[int, ...],
     result_ssa_id: int,
+    stability_mode: Literal["logspace_min", "logspace_max"],
 ) -> None:
     """Einsum on the exponentials of the operands, each shifted by its scalar maximum to prevent overflow; the shifts add back onto the logarithm of the result."""
 
+    norm_backend_function = backend_functions.max if stability_mode == "logspace_max" else backend_functions.min
+    # convert to logspace
     log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
-    shift_positions = [builder.wrap_and_append(backend_functions.max, (log_argument_position,)) for log_argument_position in log_argument_positions]
-    raw_shifted_positions: list[int] = []
-    for log_argument_position, shift_position in zip(log_argument_positions, shift_positions):
-        log_shifted_position = builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position))
-        raw_shifted_positions.append(builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)))
+    # shift by min/max
+    shift_positions = [builder.wrap_and_append(norm_backend_function, (log_argument_position,)) for log_argument_position in log_argument_positions]
+    log_shifted_positions = [
+        builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position)) for log_argument_position, shift_position in zip(log_argument_positions, shift_positions)
+    ]
+    # logsumexp einsum
+    raw_shifted_positions = [builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)) for log_shifted_position in log_shifted_positions]
     raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_shifted_positions))
     log_einsum_position = builder.wrap_and_append(backend_functions.log, (raw_einsum_position,))
+    # unshift by min/max
     for shift_position in shift_positions:
         log_einsum_position = builder.wrap_and_append(backend_functions.add, (log_einsum_position, shift_position))
     positions[result_ssa_id, "logspace"] = log_einsum_position
 
 
 def _append_logspace_instruction(
-    builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _LogspacePositions, instruction: RichInstruction, result_ssa_id: int
+    builder: _ProgramBuilder[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArray],
+    positions: _LogspacePositions,
+    instruction: RichInstruction,
+    result_ssa_id: int,
+    stability_mode: Literal["logspace_min", "logspace_max"],
 ) -> None:
     argument_ssa_ids = instruction.argument_ssa_ids
     match instruction.operator:
@@ -342,7 +396,7 @@ def _append_logspace_instruction(
             aggregate = backend_functions.add if isinstance(instruction.operator, OperatorAdd) else backend_functions.subtract
             log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
             # add -m
-            log_shifted_positions, shift_position = _append_max_shifted(builder, backend_functions, log_argument_positions)
+            log_shifted_positions, shift_position = _append_shifted(builder, backend_functions, log_argument_positions, stability_mode)
             # exponentiate
             raw_shifted_positions = [builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)) for log_shifted_position in log_shifted_positions]
             # ±
@@ -369,6 +423,6 @@ def _append_logspace_instruction(
             indices_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
             positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (log_argument_position, indices_position))
         case OperatorEinsum(format_string):
-            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id)
+            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode)
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no logspace backend translation.")

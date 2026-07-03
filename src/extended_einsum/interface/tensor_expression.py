@@ -65,6 +65,7 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     ) -> None:
         self.operator = operator
         self.arguments = arguments
+        operator.check_inputs(arguments)
         self._shape = operator.propagate_shapes([tuple(argument.shape) for argument in arguments])
         self._format: TensorFormat = _propagate_tensor_format(
             operator,
@@ -99,13 +100,13 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def format(self) -> TensorFormat:
         return self._format
 
-    def materialize(self, stability_mode: StabilityMode) -> TArray:
+    def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
         self._rich_program, self._input_arguments = extract_program(self, stability_mode)
         backend_functions = BACKEND_TO_FUNCTIONS[self.backend]
         self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
         compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
         self._backend_code = compiler.compile(self._backend_program, self._input_arguments)
-        return self._backend_code(self._input_arguments)
+        return self._backend_code([argument.backend_array for argument in self._input_arguments])
 
     def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorAdd(), [self, other])
