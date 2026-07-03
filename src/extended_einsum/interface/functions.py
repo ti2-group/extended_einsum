@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Generic, override
+from typing import Generic, TypeVar, override
 
-from extended_einsum.backend import TBackendArray, get_backend_of_array
-from extended_einsum.format import DenseArray, SparseArray
+from extended_einsum.backend_translation import BackendArray
+from extended_einsum.backend_translation.backend import get_backend_of_array
 from extended_einsum.interface.tensor_expression import (
     Parameter,
     TensorExpression,
@@ -23,6 +23,8 @@ from extended_einsum.language.rich_operators import (
 )
 from extended_einsum.language.types import Array, Backend, Shape, TArray, TensorFormat
 from extended_einsum.utils import normalize_axis, parse_format_string
+
+TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
 
 @dataclass(frozen=True)
@@ -46,14 +48,8 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
         return self._format
 
 
-def array(backend_array: TBackendArray, format: TensorFormat = "dense") -> DenseArray[TBackendArray] | SparseArray[TBackendArray]:
-    match format:
-        case "dense":
-            return DenseArray(backend_array)
-        case "sparse":
-            return SparseArray(backend_array)
-        case _:
-            raise ValueError(f"Unsupported format: {format}")
+def array(backend_array: TBackendArray, format: TensorFormat = "dense") -> BackendArrayWrapper[TBackendArray]:
+    return BackendArrayWrapper(backend_array, format)
 
 
 def exp(
