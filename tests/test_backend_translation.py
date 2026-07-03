@@ -117,39 +117,54 @@ def test_translation_rejects_operator_without_backend_function(stability_mode: S
         translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
 
 
+def test_run_program_rejects_wrong_number_of_inputs() -> None:
+    rich_program = _single_instruction_program(OperatorExp(), 1, "unstable")
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+
+    with pytest.raises(ValueError, match="number of inputs"):
+        run_program(backend_program, [MATRIX, MATRIX])
+
+
 ################################
-# translation of single instructions (scaled)
+# translation of single instructions (stable modes)
 ################################
 
-# single-instruction programs on positive inputs, compared against the actual result.
-# the values are positive because the scaled translation normalizes raw tensors by their total sum
-SCALED_TRANSLATION_CASES: list[tuple[RichOperator, list[npt.NDArray], npt.NDArray]] = [
-    (OperatorExp(), [MATRIX], np.exp(MATRIX)),
-    (OperatorLog(), [POSITIVE_MATRIX], np.log(POSITIVE_MATRIX)),
-    (OperatorAdd(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX + OTHER_POSITIVE_MATRIX),
-    (OperatorSubtract(), [POSITIVE_MATRIX + OTHER_POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX),
-    (OperatorMultiply(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX),
-    (OperatorDivide(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX / OTHER_POSITIVE_MATRIX),
-    (OperatorStack(axis=1), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], np.stack([POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], axis=1)),
-    (OperatorTake(axis=1), [POSITIVE_MATRIX, INDICES], POSITIVE_MATRIX[:, INDICES]),
-    (OperatorSelect(axis=0, index=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[1]),
-    (OperatorSlice(start=1, stop=3, axis=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[:, 1:3]),
-    (OperatorSoftmax(axis=1), [MATRIX], np.exp(MATRIX) / np.sum(np.exp(MATRIX), axis=1, keepdims=True)),
-    (OperatorEinsum("ik, kj -> ij"), [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX], POSITIVE_MATRIX @ POSITIVE_RIGHT_MATRIX),
-    (OperatorEinsum("ik ->"), [POSITIVE_MATRIX], np.sum(POSITIVE_MATRIX)),
+# single-instruction programs compared against the actual result. values that the stable translations convert
+# are strictly positive, because the scaled translation normalizes them by their total sum or minimum and the
+# logspace translation takes their logarithm
+STABLE_TRANSLATION_CASES: list[tuple[str, RichOperator, list[npt.NDArray], npt.NDArray]] = [
+    ("exp", OperatorExp(), [MATRIX], np.exp(MATRIX)),
+    ("log", OperatorLog(), [POSITIVE_MATRIX], np.log(POSITIVE_MATRIX)),
+    ("add", OperatorAdd(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX + OTHER_POSITIVE_MATRIX),
+    # the minuend is constructed so that the difference is exactly POSITIVE_MATRIX, keeping the result positive
+    ("subtract", OperatorSubtract(), [POSITIVE_MATRIX + OTHER_POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX),
+    ("multiply", OperatorMultiply(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX),
+    ("divide", OperatorDivide(), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], POSITIVE_MATRIX / OTHER_POSITIVE_MATRIX),
+    ("stack", OperatorStack(axis=1), [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], np.stack([POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX], axis=1)),
+    ("take", OperatorTake(axis=1), [POSITIVE_MATRIX, INDICES], POSITIVE_MATRIX[:, INDICES]),
+    ("select", OperatorSelect(axis=0, index=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[1]),
+    ("slice", OperatorSlice(start=1, stop=3, axis=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[:, 1:3]),
+    ("softmax", OperatorSoftmax(axis=1), [MATRIX], np.exp(MATRIX) / np.sum(np.exp(MATRIX), axis=1, keepdims=True)),
+    ("einsum-matmul", OperatorEinsum("ik, kj -> ij"), [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX], POSITIVE_MATRIX @ POSITIVE_RIGHT_MATRIX),
+    ("einsum-total-sum", OperatorEinsum("ik ->"), [POSITIVE_MATRIX], np.sum(POSITIVE_MATRIX)),
 ]
-SCALED_TRANSLATION_CASE_IDS = [f"{operator.name}-{case_index}" for case_index, (operator, _, _) in enumerate(SCALED_TRANSLATION_CASES)]
+STABLE_TRANSLATION_CASE_IDS = [case_name for case_name, _, _, _ in STABLE_TRANSLATION_CASES]
 
 
-@pytest.mark.parametrize("stability_mode", SCALED_MODES)
-@pytest.mark.parametrize(("operator", "tensor_arguments", "expected_result"), SCALED_TRANSLATION_CASES, ids=SCALED_TRANSLATION_CASE_IDS)
-def test_scaled_translation_computes_actual_result(operator: RichOperator, tensor_arguments: list[npt.NDArray], expected_result: npt.NDArray, stability_mode: StabilityMode) -> None:
+@pytest.mark.parametrize("stability_mode", STABLE_MODES)
+@pytest.mark.parametrize(("case_name", "operator", "tensor_arguments", "expected_result"), STABLE_TRANSLATION_CASES, ids=STABLE_TRANSLATION_CASE_IDS)
+def test_stable_translation_computes_actual_result(case_name: str, operator: RichOperator, tensor_arguments: list[npt.NDArray], expected_result: npt.NDArray, stability_mode: StabilityMode) -> None:
     rich_program = _single_instruction_program(operator, len(tensor_arguments), stability_mode)
 
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
     result = run_program(backend_program, tensor_arguments)
 
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+################################
+# translation of single instructions (scaled)
+################################
 
 
 @pytest.mark.parametrize("stability_mode", SCALED_MODES)
@@ -254,9 +269,11 @@ def test_logspace_translation_converts_each_value_at_most_once(stability_mode: S
 
 @pytest.mark.parametrize("stability_mode", ALL_MODES)
 def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) -> None:
-    left_matrix = np.abs(_RNG.standard_normal((3, 4))) + 0.5
-    right_matrix = np.abs(_RNG.standard_normal((4, 5))) + 0.5
-    bias_matrix = np.abs(_RNG.standard_normal((3, 5))) + 0.5
+    # a test-local generator keeps the inputs independent of which tests ran before
+    rng = np.random.default_rng(seed=1)
+    left_matrix = np.abs(rng.standard_normal((3, 4))) + 0.5
+    right_matrix = np.abs(rng.standard_normal((4, 5))) + 0.5
+    bias_matrix = np.abs(rng.standard_normal((3, 5))) + 0.5
     rich_program = _dense_program(
         instructions=[
             RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1)),  # ssa id 3
@@ -281,10 +298,11 @@ def test_translate_to_backend_program_end_to_end(stability_mode: StabilityMode) 
 def test_translate_to_backend_program_with_mixed_representations(stability_mode: StabilityMode) -> None:
     # in scaled mode this program mixes representations: the einsum introduces a scale, the multiplication
     # and addition combine it with raw inputs, and the logarithm eliminates it again
-    left_matrix = np.abs(_RNG.standard_normal((3, 4))) + 0.5
-    right_matrix = np.abs(_RNG.standard_normal((4, 5))) + 0.5
-    factor_matrix = np.abs(_RNG.standard_normal((3, 5))) + 0.5
-    summand_matrix = np.abs(_RNG.standard_normal((3, 5))) + 0.5
+    rng = np.random.default_rng(seed=2)
+    left_matrix = np.abs(rng.standard_normal((3, 4))) + 0.5
+    right_matrix = np.abs(rng.standard_normal((4, 5))) + 0.5
+    factor_matrix = np.abs(rng.standard_normal((3, 5))) + 0.5
+    summand_matrix = np.abs(rng.standard_normal((3, 5))) + 0.5
     rich_program = _dense_program(
         instructions=[
             RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1)),  # ssa id 4
@@ -342,8 +360,6 @@ def test_stable_modes_survive_huge_intermediate_values(stability_mode: Stability
 ################################
 
 # every stability mode must compute the same result as the unstable baseline, up to numeric error
-COMPARED_STABILITY_MODES = STABLE_MODES
-
 POSITIVE_BIAS_MATRIX = np.abs(_RNG.standard_normal((3, 5))) + 0.5
 POSITIVE_VALUE_MATRIX = np.abs(_RNG.standard_normal((5, 2))) + 0.5
 POSITIVE_SQUARE_MATRICES = [np.abs(_RNG.standard_normal((3, 3))) + 0.5 for _ in range(3)]
@@ -351,19 +367,71 @@ POSITIVE_SQUARE_MATRICES = [np.abs(_RNG.standard_normal((3, 3))) + 0.5 for _ in 
 # single-operator programs covering every translated operator, plus composite programs that mix representations.
 # inputs that the scaled translation consumes as scaled pairs are positive, because it normalizes them by their total sum
 AGREEMENT_CASES: list[tuple[str, list[RichInstruction], list[npt.NDArray]]] = [
-    ("exp", [RichInstruction(OperatorExp(), (0,))], [MATRIX]),
-    ("log", [RichInstruction(OperatorLog(), (0,))], [POSITIVE_MATRIX]),
-    ("add", [RichInstruction(OperatorAdd(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
-    ("subtract-with-mixed-sign-result", [RichInstruction(OperatorSubtract(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
-    ("multiply", [RichInstruction(OperatorMultiply(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
-    ("divide", [RichInstruction(OperatorDivide(), (0, 1))], [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX]),
-    ("stack-with-mismatched-scales", [RichInstruction(OperatorStack(axis=0), (0, 1, 2))], [POSITIVE_MATRIX, 1.0e6 * OTHER_POSITIVE_MATRIX, 1.0e-6 * POSITIVE_MATRIX]),
-    ("take", [RichInstruction(OperatorTake(axis=1), (0, 1))], [POSITIVE_MATRIX, INDICES]),
-    ("select", [RichInstruction(OperatorSelect(axis=0, index=1), (0,))], [POSITIVE_MATRIX]),
-    ("slice", [RichInstruction(OperatorSlice(start=1, stop=3, axis=1), (0,))], [POSITIVE_MATRIX]),
-    ("softmax", [RichInstruction(OperatorSoftmax(axis=1), (0,))], [MATRIX]),
-    ("einsum-matmul", [RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1))], [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX]),
-    ("einsum-total-sum", [RichInstruction(OperatorEinsum("ik ->"), (0,))], [POSITIVE_MATRIX]),
+    (
+        "exp",
+        [RichInstruction(OperatorExp(), (0,))],
+        [MATRIX],
+    ),
+    (
+        "log",
+        [RichInstruction(OperatorLog(), (0,))],
+        [POSITIVE_MATRIX],
+    ),
+    (
+        "add",
+        [RichInstruction(OperatorAdd(), (0, 1))],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
+    (
+        "subtract-with-mixed-sign-result",
+        [RichInstruction(OperatorSubtract(), (0, 1))],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
+    (
+        "multiply",
+        [RichInstruction(OperatorMultiply(), (0, 1))],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
+    (
+        "divide",
+        [RichInstruction(OperatorDivide(), (0, 1))],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
+    (
+        "stack-with-mismatched-scales",
+        [RichInstruction(OperatorStack(axis=0), (0, 1, 2))],
+        [POSITIVE_MATRIX, 1.0e6 * OTHER_POSITIVE_MATRIX, 1.0e-6 * POSITIVE_MATRIX],
+    ),
+    (
+        "take",
+        [RichInstruction(OperatorTake(axis=1), (0, 1))],
+        [POSITIVE_MATRIX, INDICES],
+    ),
+    (
+        "select",
+        [RichInstruction(OperatorSelect(axis=0, index=1), (0,))],
+        [POSITIVE_MATRIX],
+    ),
+    (
+        "slice",
+        [RichInstruction(OperatorSlice(start=1, stop=3, axis=1), (0,))],
+        [POSITIVE_MATRIX],
+    ),
+    (
+        "softmax",
+        [RichInstruction(OperatorSoftmax(axis=1), (0,))],
+        [MATRIX],
+    ),
+    (
+        "einsum-matmul",
+        [RichInstruction(OperatorEinsum("ik, kj -> ij"), (0, 1))],
+        [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX],
+    ),
+    (
+        "einsum-total-sum",
+        [RichInstruction(OperatorEinsum("ik ->"), (0,))],
+        [POSITIVE_MATRIX],
+    ),
     (
         "attention-block",
         [
@@ -402,11 +470,25 @@ AGREEMENT_CASES: list[tuple[str, list[RichInstruction], list[npt.NDArray]]] = [
         ],
         [1.0e3 * square_matrix for square_matrix in POSITIVE_SQUARE_MATRICES],
     ),
+    (
+        "einsum-with-repeated-argument",
+        [RichInstruction(OperatorEinsum("ij, ij ->"), (0, 0))],
+        [POSITIVE_MATRIX],
+    ),
+    (
+        "value-consumed-both-raw-and-converted",
+        [
+            RichInstruction(OperatorMultiply(), (0, 1)),  # ssa id 2
+            RichInstruction(OperatorSoftmax(axis=1), (2,)),  # ssa id 3, consumes ssa id 2 raw
+            RichInstruction(OperatorMultiply(), (3, 2)),  # ssa id 4, consumes ssa id 2 as a scaled pair / in logspace
+        ],
+        [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX],
+    ),
 ]
 AGREEMENT_CASE_IDS = [case_name for case_name, _, _ in AGREEMENT_CASES]
 
 
-@pytest.mark.parametrize("stability_mode", COMPARED_STABILITY_MODES)
+@pytest.mark.parametrize("stability_mode", STABLE_MODES)
 @pytest.mark.parametrize(("case_name", "instructions", "tensor_arguments"), AGREEMENT_CASES, ids=AGREEMENT_CASE_IDS)
 def test_stability_modes_compute_same_result(case_name: str, instructions: list[RichInstruction], tensor_arguments: list[npt.NDArray], stability_mode: StabilityMode) -> None:
     if stability_mode in LOGSPACE_MODES and case_name == "subtract-with-mixed-sign-result":

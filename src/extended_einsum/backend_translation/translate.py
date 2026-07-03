@@ -121,7 +121,7 @@ def _translate_scaled(rich_program: RichProgram, backend_functions: BackendFunct
     """Translates a rich program into a backend program whose intermediate values are scaled pairs of a normalized tensor and a scalar log scale.
 
     Scaling is lazy: a value stays a raw tensor until an operator consumes it as a scaled pair, then it is normalized by its total sum
-    (scaled_sum) or its minimum (scaled_min), which assumes non-negative values. The log and softmax operators eliminate the scale again,
+    (scaled_sum) or its minimum (scaled_min), which assumes strictly positive values. The log and softmax operators eliminate the scale again,
     so their results are stored as raw tensors.
     """
 
@@ -287,7 +287,7 @@ def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFun
     """Translates a rich program into a backend program whose intermediate values are the natural logarithms of the actual values.
 
     Conversion is lazy: a value stays a raw tensor until an operator consumes it in logspace, then it is converted with log,
-    which assumes non-negative values. The exp and log operators only move values between the raw and logspace parts, so a
+    which assumes strictly positive values. The exp and log operators only move values between the raw and logspace parts, so a
     chain like log(einsum(exp(a), exp(b))) never materializes the raw exponentials.
     """
 
@@ -317,7 +317,7 @@ def _as_raw_position(builder: _ProgramBuilder[TBackendArray], backend_functions:
 
 
 def _as_logspace_position(builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _LogspacePositions, ssa_id: int) -> int:
-    """Position of the value's natural logarithm, converting it from its raw tensor at most once, which assumes non-negative values."""
+    """Position of the value's natural logarithm, converting it from its raw tensor at most once, which assumes strictly positive values."""
 
     if (ssa_id, "logspace") not in positions:
         positions[ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.log, (positions[ssa_id, "raw"],))

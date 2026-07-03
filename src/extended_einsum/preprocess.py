@@ -224,7 +224,7 @@ def _canonical_argument_order_for_operator(
     arguments: tuple[int, ...],
     program: RichProgram,
 ) -> tuple[int, ...]:
-    if operator not in _COMMUTATIVE_OPERATORS:
+    if operator.name not in _COMMUTATIVE_OPERATORS:
         return tuple(range(len(arguments)))
 
     return tuple(
