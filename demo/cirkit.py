@@ -27,12 +27,12 @@ from cirkit.templates import data_modalities, utils
 from torch import optim
 
 import extended_einsum.interface as xe
-from extended_einsum.format import DenseArray
+from extended_einsum.backend_translation import run_program, translate_to_backend_program
+from extended_einsum.backends.torch import TorchBackendFunctions
 from extended_einsum.interface.tensor_expression import Parameter
 from extended_einsum.language.rich_program import RichProgram
+from extended_einsum.language.types import StabilityMode
 from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
-from extended_einsum.runtime import run_program
-from extended_einsum.translations.torch import TorchTranslation
 
 WIDTH = 4
 HEIGHT = 4
@@ -169,7 +169,7 @@ def translate_cirkit_to_xe(
     symbolic_circuit,
     *,
     batch_size: int,
-    stability: str,
+    stability: StabilityMode,
     log_floor: float | None = None,
 ) -> tuple[RichProgram, list[object]]:
     input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
@@ -185,10 +185,9 @@ def translate_cirkit_to_xe(
         symbolic_circuit.layers[-1],
         data_by_scope,
     )
-    if stability == "scaled":
-        if log_floor is not None:
-            expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
-        expression = xe.log(expression)
+    if log_floor is not None:
+        expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
+    expression = xe.log(expression)
     return xe.extract_program(expression, stability_mode=stability)
 
 
@@ -391,17 +390,11 @@ def load_train_images(
     return train_images.to(device)
 
 
-def torch_backend_functions(program: RichProgram) -> list[TorchTranslation]:
-    return [TorchTranslation() for _ in program.instructions]
+def torch_program_runner(program: RichProgram, *, use_torch_compile: bool) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+    backend_program = translate_to_backend_program(program, TorchBackendFunctions())
 
-
-def torch_program_runner(program: RichProgram, *, use_torch_compile: bool) -> Callable[[Sequence[DenseArray[torch.Tensor]]], torch.Tensor]:
-    raw_program = program.to_raw_program()
-    backend_functions = torch_backend_functions(program)
-
-    def run(inputs: Sequence[DenseArray[torch.Tensor]]) -> torch.Tensor:
-        result = run_program(raw_program, inputs, backend_functions)
-        return result.backend_array
+    def run(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
+        return run_program(backend_program, inputs)
 
     if use_torch_compile:
         return torch.compile(run)
@@ -433,7 +426,7 @@ def setup_xe_training(
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=batch_size,
-        stability="logspace" if semiring == "lse-sum" else "scaled",
+        stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
         log_floor=1e-12 if semiring == "scaled-max" else None,
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
@@ -470,36 +463,16 @@ def setup_xe_training(
         )
         for input_id in sorted(program.parameter_indices)
     }
-    constant_inputs = {
-        input_id: inputs[input_id].backend_array.to(device)
-        for input_id in range(program.n_inputs)
-        if input_id != 0 and input_id not in program.parameter_indices
-    }
-    used_input_ids = {
-        argument
-        for instruction in program.instructions
-        for argument in instruction.argument_ssa_ids
-        if argument < program.n_inputs
-    }
-    packed_parameter_input_ids = {
-        input_id
-        for stack_order in folded.parameter_stack_orders
-        for input_id in stack_order
-    }
-    retained_input_ids = tuple(
-        input_id
-        for input_id in range(program.n_inputs)
-        if input_id in used_input_ids and input_id not in packed_parameter_input_ids
-    )
+    constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
+    used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
+    packed_parameter_input_ids = {input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order}
+    retained_input_ids = tuple(input_id for input_id in range(program.n_inputs) if input_id in used_input_ids and input_id not in packed_parameter_input_ids)
     data_input_id = retained_input_ids.index(0)
     data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
     pixel_range = torch.arange(num_variables, device=device)[:, None]
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:
-        if semiring == "lse-sum":
-            probabilities = F.log_softmax(categorical_logits, dim=1)
-        else:
-            probabilities = F.softmax(categorical_logits, dim=1)
+        probabilities = F.softmax(categorical_logits, dim=1)
         data = probabilities[pixel_range, batch.T].contiguous()
         return data[list(data_axis_order)]
 
@@ -512,17 +485,13 @@ def setup_xe_training(
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         data_input = categorical_input(batch)
-        runtime_tensors: list[torch.Tensor] = [
-            original_input_tensor(input_id, data_input)
-            for input_id in retained_input_ids
-        ]
+        runtime_tensors: list[torch.Tensor] = [original_input_tensor(input_id, data_input) for input_id in retained_input_ids]
         runtime_tensors[data_input_id] = data_input
         for stack_order in folded.parameter_stack_orders:
             runtime_tensors.append(torch.stack([parameter_inputs[input_id] for input_id in stack_order], dim=0))
         if len(runtime_tensors) != runtime_program.n_inputs:
             raise RuntimeError(f"Expected {runtime_program.n_inputs} runtime inputs, got {len(runtime_tensors)}")
-        runtime_inputs = [DenseArray(tensor) for tensor in runtime_tensors]
-        log_likelihoods = run(runtime_inputs)
+        log_likelihoods = run(runtime_tensors)
         return -torch.mean(log_likelihoods)
 
     optimizer = make_optimizer((categorical_logits, *parameter_inputs.values()), device, lr)
@@ -961,7 +930,8 @@ def main() -> None:
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=args.batch_size,
-        stability="logspace" if args.semiring == "lse-sum" else "scaled",
+        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_sum",
+        log_floor=1e-12 if args.semiring == "scaled-max" else None,
     )
 
     print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={args.units}, sum_product_layer={args.sum_product_layer}")
