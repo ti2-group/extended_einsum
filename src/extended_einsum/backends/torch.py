@@ -22,10 +22,12 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
-    def sum(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def sum(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
+            if keepdims:
+                return torch.sum(array, dim=tuple(range(array.ndim)), keepdim=True)
             return torch.sum(array)
-        return torch.sum(array, dim=axis)
+        return torch.sum(array, dim=axis, keepdim=keepdims)
 
     @override
     @staticmethod

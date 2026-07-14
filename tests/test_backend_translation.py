@@ -23,7 +23,7 @@ from extended_einsum.language.rich_operators import (
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichProgram
-from extended_einsum.language.types import StabilityMode
+from extended_einsum.language.types import Shape, StabilityMode
 
 BACKEND_FUNCTIONS = NumpyBackendFunctions()
 
@@ -33,6 +33,7 @@ def _dense_program(
     n_inputs: int,
     stability_mode: StabilityMode = "unstable",
     parameter_indices: frozenset[int] = frozenset(),
+    shapes: list[Shape] | None = None,
 ) -> RichProgram:
     n_ssa_ids = n_inputs + len(instructions)
     return RichProgram(
@@ -40,7 +41,7 @@ def _dense_program(
         n_inputs=n_inputs,
         stability_mode=stability_mode,
         tensor_formats=["dense"] * n_ssa_ids,
-        shapes=[()] * n_ssa_ids,
+        shapes=[()] * n_ssa_ids if shapes is None else shapes,
         parameter_indices=parameter_indices,
     )
 
@@ -221,6 +222,84 @@ def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials(sta
 
     assert np.all(np.isfinite(result))
     np.testing.assert_allclose(result, huge_matrix, rtol=1e-9)
+
+
+def test_scaled_sum_einsum_keeps_parameter_weights_linear_and_scales_each_data_row() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("bi,io->bo"), (2, 1)),  # ssa id 3
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        parameter_indices=frozenset({1}),
+        shapes=[(2, 2)] * 5,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    assert np.all(np.isfinite(result))
+    assert len(backend_program.backend_calls) == 10
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_scaled_sum_preserves_folded_and_batch_scales_through_slicing() -> None:
+    log_values = np.array(
+        [
+            [[0.0, -1.0], [-1000.0, -1001.0]],
+            [[-10.0, -11.0], [-1010.0, -1011.0]],
+            [[-20.0, -21.0], [-1020.0, -1021.0]],
+            [[-30.0, -31.0], [-1030.0, -1031.0]],
+        ]
+    )
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorSlice(start=1, stop=3, axis=0), (2,)),  # ssa id 3
+            RichInstruction(OperatorEinsum("fbi,io->fbo"), (3, 1)),  # ssa id 4
+            RichInstruction(OperatorLog(), (4,)),  # ssa id 5
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        parameter_indices=frozenset({1}),
+        shapes=[(4, 2, 2), (2, 2), (4, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    sliced_values = log_values[1:3]
+    fiber_maxima = np.max(sliced_values, axis=-1, keepdims=True)
+    expected_result = fiber_maxima + np.log(np.einsum("fbi,io->fbo", np.exp(sliced_values - fiber_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_scaled_sum_elementwise_einsum_propagates_scales_directly() -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("ij,ij->ij"), (0, 1)),  # ssa id 2
+            RichInstruction(OperatorLog(), (2,)),  # ssa id 3
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        shapes=[(3, 4)] * 4,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
+
+    # Normalize each input once, then use one einsum and one scale addition;
+    # no output renormalization or scale reshaping is necessary.
+    assert len(backend_program.backend_calls) == 10
+    np.testing.assert_allclose(result, np.log(POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX), rtol=1e-9)
 
 
 ################################

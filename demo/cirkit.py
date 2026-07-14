@@ -959,7 +959,7 @@ def main() -> None:
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=batch_size,
-        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_sum",
+        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_min",
     )
 
     print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={num_units}, sum_product_layer={args.sum_product_layer}")

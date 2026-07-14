@@ -23,8 +23,8 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
-    def sum(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.sum(array, axis=axis)
+    def sum(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.sum(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod

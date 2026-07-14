@@ -23,8 +23,8 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def sum(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.sum(array, axis=axis)
+    def sum(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.sum(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
