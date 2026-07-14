@@ -25,6 +25,7 @@ from cirkit.pipeline import PipelineContext
 from cirkit.symbolic.layers import HadamardLayer, InputLayer, KroneckerLayer, SumLayer
 from cirkit.templates import data_modalities, utils
 from torch import optim
+from torch.fx.experimental.proxy_tensor import make_fx
 
 import extended_einsum.interface as xe
 from extended_einsum.backend_translation import run_program, translate_to_backend_program
@@ -38,8 +39,6 @@ WIDTH = 4
 HEIGHT = 4
 DEFAULT_UNITS = 64
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_UNIT_SIZES = (64,)
-DEFAULT_BATCH_SIZES = (256,)
 DEFAULT_EPOCHS = 1
 DEFAULT_NUM_SAMPLES = 0
 DEFAULT_PIXEL_VALUES = 256
@@ -170,7 +169,6 @@ def translate_cirkit_to_xe(
     *,
     batch_size: int,
     stability: StabilityMode,
-    log_floor: float | None = None,
 ) -> tuple[RichProgram, list[object]]:
     input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
     data_by_scope = xe.array(
@@ -185,15 +183,12 @@ def translate_cirkit_to_xe(
         symbolic_circuit.layers[-1],
         data_by_scope,
     )
-    # if log_floor is not None:
-    #     expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
     expression = xe.log(expression)
     return xe.extract_program(expression, stability_mode=stability)
 
 
 def preprocess_xe_program(
     program: RichProgram,
-    inputs: Sequence[object],
     *,
     optimize_stacking: bool,
 ) -> RichProgram:
@@ -243,12 +238,22 @@ def print_instructions(program: RichProgram, limit: int) -> None:
         print(f"  {instruction}")
 
 
-def parse_ints(value: str) -> tuple[int, ...]:
-    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+def parse_positive_ints(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("values must be positive")
+    return values
 
 
 def parse_backends(value: str) -> tuple[str, ...]:
     backends = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not backends:
+        raise argparse.ArgumentTypeError("expected at least one backend")
     unknown = set(backends) - {"xe", "cirkit"}
     if unknown:
         raise argparse.ArgumentTypeError(f"Unknown backend(s): {sorted(unknown)}")
@@ -390,15 +395,25 @@ def load_train_images(
     return train_images.to(device)
 
 
-def torch_program_runner(program: RichProgram, *, use_torch_compile: bool) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+def torch_program_runner(program: RichProgram, *, use_make_fx: bool, device: torch.device) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
     backend_program = translate_to_backend_program(program, TorchBackendFunctions())
 
     def run(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
         return run_program(backend_program, inputs)
 
-    if use_torch_compile:
-        return torch.compile(run)
-    return run
+    if not use_make_fx:
+        return run
+
+    def run_flat(*inputs: torch.Tensor) -> torch.Tensor:
+        return run_program(backend_program, inputs)
+
+    example_inputs = [torch.empty(tuple(program.shapes[input_id]), dtype=torch.float32, device=device) for input_id in range(program.n_inputs)]
+    graph_module = make_fx(run_flat, tracing_mode="fake")(*example_inputs)
+
+    def run_graph(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
+        return graph_module(*inputs)
+
+    return run_graph
 
 
 def setup_xe_training(
@@ -427,11 +442,10 @@ def setup_xe_training(
         symbolic_circuit,
         batch_size=batch_size,
         stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
-        log_floor=1e-12 if semiring == "scaled-max" else None,
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
     runtime_program = OptimizeContractionPaths.apply(folded.program)
-    run = torch_program_runner(runtime_program, use_torch_compile=False)
+    run = torch_program_runner(runtime_program, use_make_fx=use_torch_compile, device=device)
 
     num_variables = width * height
     input_shape = input_shape_tuple(inputs[0])
@@ -516,7 +530,6 @@ def setup_cirkit_training(
     width: int,
     height: int,
     num_units: int,
-    batch_size: int,
     sum_product_layer: str,
     device: torch.device,
     dataset: str,
@@ -733,7 +746,6 @@ def run_training_config(
         "width": args.width,
         "height": args.height,
         "num_units": num_units,
-        "batch_size": batch_size,
         "sum_product_layer": args.sum_product_layer,
         "device": device,
         "dataset": args.dataset,
@@ -744,6 +756,7 @@ def run_training_config(
         "lr": args.lr,
     }
     if backend == "xe":
+        setup_kwargs["batch_size"] = batch_size
         setup_kwargs["semiring"] = args.semiring
     step, optimizer, train_images, _program = setup_fn(**setup_kwargs)
     setup_ms = elapsed_wall_ms(setup_start, device)
@@ -835,8 +848,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
-    parser.add_argument("--units", type=int, default=DEFAULT_UNITS)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--units",
+        "--unit-sizes",
+        dest="unit_sizes",
+        type=parse_positive_ints,
+        default=(DEFAULT_UNITS,),
+        metavar="N[,N...]",
+        help="Unit count, or comma-separated counts for a training sweep.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        "--batch-sizes",
+        dest="batch_sizes",
+        type=parse_positive_ints,
+        default=(DEFAULT_BATCH_SIZE,),
+        metavar="N[,N...]",
+        help="Batch size, or comma-separated sizes for a training sweep.",
+    )
     parser.add_argument("--sum-product-layer", choices=("cp", "tucker"), default="cp")
     parser.add_argument(
         "--semiring",
@@ -882,18 +911,6 @@ def parse_args() -> argparse.Namespace:
         default=("xe",),
         help="Comma-separated subset of: xe,cirkit.",
     )
-    parser.add_argument(
-        "--unit-sizes",
-        type=parse_ints,
-        default=DEFAULT_UNIT_SIZES,
-        help="Comma-separated training unit sizes.",
-    )
-    parser.add_argument(
-        "--batch-sizes",
-        type=parse_ints,
-        default=DEFAULT_BATCH_SIZES,
-        help="Comma-separated training batch sizes.",
-    )
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument(
         "--max-batches",
@@ -915,7 +932,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--verbose-errors", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.train and (len(args.unit_sizes) != 1 or len(args.batch_sizes) != 1):
+        parser.error("multiple --units or --batch-size values require --train")
+    return args
 
 
 def main() -> None:
@@ -927,20 +947,22 @@ def main() -> None:
         run_training_sweep(args)
         return
 
+    num_units = args.unit_sizes[0]
+    batch_size = args.batch_sizes[0]
+
     symbolic_circuit = make_symbolic_circuit(
         width=args.width,
         height=args.height,
-        num_units=args.units,
+        num_units=num_units,
         sum_product_layer=args.sum_product_layer,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         stability="logspace_max" if args.semiring == "lse-sum" else "scaled_sum",
-        log_floor=1e-12 if args.semiring == "scaled-max" else None,
     )
 
-    print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={args.units}, sum_product_layer={args.sum_product_layer}")
+    print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={num_units}, sum_product_layer={args.sum_product_layer}")
     print_program_summary("direct XE program", program, inputs, shape_preview=args.shape_preview)
 
     final_program = program
@@ -948,7 +970,6 @@ def main() -> None:
         try:
             preprocessed = preprocess_xe_program(
                 program,
-                inputs,
                 optimize_stacking=not args.no_optimize_stacking,
             )
         except NameError as error:
