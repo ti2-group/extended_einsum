@@ -29,17 +29,26 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
-    def max(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def max(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
+            if keepdims:
+                return torch.amax(array, dim=tuple(range(array.ndim)), keepdim=True)
             return torch.max(array)
-        return torch.amax(array, dim=axis)
+        return torch.amax(array, dim=axis, keepdim=keepdims)
 
     @override
     @staticmethod
-    def min(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def min(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
+            if keepdims:
+                return torch.amin(array, dim=tuple(range(array.ndim)), keepdim=True)
             return torch.min(array)
-        return torch.amin(array, dim=axis)
+        return torch.amin(array, dim=axis, keepdim=keepdims)
+
+    @override
+    @staticmethod
+    def reshape(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.reshape(array, shape)
 
     @override
     @staticmethod

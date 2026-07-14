@@ -185,8 +185,8 @@ def translate_cirkit_to_xe(
         symbolic_circuit.layers[-1],
         data_by_scope,
     )
-    if log_floor is not None:
-        expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
+    # if log_floor is not None:
+    #     expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
     expression = xe.log(expression)
     return xe.extract_program(expression, stability_mode=stability)
 

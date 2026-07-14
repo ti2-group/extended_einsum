@@ -21,6 +21,7 @@ from extended_einsum.language.rich_operators import (
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichProgram
+from extended_einsum.utils import parse_format_string
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
@@ -283,6 +284,16 @@ _LogspacePart = Literal["raw", "logspace"]
 _LogspacePositions = dict[tuple[int, _LogspacePart], int]
 
 
+def _parameter_derived_ssa_ids(rich_program: RichProgram) -> frozenset[int]:
+    """SSA values whose complete dependency chain consists of parameters."""
+
+    parameter_derived = set(rich_program.parameter_indices)
+    for instruction_index, instruction in enumerate(rich_program.instructions):
+        if instruction.argument_ssa_ids and all(argument_ssa_id in parameter_derived for argument_ssa_id in instruction.argument_ssa_ids):
+            parameter_derived.add(rich_program.n_inputs + instruction_index)
+    return frozenset(parameter_derived)
+
+
 def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray], stability_mode: Literal["logspace_min", "logspace_max"]) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are the natural logarithms of the actual values.
 
@@ -293,6 +304,7 @@ def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFun
 
     builder = _ProgramBuilder(rich_program.n_inputs)
     positions: _LogspacePositions = {(ssa_id, "raw"): ssa_id for ssa_id in range(rich_program.n_inputs)}
+    parameter_derived_ssa_ids = _parameter_derived_ssa_ids(rich_program)
     for instruction_index, instruction in enumerate(rich_program.instructions):
         _append_logspace_instruction(
             builder,
@@ -301,6 +313,7 @@ def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFun
             instruction,
             rich_program.n_inputs + instruction_index,
             stability_mode,
+            parameter_derived_ssa_ids,
         )
     output_position = _as_raw_position(builder, backend_functions, positions, rich_program.output_ssa)
     if output_position != builder.last_position:
@@ -340,6 +353,14 @@ def _append_shifted(
     return log_shifted_positions, shift_position
 
 
+def _reshape_einsum_shift(backend_functions: BackendFunctions[TBackendArray], retained_labels: str, output_string: str, shift: TBackendArray) -> TBackendArray:
+    """Reshapes a shift over retained einsum labels so that it broadcasts over the complete output."""
+
+    retained_dimensions = iter(shift.shape)
+    output_shape = tuple(next(retained_dimensions) if output_label in retained_labels else 1 for output_label in output_string)
+    return backend_functions.reshape(shift, output_shape)
+
+
 def _append_logspace_einsum(
     builder: _ProgramBuilder[TBackendArray],
     backend_functions: BackendFunctions[TBackendArray],
@@ -348,23 +369,41 @@ def _append_logspace_einsum(
     argument_ssa_ids: tuple[int, ...],
     result_ssa_id: int,
     stability_mode: Literal["logspace_min", "logspace_max"],
+    parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
-    """Einsum on the exponentials of the operands, each shifted by its scalar maximum to prevent overflow; the shifts add back onto the logarithm of the result."""
+    """Stable einsum that keeps parameter-derived weights linear and shifts other operands in log space."""
 
     norm_backend_function = backend_functions.max if stability_mode == "logspace_max" else backend_functions.min
-    # convert to logspace
-    log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
-    # shift by min/max
-    shift_positions = [builder.wrap_and_append(norm_backend_function, (log_argument_position,)) for log_argument_position in log_argument_positions]
-    log_shifted_positions = [
-        builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position)) for log_argument_position, shift_position in zip(log_argument_positions, shift_positions)
-    ]
-    # logsumexp einsum
-    raw_shifted_positions = [builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)) for log_shifted_position in log_shifted_positions]
-    raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_shifted_positions))
+    input_strings, output_string = parse_format_string(format_string)
+    if len(input_strings) != len(argument_ssa_ids):
+        raise ValueError(f"The einsum format string has {len(input_strings)} inputs, but the instruction has {len(argument_ssa_ids)} arguments.")
+
+    raw_argument_positions: list[int] = []
+    shift_positions: list[tuple[int, str, str]] = []
+    for input_string, argument_ssa_id in zip(input_strings, argument_ssa_ids, strict=True):
+        if argument_ssa_id in parameter_derived_ssa_ids:
+            raw_argument_positions.append(_as_raw_position(builder, backend_functions, positions, argument_ssa_id))
+            continue
+
+        log_argument_position = _as_logspace_position(builder, backend_functions, positions, argument_ssa_id)
+        retained_labels = "".join(output_label for output_label in output_string if output_label in input_string)
+        reduction_axes = tuple(axis for axis, input_label in enumerate(input_string) if input_label not in output_string)
+        if not reduction_axes:
+            shift_position = log_argument_position
+        elif retained_labels:
+            shift_position = builder.wrap_and_append(partial(norm_backend_function, axis=reduction_axes, keepdims=True), (log_argument_position,))
+        else:
+            shift_position = builder.wrap_and_append(norm_backend_function, (log_argument_position,))
+        log_shifted_position = builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position))
+        raw_argument_positions.append(builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)))
+        shift_positions.append((shift_position, input_string, retained_labels))
+
+    raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_argument_positions))
     log_einsum_position = builder.wrap_and_append(backend_functions.log, (raw_einsum_position,))
-    # unshift by min/max
-    for shift_position in shift_positions:
+    for shift_position, input_string, retained_labels in shift_positions:
+        if retained_labels:
+            shift_position = builder.wrap_and_append(partial(backend_functions.einsum, f"{input_string}->{retained_labels}"), (shift_position,))
+            shift_position = builder.wrap_and_append(partial(_reshape_einsum_shift, backend_functions, retained_labels, output_string), (shift_position,))
         log_einsum_position = builder.wrap_and_append(backend_functions.add, (log_einsum_position, shift_position))
     positions[result_ssa_id, "logspace"] = log_einsum_position
 
@@ -376,6 +415,7 @@ def _append_logspace_instruction(
     instruction: RichInstruction,
     result_ssa_id: int,
     stability_mode: Literal["logspace_min", "logspace_max"],
+    parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
     argument_ssa_ids = instruction.argument_ssa_ids
     match instruction.operator:
@@ -423,6 +463,6 @@ def _append_logspace_instruction(
             indices_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
             positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (log_argument_position, indices_position))
         case OperatorEinsum(format_string):
-            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode)
+            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids)
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no logspace backend translation.")

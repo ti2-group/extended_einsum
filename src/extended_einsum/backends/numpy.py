@@ -28,13 +28,18 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
-    def max(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.max(array, axis=axis)
+    def max(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.max(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def min(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.min(array, axis=axis)
+    def min(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.min(array, axis=axis, keepdims=keepdims)
+
+    @override
+    @staticmethod
+    def reshape(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
+        return np.reshape(array, shape)
 
     @override
     @staticmethod

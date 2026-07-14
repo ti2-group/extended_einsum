@@ -28,13 +28,18 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def max(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.max(array, axis=axis)
+    def max(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.max(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def min(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.min(array, axis=axis)
+    def min(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.min(array, axis=axis, keepdims=keepdims)
+
+    @override
+    @staticmethod
+    def reshape(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        return jnp.reshape(array, shape)
 
     @override
     @staticmethod

@@ -28,7 +28,12 @@ from extended_einsum.language.types import StabilityMode
 BACKEND_FUNCTIONS = NumpyBackendFunctions()
 
 
-def _dense_program(instructions: list[RichInstruction], n_inputs: int, stability_mode: StabilityMode = "unstable") -> RichProgram:
+def _dense_program(
+    instructions: list[RichInstruction],
+    n_inputs: int,
+    stability_mode: StabilityMode = "unstable",
+    parameter_indices: frozenset[int] = frozenset(),
+) -> RichProgram:
     n_ssa_ids = n_inputs + len(instructions)
     return RichProgram(
         instructions=instructions,
@@ -36,7 +41,7 @@ def _dense_program(instructions: list[RichInstruction], n_inputs: int, stability
         stability_mode=stability_mode,
         tensor_formats=["dense"] * n_ssa_ids,
         shapes=[()] * n_ssa_ids,
-        parameter_indices=frozenset(),
+        parameter_indices=parameter_indices,
     )
 
 
@@ -260,6 +265,80 @@ def test_logspace_translation_converts_each_value_at_most_once(stability_mode: S
     # converting the two inputs to logspace, two logspace multiplications, and the raw conversion of the output
     assert len(backend_program.backend_calls) == 5
     np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
+
+
+def test_logspace_max_einsum_keeps_parameter_weights_linear_and_shifts_each_data_row() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("bi, io -> bo"), (2, 1)),  # ssa id 3
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_logspace_max_einsum_shifts_rows_by_output_label_after_axis_reordering() -> None:
+    log_values = np.array([[0.0, -1000.0], [-1.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("ib, io -> bo"), (2, 1)),  # ssa id 3; batch/row label b is axis 1
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    column_maxima = np.max(log_values, axis=0, keepdims=True)
+    expected_result = column_maxima.T + np.log(np.einsum("ib,io->bo", np.exp(log_values - column_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_logspace_max_einsum_keeps_softmax_derived_parameters_linear() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weight_logits = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorSoftmax(axis=0), (1,)),  # ssa id 2, still parameter-derived
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 3
+            RichInstruction(OperatorEinsum("bi, io -> bo"), (3, 2)),  # ssa id 4
+            RichInstruction(OperatorLog(), (4,)),  # ssa id 5
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weight_logits])
+
+    weights = np.exp(weight_logits - np.max(weight_logits, axis=0, keepdims=True))
+    weights /= np.sum(weights, axis=0, keepdims=True)
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    # softmax, the shifted data operand, the einsum, and restoring the row shift require nine calls;
+    # converting and shifting the softmax result as another log-space operand would require five more.
+    assert len(backend_program.backend_calls) == 9
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
 ################################
