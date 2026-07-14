@@ -48,6 +48,11 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
+    def concat(arrays: Sequence[npt.NDArray], axis: int) -> npt.NDArray:
+        return np.concatenate(list(arrays), axis=axis)
+
+    @override
+    @staticmethod
     def take(array: npt.NDArray, indices: npt.NDArray, axis: int) -> npt.NDArray:
         return np.take(array, indices, axis=axis)
 

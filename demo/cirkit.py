@@ -431,11 +431,13 @@ def setup_xe_training(
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
     runtime_program = OptimizeContractionPaths.apply(folded.program)
-    run = torch_program_runner(runtime_program, use_torch_compile=use_torch_compile)
+    run = torch_program_runner(runtime_program, use_torch_compile=False)
 
     num_variables = width * height
     input_shape = input_shape_tuple(inputs[0])
     categorical_units = input_shape[-1]
+    data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
+    data_axis_order_tensor = torch.tensor(data_axis_order, dtype=torch.long, device=device)
     train_images = load_train_images(
         dataset=dataset,
         device=device,
@@ -444,37 +446,39 @@ def setup_xe_training(
         num_variables=num_variables,
         pixel_values=pixel_values,
     )
+    train_images = train_images.index_select(1, data_axis_order_tensor)
     categorical_logits = torch.nn.Parameter(
         torch.normal(
             mean=0.0,
             std=1.0,
             size=(num_variables, pixel_values, categorical_units),
             device=device,
-        )
+        ).index_select(0, data_axis_order_tensor)
     )
-    parameter_inputs = {
-        input_id: torch.nn.Parameter(
-            torch.normal(
-                mean=0.0,
-                std=1.0,
-                size=input_shape_tuple(inputs[input_id]),
-                device=device,
-            )
+    used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
+    packed_parameter_input_sequence = tuple(input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order)
+    packed_parameter_input_ids = set(packed_parameter_input_sequence)
+    if len(packed_parameter_input_sequence) != len(packed_parameter_input_ids):
+        raise ValueError("A parameter input cannot occur in more than one packed stack.")
+    retained_input_ids = tuple(input_id for input_id in range(program.n_inputs) if input_id in used_input_ids and input_id not in packed_parameter_input_ids)
+    data_input_id = retained_input_ids.index(0)
+    initialized_parameter_inputs = {
+        input_id: torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=input_shape_tuple(inputs[input_id]),
+            device=device,
         )
         for input_id in sorted(program.parameter_indices)
     }
+    parameter_inputs = {input_id: torch.nn.Parameter(tensor) for input_id, tensor in initialized_parameter_inputs.items() if input_id not in packed_parameter_input_ids}
+    packed_parameter_inputs = [torch.nn.Parameter(torch.stack([initialized_parameter_inputs[input_id] for input_id in stack_order], dim=0)) for stack_order in folded.parameter_stack_orders]
     constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
-    used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
-    packed_parameter_input_ids = {input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order}
-    retained_input_ids = tuple(input_id for input_id in range(program.n_inputs) if input_id in used_input_ids and input_id not in packed_parameter_input_ids)
-    data_input_id = retained_input_ids.index(0)
-    data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
     pixel_range = torch.arange(num_variables, device=device)[:, None]
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:
         probabilities = F.softmax(categorical_logits, dim=1)
-        data = probabilities[pixel_range, batch.T].contiguous()
-        return data[list(data_axis_order)]
+        return probabilities[pixel_range, batch.T].contiguous()
 
     def original_input_tensor(input_id: int, data_input: torch.Tensor) -> torch.Tensor:
         if input_id == 0:
@@ -487,14 +491,16 @@ def setup_xe_training(
         data_input = categorical_input(batch)
         runtime_tensors: list[torch.Tensor] = [original_input_tensor(input_id, data_input) for input_id in retained_input_ids]
         runtime_tensors[data_input_id] = data_input
-        for stack_order in folded.parameter_stack_orders:
-            runtime_tensors.append(torch.stack([parameter_inputs[input_id] for input_id in stack_order], dim=0))
+        runtime_tensors.extend(packed_parameter_inputs)
         if len(runtime_tensors) != runtime_program.n_inputs:
             raise RuntimeError(f"Expected {runtime_program.n_inputs} runtime inputs, got {len(runtime_tensors)}")
         log_likelihoods = run(runtime_tensors)
         return -torch.mean(log_likelihoods)
 
-    optimizer = make_optimizer((categorical_logits, *parameter_inputs.values()), device, lr)
+    if use_torch_compile:
+        step = torch.compile(step, mode="reduce-overhead" if device.type == "cuda" else None)
+
+    optimizer = make_optimizer((categorical_logits, *parameter_inputs.values(), *packed_parameter_inputs), device, lr)
     return step, optimizer, train_images, runtime_program
 
 
@@ -835,7 +841,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semiring",
         choices=("scaled-max", "lse-sum"),
-        default="scaled-max",
+        default="lse-sum",
         help="Numerical-stability mode to request from XE.",
     )
     parser.add_argument(

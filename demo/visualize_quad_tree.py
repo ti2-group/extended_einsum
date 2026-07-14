@@ -120,7 +120,7 @@ def build_quad_tree_program(
     )
 
     expression = to_xe_expression(symbolic_circuit, symbolic_circuit.layers[-1], data_by_scope)
-    program, _inputs = xe.extract_program(expression, stability_mode="none")
+    program, _inputs = xe.extract_program(expression, stability_mode="unstable")
     return program
 
 

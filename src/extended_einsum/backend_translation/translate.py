@@ -7,6 +7,7 @@ from extended_einsum.backend_translation.backend import BackendArray, BackendFun
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
+    OperatorConcat,
     OperatorDivide,
     OperatorEinsum,
     OperatorExp,
@@ -65,6 +66,9 @@ def _operator_to_backend_call(operator: RichOperator, backend_functions: Backend
         case OperatorStack(axis):
             # stack takes the tensors as a sequence instead of separate arguments
             return partial(backend_functions.stack, axis=axis)
+        case OperatorConcat(axis):
+            # concat takes the tensors as a sequence instead of separate arguments
+            return partial(backend_functions.concat, axis=axis)
         case OperatorTake(axis):
             backend_function = partial(backend_functions.take, axis=axis)
         case OperatorSelect(axis, index):
@@ -261,6 +265,12 @@ def _append_scaled_instruction(
             rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
             positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.stack, axis=axis), tuple(rescaled_positions))
             positions[result_ssa_id, "log_scale"] = common_scale_position
+        case OperatorConcat(axis):
+            # bring all operands to a common log scale, then concatenate the rescaled values
+            scaled_pairs = [_scaled_positions(builder, backend_functions, positions, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
+            rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
+            positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(rescaled_positions))
+            positions[result_ssa_id, "log_scale"] = common_scale_position
         case OperatorTake(_):
             # indexing the normalized values does not change the scalar log scale; the indices are integer positions and always used raw
             normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, argument_ssa_ids[0], stability_mode)
@@ -378,6 +388,18 @@ def _append_logspace_einsum(
     if len(input_strings) != len(argument_ssa_ids):
         raise ValueError(f"The einsum format string has {len(input_strings)} inputs, but the instruction has {len(argument_ssa_ids)} arguments.")
 
+    # An einsum whose operands and output all have the same labels is an
+    # elementwise product. For non-parameter values that product is already
+    # represented exactly by addition in log space; routing it through the
+    # general shifted-einsum lowering adds many redundant tensor operations.
+    if all(input_string == output_string for input_string in input_strings) and all(argument_ssa_id not in parameter_derived_ssa_ids for argument_ssa_id in argument_ssa_ids):
+        log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
+        result_position = log_argument_positions[0]
+        for log_argument_position in log_argument_positions[1:]:
+            result_position = builder.wrap_and_append(backend_functions.add, (result_position, log_argument_position))
+        positions[result_ssa_id, "logspace"] = result_position
+        return
+
     raw_argument_positions: list[int] = []
     shift_positions: list[tuple[int, str, str]] = []
     for input_string, argument_ssa_id in zip(input_strings, argument_ssa_ids, strict=True):
@@ -453,8 +475,8 @@ def _append_logspace_instruction(
             # log(a / b) = log(a) - log(b)
             log_argument_1, log_argument_2 = (_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids)
             positions[result_ssa_id, "logspace"] = builder.wrap_and_append(backend_functions.subtract, (log_argument_1, log_argument_2))
-        case OperatorStack(_) | OperatorSelect(_, _) | OperatorSlice(_, _, _):
-            # stacking and indexing commute with the elementwise logarithm
+        case OperatorStack(_) | OperatorConcat(_) | OperatorSelect(_, _) | OperatorSlice(_, _, _):
+            # stacking, concatenation, and indexing commute with the elementwise logarithm
             log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
             positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), tuple(log_argument_positions))
         case OperatorTake(_):

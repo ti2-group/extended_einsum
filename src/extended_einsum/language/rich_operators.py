@@ -422,7 +422,11 @@ def _get_axis_sizes(index_strings: list[str], tensor_shapes: list[Shape]) -> dic
                 axis_sizes[index] = tensor_shape[index_string.index(index)]
                 size_sources[index] = i
             elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
+                current_size = tensor_shape[index_string.index(index)]
+                previous_source = size_sources[index]
                 raise RuntimeError(
-                    f"Incompatible axis sizes for index {index}: argument {i} says {tensor_shape[index_string.index(index)]} ({index_string} and {tensor_shape}) but tensor {size_sources[index]} says {axis_sizes[index]} ({tensor_shapes[size_sources[index]]} and {index_strings[size_sources[index]]})."
+                    f"Incompatible axis sizes for index {index}: argument {i} says {current_size} "
+                    f"({index_string} and {tensor_shape}) but tensor {previous_source} says {axis_sizes[index]} "
+                    f"({tensor_shapes[previous_source]} and {index_strings[previous_source]})."
                 )
     return axis_sizes

@@ -57,6 +57,11 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
+    def concat(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+        return torch.cat(list(arrays), dim=axis)
+
+    @override
+    @staticmethod
     def take(array: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:
         return torch.index_select(array, dim=axis, index=indices)
 

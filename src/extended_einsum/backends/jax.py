@@ -48,6 +48,11 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
+    def concat(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
+        return jnp.concatenate(list(arrays), axis=axis)
+
+    @override
+    @staticmethod
     def take(array: jax.Array, indices: jax.Array, axis: int) -> jax.Array:
         return jnp.take(array, indices, axis=axis)
 

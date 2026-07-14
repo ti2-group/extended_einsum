@@ -290,6 +290,26 @@ def test_logspace_max_einsum_keeps_parameter_weights_linear_and_shifts_each_data
     np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+def test_logspace_elementwise_einsum_is_addition(stability_mode: StabilityMode) -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("ij,ij->ij"), (0, 1)),
+            RichInstruction(OperatorLog(), (2,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
+
+    # Convert both inputs to log space and add them; the final log instruction
+    # only changes which representation is returned and requires no call.
+    assert len(backend_program.backend_calls) == 3
+    np.testing.assert_allclose(result, np.log(POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX), rtol=1e-9)
+
+
 def test_logspace_max_einsum_shifts_rows_by_output_label_after_axis_reordering() -> None:
     log_values = np.array([[0.0, -1000.0], [-1.0, -1001.0]])
     weights = np.array([[1.0, 2.0], [3.0, 4.0]])

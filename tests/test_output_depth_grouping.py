@@ -2,8 +2,9 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from extended_einsum.format import DenseArray
 
+from extended_einsum.backend_translation import run_program, translate_to_backend_program
+from extended_einsum.backends.torch import TorchBackendFunctions
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
@@ -15,6 +16,7 @@ from extended_einsum.language.rich_operators import (
     OperatorSoftmax,
     OperatorStack,
     OperatorSubtract,
+    OperatorTake,
 )
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.preprocess import (
@@ -24,9 +26,7 @@ from extended_einsum.preprocess import (
     group_identical_ops_by_output_depth,
     to_annotated_ssa_path,
 )
-from extended_einsum.runtime import run_program
 from extended_einsum.shapes import Shape
-from extended_einsum.translations.torch import TorchTranslation
 
 
 def _add_instruction(first: int, second: int) -> RichInstruction:
@@ -53,6 +53,10 @@ def _select_instruction(argument: int, index: int, axis: int = 0) -> RichInstruc
     return RichInstruction(OperatorSelect(axis, index), (argument,))
 
 
+def _take_instruction(argument: int, indices: int, axis: int = 0) -> RichInstruction:
+    return RichInstruction(OperatorTake(axis), (argument, indices))
+
+
 def _stack_instruction(*arguments: int, axis: int = 0) -> RichInstruction:
     return RichInstruction(OperatorStack(axis), arguments)
 
@@ -71,7 +75,7 @@ def _program(
     return RichProgram(
         instructions=instructions,
         n_inputs=n_inputs,
-        stability_mode="none",
+        stability_mode="unstable",
         shapes=shapes,
         tensor_formats=["dense" for _ in shapes],
         parameter_indices=parameter_indices,
@@ -88,23 +92,19 @@ class ConcatOperatorTests(unittest.TestCase):
         program = RichProgram(
             instructions=[RichInstruction(OperatorConcat(axis=0), (0, 1))],
             n_inputs=2,
-            stability_mode="none",
+            stability_mode="unstable",
             shapes=[(2, 3), (1, 3), (3, 3)],
             tensor_formats=["dense", "dense", "dense"],
             parameter_indices=frozenset(),
         )
-        first = DenseArray(torch.ones((2, 3)))
-        second = DenseArray(torch.zeros((1, 3)))
-
-        result = run_program(
-            program.to_raw_program(),
-            [first, second],
-            [TorchTranslation()],
-        )
+        first = torch.ones((2, 3))
+        second = torch.zeros((1, 3))
+        backend_program = translate_to_backend_program(program, TorchBackendFunctions())
+        result = run_program(backend_program, [first, second])
 
         torch.testing.assert_close(
-            result.backend_array,
-            torch.cat([first.backend_array, second.backend_array], dim=0),
+            result,
+            torch.cat([first, second], dim=0),
         )
 
 
