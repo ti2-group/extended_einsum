@@ -61,10 +61,14 @@ CSV_FIELDS = (
     "max_batches",
     "num_samples",
     "dataset",
+    "region_graph",
     "sum_product_layer",
     "semiring",
+    "backend_type",
     "torch_compile",
+    "seed",
     "warmup_steps",
+    "warmup_epochs",
     "setup_ms",
     "warmup_ms",
     "epoch_total_ms",
@@ -616,6 +620,31 @@ def run_warmup(
     return elapsed_wall_ms(start, device)
 
 
+def run_warmup_epochs(
+    step: Callable,
+    optimizer,
+    train_images: torch.Tensor,
+    *,
+    batch_size: int,
+    max_batches: int | None,
+    warmup_epochs: int,
+    device: torch.device,
+) -> float:
+    if warmup_epochs <= 0:
+        return 0.0
+    start = time.perf_counter()
+    for _ in range(warmup_epochs):
+        run_epoch(
+            step,
+            optimizer,
+            train_images,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            device=device,
+        )
+    return elapsed_wall_ms(start, device)
+
+
 def empty_epoch_stats() -> dict[str, float | int]:
     return {
         "data_loading_ms": 0.0,
@@ -695,12 +724,18 @@ def run_epoch(
 
 def append_row(output_path: Path, row: dict) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = output_path.exists()
+    file_has_header = output_path.exists() and output_path.stat().st_size > 0
+    fieldnames = CSV_FIELDS
+    if file_has_header:
+        with output_path.open(newline="") as existing_file:
+            existing_header = next(csv.reader(existing_file), None)
+        if existing_header:
+            fieldnames = tuple(existing_header)
     with output_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not file_exists:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_has_header:
             writer.writeheader()
-        writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+        writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
 def print_epoch_summary(row: dict) -> None:
@@ -748,10 +783,14 @@ def base_row(
         "max_batches": args.max_batches or "",
         "num_samples": args.num_samples,
         "dataset": args.dataset,
+        "region_graph": args.region_graph,
         "sum_product_layer": args.sum_product_layer,
         "semiring": args.semiring,
+        "backend_type": "cirkit" if backend.startswith("cirkit") else "xe",
         "torch_compile": args.torch_compile,
+        "seed": args.seed,
         "warmup_steps": args.warmup_steps,
+        "warmup_epochs": args.warmup_epochs,
     }
 
 
@@ -791,6 +830,15 @@ def run_training_config(
         num_variables=args.width * args.height,
         pixel_values=args.pixel_values,
         warmup_steps=args.warmup_steps,
+        device=device,
+    )
+    warmup_ms += run_warmup_epochs(
+        step,
+        optimizer,
+        train_images,
+        batch_size=batch_size,
+        max_batches=args.max_batches,
+        warmup_epochs=args.warmup_epochs,
         device=device,
     )
 
@@ -952,6 +1000,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pixel-values", type=int, default=DEFAULT_PIXEL_VALUES)
     parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
