@@ -94,10 +94,11 @@ def make_symbolic_circuit(
     height: int,
     num_units: int,
     sum_product_layer: str,
+    region_graph: str = "quad-tree-2",
 ):
     return data_modalities.image_data(
         (1, width, height),
-        region_graph="quad-tree-2",
+        region_graph=region_graph,
         input_layer="categorical",
         num_input_units=num_units,
         sum_product_layer=sum_product_layer,
@@ -121,47 +122,63 @@ def generate_symbols(count: int) -> str:
     return EINSUM_SYMBOLS[:count]
 
 
-def to_xe_expression(symbolic_circuit, layer, data_by_scope):
+def to_xe_expression(symbolic_circuit, layer, data_by_scope, expression_by_layer=None):
+    if expression_by_layer is None:
+        expression_by_layer = {}
+    if layer in expression_by_layer:
+        return expression_by_layer[layer]
+
     children = symbolic_circuit.layer_inputs(layer)
     child_nodes = [
         to_xe_expression(
             symbolic_circuit,
             child,
             data_by_scope,
+            expression_by_layer,
         )
         for child in children
     ]
 
     if not children:
         scope_id = get_scope_id(layer.scope)
-        return xe.select(data_by_scope, scope_id)
-
-    if isinstance(layer, HadamardLayer):
+        result = xe.select(data_by_scope, scope_id)
+    elif isinstance(layer, HadamardLayer):
         format_string = ",".join(["ab"] * len(child_nodes)) + "->ab"
         if not all(child.shape == child_nodes[0].shape for child in child_nodes):
             raise ValueError("Hadamard layer children must have the same shape")
-        return xe.einsum(format_string, *child_nodes)
-
-    if isinstance(layer, KroneckerLayer):
+        result = xe.einsum(format_string, *child_nodes)
+    elif isinstance(layer, KroneckerLayer):
         child_indices = generate_symbols(len(child_nodes) + 1)
         batched_child_indices = [f"a{symbol}" for symbol in child_indices[1:]]
         format_string = ",".join(batched_child_indices) + "->" + "".join(child_indices)
-        return xe.einsum(format_string, *child_nodes)
+        result = xe.einsum(format_string, *child_nodes)
+    elif isinstance(layer, SumLayer):
+        output_units = layer.params["weight"].shape[0]
+        if len(children) > 1:
+            if layer.num_input_units != output_units or not all(child.shape == child_nodes[0].shape for child in child_nodes):
+                raise ValueError("Multi-input sum layers must be mixing layers over equally shaped children")
+            stacked_children = xe.stack(child_nodes, axis=1)
+            mixing_logits = Parameter(xe.array(torch.empty((output_units, len(children)), dtype=torch.float32)))
+            mixing_weights = xe.softmax(mixing_logits, axis=1)
+            result = xe.einsum("bhu,uh->bu", stacked_children, mixing_weights)
+        else:
+            child = child_nodes[0]
+            child_indices = generate_symbols(len(child.shape))
+            weight_shape = (output_units, *child.shape[1:])
+            output_unit_index = generate_symbols(len(child.shape) + 1)[-1]
+            weight_indices = output_unit_index + child_indices[1:]
+            out_indices = child_indices[0] + output_unit_index
+            format_string = f"{child_indices},{weight_indices}->{out_indices}"
+            weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
+            weight_input_axes = tuple(range(1, len(weight_shape)))
+            softmax_axis: int | tuple[int, ...] = weight_input_axes[0] if len(weight_input_axes) == 1 else weight_input_axes
+            weights = xe.softmax(weight_logits, axis=softmax_axis)
+            result = xe.einsum(format_string, child, weights)
+    else:
+        raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
 
-    if isinstance(layer, SumLayer):
-        if len(children) != 1:
-            raise ValueError("Sum layers are expected to have exactly one child")
-        child = child_nodes[0]
-        child_indices = generate_symbols(len(child.shape))
-        weight_shape = child.shape[1:] + (layer.params["weight"].shape[0],)
-        weight_indices = generate_symbols(len(child.shape) + 1)[1:]
-        out_indices = child_indices[0] + weight_indices[-1]
-        format_string = f"{child_indices},{weight_indices}->{out_indices}"
-        weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
-        weights = xe.softmax(weight_logits, axis=0)
-        return xe.einsum(format_string, child, weights)
-
-    raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
+    expression_by_layer[layer] = result
+    return result
 
 
 def translate_cirkit_to_xe(
@@ -191,12 +208,13 @@ def preprocess_xe_program(
     program: RichProgram,
     *,
     optimize_stacking: bool,
+    fuse_logspace_outer_products: bool = False,
 ) -> RichProgram:
     if not optimize_stacking:
         return program
 
     folded = FoldSameShapedOperations.apply(program)
-    return OptimizeContractionPaths.apply(folded)
+    return OptimizeContractionPaths.apply(folded, fuse_logspace_outer_products=fuse_logspace_outer_products)
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -423,6 +441,7 @@ def setup_xe_training(
     num_units: int,
     batch_size: int,
     sum_product_layer: str,
+    region_graph: str,
     device: torch.device,
     dataset: str,
     data_dir: str,
@@ -437,6 +456,7 @@ def setup_xe_training(
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
+        region_graph=region_graph,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
@@ -444,7 +464,7 @@ def setup_xe_training(
         stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
-    runtime_program = OptimizeContractionPaths.apply(folded.program)
+    runtime_program = OptimizeContractionPaths.apply(folded.program, fuse_logspace_outer_products=region_graph == "quad-graph")
     run = torch_program_runner(runtime_program, use_make_fx=use_torch_compile, device=device)
 
     num_variables = width * height
@@ -531,6 +551,7 @@ def setup_cirkit_training(
     height: int,
     num_units: int,
     sum_product_layer: str,
+    region_graph: str,
     device: torch.device,
     dataset: str,
     data_dir: str,
@@ -544,6 +565,7 @@ def setup_cirkit_training(
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
+        region_graph=region_graph,
     )
     ctx = PipelineContext(
         backend="torch",
@@ -691,12 +713,13 @@ def print_epoch_summary(row: dict) -> None:
 
 
 def display_backend(backend: str, args: argparse.Namespace) -> str:
+    backend_name = backend if args.region_graph == "quad-tree-2" else f"{backend}-{args.region_graph}"
     if backend != "xe":
-        return backend
+        return backend_name
     suffixes = [args.semiring]
     if args.torch_compile:
         suffixes.append("torch-compile")
-    return "-".join((backend, *suffixes))
+    return "-".join((backend_name, *suffixes))
 
 
 def base_row(
@@ -747,6 +770,7 @@ def run_training_config(
         "height": args.height,
         "num_units": num_units,
         "sum_product_layer": args.sum_product_layer,
+        "region_graph": args.region_graph,
         "device": device,
         "dataset": args.dataset,
         "data_dir": args.data_dir,
@@ -800,6 +824,7 @@ def run_training_sweep(args: argparse.Namespace) -> None:
     device = get_device(args.device)
     print(f"device={device} ({get_device_name(device)})")
     print(f"writing results to {args.output}")
+    print(f"region_graph={args.region_graph}")
 
     for backend, num_units, batch_size in itertools.product(args.backends, args.unit_sizes, args.batch_sizes):
         cleanup_device(device)
@@ -867,6 +892,7 @@ def parse_args() -> argparse.Namespace:
         help="Batch size, or comma-separated sizes for a training sweep.",
     )
     parser.add_argument("--sum-product-layer", choices=("cp", "tucker"), default="cp")
+    parser.add_argument("--region-graph", choices=("quad-tree-2", "quad-graph"), default="quad-tree-2")
     parser.add_argument(
         "--semiring",
         choices=("scaled-max", "lse-sum"),
@@ -955,6 +981,7 @@ def main() -> None:
         height=args.height,
         num_units=num_units,
         sum_product_layer=args.sum_product_layer,
+        region_graph=args.region_graph,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
@@ -962,7 +989,10 @@ def main() -> None:
         stability="logspace_max" if args.semiring == "lse-sum" else "scaled_min",
     )
 
-    print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={num_units}, sum_product_layer={args.sum_product_layer}")
+    print(
+        f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={num_units}, "
+        f"sum_product_layer={args.sum_product_layer}, region_graph={args.region_graph}"
+    )
     print_program_summary("direct XE program", program, inputs, shape_preview=args.shape_preview)
 
     final_program = program
@@ -971,6 +1001,7 @@ def main() -> None:
             preprocessed = preprocess_xe_program(
                 program,
                 optimize_stacking=not args.no_optimize_stacking,
+                fuse_logspace_outer_products=args.region_graph == "quad-graph",
             )
         except NameError as error:
             print()
