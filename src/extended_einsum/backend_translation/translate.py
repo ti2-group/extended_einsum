@@ -24,7 +24,7 @@ from extended_einsum.language.rich_operators import (
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import Shape
 from extended_einsum.shapes import infer_binary_shape
-from extended_einsum.utils import normalize_axis, parse_format_string
+from extended_einsum.utils import is_contraction_free_einsum, normalize_axis, parse_format_string
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
@@ -237,17 +237,44 @@ def _take_broadcast_scale(backend_functions: BackendFunctions[TBackendArray], ax
     return backend_functions.take(scale, indices, axis)
 
 
-def _append_rescaled_values(builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], scaled_pairs: list[tuple[int, int]]) -> tuple[list[int], int]:
+def _append_rescaled_values(
+    builder: _ProgramBuilder[TBackendArray],
+    backend_functions: BackendFunctions[TBackendArray],
+    scaled_pairs: list[tuple[int, int]],
+    scaled_shapes: list[Shape],
+    *,
+    reduce_scales_to_scalar: bool = False,
+) -> tuple[list[int], int, Shape]:
     """Brings scaled pairs to a common log scale, the maximum of their log scales, and returns the positions of the rescaled values and of the common log scale."""
 
-    stacked_scales_position = builder.append(partial(backend_functions.stack, axis=0), tuple(log_scale_position for _, log_scale_position in scaled_pairs))
-    common_scale_position = builder.wrap_and_append(backend_functions.max, (stacked_scales_position,))
+    if not scaled_pairs:
+        raise ValueError("At least one scaled pair is required")
+    if len(scaled_pairs) != len(scaled_shapes):
+        raise ValueError("Every scaled pair must have a scale shape")
+    scale_positions = [log_scale_position for _, log_scale_position in scaled_pairs]
+    if reduce_scales_to_scalar:
+        scale_positions = [builder.wrap_and_append(backend_functions.max, (scale_position,)) for scale_position in scale_positions]
+    common_scale_position = scale_positions[0]
+    common_scale_shape = () if reduce_scales_to_scalar else scaled_shapes[0]
+    for log_scale_position, scale_shape in zip(scale_positions[1:], scaled_shapes[1:], strict=True):
+        common_scale_position = builder.wrap_and_append(backend_functions.maximum, (common_scale_position, log_scale_position))
+        if not reduce_scales_to_scalar:
+            common_scale_shape = infer_binary_shape(common_scale_shape, scale_shape)
     rescaled_positions: list[int] = []
     for normalized_position, log_scale_position in scaled_pairs:
         shift_position = builder.wrap_and_append(backend_functions.subtract, (log_scale_position, common_scale_position))
         factor_position = builder.wrap_and_append(backend_functions.exp, (shift_position,))
         rescaled_positions.append(builder.wrap_and_append(backend_functions.multiply, (normalized_position, factor_position)))
-    return rescaled_positions, common_scale_position
+    return rescaled_positions, common_scale_position, common_scale_shape
+
+
+def _reshape_stack_scale(backend_functions: BackendFunctions[TBackendArray], axis: int, scale: TBackendArray) -> TBackendArray:
+    """Inserts the stack axis into a non-scalar broadcast scale."""
+
+    if not scale.shape:
+        return scale
+    normalized_axis = axis if axis >= 0 else axis + len(scale.shape) + 1
+    return backend_functions.reshape(scale, (*scale.shape[:normalized_axis], 1, *scale.shape[normalized_axis:]))
 
 
 def _append_scaled_einsum(
@@ -281,10 +308,12 @@ def _append_scaled_einsum(
 
         normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode)
         scale_shape = scale_shapes[argument_ssa_id]
-        scale_shape_is_known = len(value_shapes[argument_ssa_id]) == len(input_string)
+        value_shape_is_known = len(value_shapes[argument_ssa_id]) == len(input_string)
+        scale_shape_is_scalar = value_shape_is_known and not scale_shape
+        scale_shape_is_known = value_shape_is_known and (not scale_shape or len(scale_shape) == len(input_string))
         retained_labels = "".join(output_label for output_label in output_string if output_label in input_string)
         reduction_axes = tuple(axis for axis, input_label in enumerate(input_string) if input_label not in output_string)
-        if reduction_axes and (not scale_shape_is_known or any(scale_shape[axis] != 1 for axis in reduction_axes)):
+        if reduction_axes and not scale_shape_is_scalar and (not scale_shape_is_known or any(scale_shape[axis] != 1 for axis in reduction_axes)):
             common_scale_position = builder.wrap_and_append(partial(backend_functions.max, axis=reduction_axes, keepdims=True), (log_scale_position,))
             scale_delta_position = builder.wrap_and_append(backend_functions.subtract, (log_scale_position, common_scale_position))
             scale_factor_position = builder.wrap_and_append(backend_functions.exp, (scale_delta_position,))
@@ -296,15 +325,17 @@ def _append_scaled_einsum(
         einsum_argument_positions.append(normalized_position)
         shift_positions.append((common_scale_position, common_scale_shape, scale_shape_is_known, input_string, retained_labels))
 
-    is_elementwise = all(set(input_string) == set(output_string) for input_string in input_strings) and all(scale_shape_is_known for _, _, scale_shape_is_known, _, _ in shift_positions)
-    if is_elementwise:
+    # A contraction-free einsum only multiplies and broadcasts its operands.
+    # Keep the normalized tensors and their log scales separate instead of
+    # renormalizing a materialized Kronecker product.
+    if is_contraction_free_einsum(format_string) and all(scale_shape_is_known for _, _, scale_shape_is_known, _, _ in shift_positions):
         positions[result_ssa_id, "normalized"] = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
         result_scale_position: int | None = None
         result_scale_shape: Shape = ()
         for operand_scale_position, operand_scale_shape, _, input_string, _ in shift_positions:
             if operand_scale_shape and input_string != output_string:
-                operand_scale_position = builder.wrap_and_append(partial(backend_functions.einsum, f"{input_string}->{output_string}"), (operand_scale_position,))
-                operand_scale_shape = tuple(operand_scale_shape[input_string.index(output_label)] for output_label in output_string)
+                operand_scale_position = builder.wrap_and_append(partial(_broadcast_einsum_operand, backend_functions, input_string, output_string), (operand_scale_position,))
+                operand_scale_shape = tuple(operand_scale_shape[input_string.index(output_label)] if output_label in input_string else 1 for output_label in output_string)
             if result_scale_position is None:
                 result_scale_position = operand_scale_position
                 result_scale_shape = operand_scale_shape
@@ -312,7 +343,7 @@ def _append_scaled_einsum(
                 result_scale_position = builder.wrap_and_append(backend_functions.add, (result_scale_position, operand_scale_position))
                 result_scale_shape = infer_binary_shape(result_scale_shape, operand_scale_shape)
         if result_scale_position is None:
-            raise ValueError("An elementwise scaled einsum must have at least one non-parameter operand.")
+            raise ValueError("A contraction-free scaled einsum must have at least one non-parameter operand.")
         positions[result_ssa_id, "log_scale"] = result_scale_position
         scale_shapes[result_ssa_id] = result_scale_shape
         return
@@ -325,6 +356,7 @@ def _append_scaled_einsum(
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
     positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
     log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
+    result_scale_shape = _fiber_scale_shape(value_shapes[result_ssa_id])
     for operand_scale_position, operand_scale_shape, scale_shape_is_known, input_string, retained_labels in shift_positions:
         scale_already_broadcasts_to_output = scale_shape_is_known and len(operand_scale_shape) == len(output_string) and all(
             dimension == 1 or input_label == output_label for dimension, input_label, output_label in zip(operand_scale_shape, input_string, output_string, strict=True)
@@ -333,9 +365,12 @@ def _append_scaled_einsum(
             operand_scale_position = builder.wrap_and_append(partial(backend_functions.einsum, f"{input_string}->{retained_labels}"), (operand_scale_position,))
         if retained_labels and (not scale_shape_is_known or operand_scale_shape) and not scale_already_broadcasts_to_output:
             operand_scale_position = builder.wrap_and_append(partial(_reshape_einsum_shift, backend_functions, retained_labels, output_string), (operand_scale_position,))
+        if operand_scale_shape and not scale_already_broadcasts_to_output:
+            operand_scale_shape = tuple(operand_scale_shape[input_string.index(output_label)] if output_label in input_string else 1 for output_label in output_string) if retained_labels else ()
         log_scale_position = builder.wrap_and_append(backend_functions.add, (log_scale_position, operand_scale_position))
+        result_scale_shape = infer_binary_shape(result_scale_shape, operand_scale_shape)
     positions[result_ssa_id, "log_scale"] = log_scale_position
-    scale_shapes[result_ssa_id] = _fiber_scale_shape(value_shapes[result_ssa_id])
+    scale_shapes[result_ssa_id] = result_scale_shape
 
 
 def _append_scaled_instruction(
@@ -373,10 +408,12 @@ def _append_scaled_instruction(
             # n1 * e^s1 ± n2 * e^s2 = (n1 * e^(s1 - m) ± n2 * e^(s2 - m)) * e^m with m = max(s1, s2)
             combine = backend_functions.add if isinstance(instruction.operator, OperatorAdd) else backend_functions.subtract
             scaled_pairs = [_scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
-            rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
+            rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
+                builder, backend_functions, scaled_pairs, [scale_shapes[argument_ssa_id] for argument_ssa_id in argument_ssa_ids]
+            )
             positions[result_ssa_id, "normalized"] = builder.wrap_and_append(combine, tuple(rescaled_positions))
             positions[result_ssa_id, "log_scale"] = common_scale_position
-            scale_shapes[result_ssa_id] = ()
+            scale_shapes[result_ssa_id] = common_scale_shape
         case OperatorMultiply():
             # the normalized values multiply and the log scales add up
             (normalized_1, log_scale_1), (normalized_2, log_scale_2) = (
@@ -396,17 +433,26 @@ def _append_scaled_instruction(
         case OperatorStack(axis):
             # bring all operands to a common log scale, then stack the rescaled values
             scaled_pairs = [_scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
-            rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
+            rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
+                builder, backend_functions, scaled_pairs, [scale_shapes[argument_ssa_id] for argument_ssa_id in argument_ssa_ids]
+            )
             positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.stack, axis=axis), tuple(rescaled_positions))
-            positions[result_ssa_id, "log_scale"] = common_scale_position
-            scale_shapes[result_ssa_id] = ()
+            positions[result_ssa_id, "log_scale"] = builder.wrap_and_append(partial(_reshape_stack_scale, backend_functions, axis), (common_scale_position,))
+            normalized_axis = normalize_axis(axis, len(value_shapes[result_ssa_id])) if value_shapes[result_ssa_id] else 0
+            scale_shapes[result_ssa_id] = common_scale_shape if not common_scale_shape else (*common_scale_shape[:normalized_axis], 1, *common_scale_shape[normalized_axis:])
         case OperatorConcat(axis):
             # bring all operands to a common log scale, then concatenate the rescaled values
             scaled_pairs = [_scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
-            rescaled_positions, common_scale_position = _append_rescaled_values(builder, backend_functions, scaled_pairs)
+            rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
+                builder,
+                backend_functions,
+                scaled_pairs,
+                [scale_shapes[argument_ssa_id] for argument_ssa_id in argument_ssa_ids],
+                reduce_scales_to_scalar=True,
+            )
             positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(rescaled_positions))
             positions[result_ssa_id, "log_scale"] = common_scale_position
-            scale_shapes[result_ssa_id] = ()
+            scale_shapes[result_ssa_id] = common_scale_shape
         case OperatorTake(_):
             # The indices are integer positions and always used raw. Index a
             # broadcastable scale only when it varies along the selected axis.
@@ -540,6 +586,17 @@ def _reshape_einsum_shift(backend_functions: BackendFunctions[TBackendArray], re
     return backend_functions.reshape(shift, output_shape)
 
 
+def _broadcast_einsum_operand(backend_functions: BackendFunctions[TBackendArray], input_string: str, output_string: str, operand: TBackendArray) -> TBackendArray:
+    """Reorders and reshapes a contraction-free einsum operand for broadcasting over the output."""
+
+    retained_labels = "".join(output_label for output_label in output_string if output_label in input_string)
+    if input_string != retained_labels:
+        operand = backend_functions.einsum(f"{input_string}->{retained_labels}", operand)
+    retained_dimensions = iter(operand.shape)
+    output_shape = tuple(next(retained_dimensions) if output_label in retained_labels else 1 for output_label in output_string)
+    return backend_functions.reshape(operand, output_shape)
+
+
 def _append_logspace_einsum(
     builder: _ProgramBuilder[TBackendArray],
     backend_functions: BackendFunctions[TBackendArray],
@@ -557,14 +614,19 @@ def _append_logspace_einsum(
     if len(input_strings) != len(argument_ssa_ids):
         raise ValueError(f"The einsum format string has {len(input_strings)} inputs, but the instruction has {len(argument_ssa_ids)} arguments.")
 
-    # An einsum whose operands and output all have the same labels is an
-    # elementwise product. For non-parameter values that product is already
-    # represented exactly by addition in log space; routing it through the
-    # general shifted-einsum lowering adds many redundant tensor operations.
-    if all(input_string == output_string for input_string in input_strings) and all(argument_ssa_id not in parameter_derived_ssa_ids for argument_ssa_id in argument_ssa_ids):
+    # A contraction-free einsum is multiplication with broadcasting, which is
+    # addition with broadcasting in log space. This includes both Hadamard and
+    # Kronecker products and avoids an exp/einsum/log roundtrip.
+    if is_contraction_free_einsum(format_string) and all(argument_ssa_id not in parameter_derived_ssa_ids for argument_ssa_id in argument_ssa_ids):
         log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
-        result_position = log_argument_positions[0]
-        for log_argument_position in log_argument_positions[1:]:
+        broadcast_positions = [
+            log_argument_position
+            if input_string == output_string
+            else builder.wrap_and_append(partial(_broadcast_einsum_operand, backend_functions, input_string, output_string), (log_argument_position,))
+            for input_string, log_argument_position in zip(input_strings, log_argument_positions, strict=True)
+        ]
+        result_position = broadcast_positions[0]
+        for log_argument_position in broadcast_positions[1:]:
             result_position = builder.wrap_and_append(backend_functions.add, (result_position, log_argument_position))
         positions[result_ssa_id, "logspace"] = result_position
         return

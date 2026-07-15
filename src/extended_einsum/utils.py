@@ -30,6 +30,18 @@ def parse_format_string(format_string: str) -> tuple[list[str], str]:
     return index_strings, output_string
 
 
+def is_contraction_free_einsum(format_string: str) -> bool:
+    """Whether an einsum only broadcasts and multiplies operands without reducing labels."""
+
+    input_strings, output_string = parse_format_string(format_string)
+    output_labels = set(output_string)
+    return (
+        len(output_string) == len(output_labels)
+        and all(len(input_string) == len(set(input_string)) and set(input_string) <= output_labels for input_string in input_strings)
+        and set().union(*map(set, input_strings)) == output_labels
+    )
+
+
 def normalize_axis(axis: int, rank: int) -> int:
     if rank <= 0:
         raise ValueError("axis normalization requires a positive rank")

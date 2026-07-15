@@ -86,12 +86,16 @@ def to_xe_expression(symbolic_circuit, layer, data_by_scope):
             raise ValueError("Sum layers are expected to have exactly one child")
         child = child_nodes[0]
         child_indices = generate_symbols(len(child.shape))
-        weight_shape = child.shape[1:] + (layer.params["weight"].shape[0],)
-        weight_indices = generate_symbols(len(child.shape) + 1)[1:]
-        out_indices = child_indices[0] + weight_indices[-1]
+        output_units = layer.params["weight"].shape[0]
+        weight_shape = (output_units, *child.shape[1:])
+        output_unit_index = generate_symbols(len(child.shape) + 1)[-1]
+        weight_indices = output_unit_index + child_indices[1:]
+        out_indices = child_indices[0] + output_unit_index
         format_string = f"{child_indices},{weight_indices}->{out_indices}"
         weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
-        weights = xe.softmax(weight_logits, axis=0)
+        weight_input_axes = tuple(range(1, len(weight_shape)))
+        softmax_axis: int | tuple[int, ...] = weight_input_axes[0] if len(weight_input_axes) == 1 else weight_input_axes
+        weights = xe.softmax(weight_logits, axis=softmax_axis)
         return xe.einsum(format_string, child, weights)
 
     raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")

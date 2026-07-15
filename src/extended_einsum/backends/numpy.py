@@ -38,6 +38,11 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
+    def maximum(array_1: npt.NDArray, array_2: npt.NDArray) -> npt.NDArray:
+        return np.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
     def reshape(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
         return np.reshape(array, shape)
 
@@ -71,7 +76,7 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
-    def softmax(array: npt.NDArray, axis: int) -> npt.NDArray:
+    def softmax(array: npt.NDArray, axis: int | tuple[int, ...]) -> npt.NDArray:
         shifted = array - np.max(array, axis=axis, keepdims=True)
         exp_array = np.exp(shifted)
         return exp_array / np.sum(exp_array, axis=axis, keepdims=True)

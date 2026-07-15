@@ -49,6 +49,11 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
+    def maximum(array_1: torch.Tensor, array_2: torch.Tensor) -> torch.Tensor:
+        return torch.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
     def reshape(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
         return torch.reshape(array, shape)
 
@@ -82,8 +87,16 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
-    def softmax(array: torch.Tensor, axis: int) -> torch.Tensor:
-        return torch.softmax(array, dim=axis)
+    def softmax(array: torch.Tensor, axis: int | tuple[int, ...]) -> torch.Tensor:
+        if isinstance(axis, int):
+            return torch.softmax(array, dim=axis)
+        normalized_axes = tuple(item if item >= 0 else item + array.ndim for item in axis)
+        if normalized_axes == tuple(range(normalized_axes[0], array.ndim)):
+            flattened = torch.flatten(array, start_dim=normalized_axes[0])
+            return torch.softmax(flattened, dim=normalized_axes[0]).reshape(array.shape)
+        shifted = array - torch.amax(array, dim=axis, keepdim=True)
+        exp_array = torch.exp(shifted)
+        return exp_array / torch.sum(exp_array, dim=axis, keepdim=True)
 
     @override
     @staticmethod

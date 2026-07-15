@@ -45,7 +45,7 @@ def _exp_instruction(argument: int) -> RichInstruction:
     return RichInstruction(OperatorExp(), (argument,))
 
 
-def _softmax_instruction(argument: int, axis: int) -> RichInstruction:
+def _softmax_instruction(argument: int, axis: int | tuple[int, ...]) -> RichInstruction:
     return RichInstruction(OperatorSoftmax(axis), (argument,))
 
 
@@ -552,6 +552,29 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         self.assertEqual(folded.instructions[1].argument_ssa_ids, (2,))
         self.assertEqual(folded.shapes, [(2, 3), (2, 3), (2, 2, 3), (2, 2, 3), (2, 3), (2, 3), (2, 3)])
 
+    def test_folding_shifts_every_softmax_axis_past_batch_axis(self) -> None:
+        program = _program(
+            instructions=[
+                _softmax_instruction(0, axis=(1, 2)),
+                _softmax_instruction(1, axis=(1, 2)),
+                _add_instruction(2, 3),
+            ],
+            n_inputs=2,
+            shapes=[
+                (5, 3, 4),
+                (5, 3, 4),
+                (5, 3, 4),
+                (5, 3, 4),
+                (5, 3, 4),
+            ],
+            parameter_indices=frozenset({0, 1}),
+        )
+
+        folded = FoldSameShapedOperations.apply(program)
+
+        softmax = next(instruction.operator for instruction in folded.instructions if instruction.operator.name == "softmax")
+        self.assertEqual(softmax.axis, (2, 3))
+
     def test_uses_packed_parameter_input_instead_of_stack_instruction(self) -> None:
         program = _program(
             instructions=[
@@ -895,8 +918,71 @@ class EinsumLabelAllocationTests(unittest.TestCase):
         self.assertEqual(len(annotated_path), 1)
         self.assertIn("Ā", annotated_path[0][2])
 
+    def test_to_annotated_ssa_path_can_keep_final_output_labels_first(self) -> None:
+        annotated_path = to_annotated_ssa_path(
+            "foij,fbi,fbj->fbo",
+            [(0, 2), (1, 3)],
+            prioritize_output_labels=True,
+        )
+
+        self.assertEqual(
+            annotated_path,
+            [
+                (0, 2, "foij,fbj->fboi"),
+                (1, 3, "fbi,fboi->fbo"),
+            ],
+        )
+
 
 class OptimizeContractionPathsTests(unittest.TestCase):
+    def test_keeps_contraction_free_stable_product_outside_component(self) -> None:
+        for stability_mode in ("scaled_min", "scaled_sum", "logspace_min", "logspace_max"):
+            with self.subTest(stability_mode=stability_mode):
+                program = RichProgram(
+                    instructions=[
+                        _einsum_instruction("bi,bj->bij", 0, 1),
+                        _einsum_instruction("bij,oij->bo", 3, 2),
+                    ],
+                    n_inputs=3,
+                    stability_mode=stability_mode,
+                    shapes=[
+                        (5, 3),
+                        (5, 4),
+                        (2, 3, 4),
+                        (5, 3, 4),
+                        (5, 2),
+                    ],
+                    tensor_formats=["dense"] * 5,
+                    parameter_indices=frozenset({2}),
+                )
+
+                self.assertEqual(extract_connected_einsum_components(program), ())
+                self.assertEqual(OptimizeContractionPaths.apply(program), program)
+
+    def test_optionally_fuses_logspace_outer_product_with_reduction(self) -> None:
+        program = RichProgram(
+            instructions=[
+                _einsum_instruction("bi,bj->bij", 0, 1),
+                _einsum_instruction("bij,oij->bo", 3, 2),
+            ],
+            n_inputs=3,
+            stability_mode="logspace_max",
+            shapes=[(5, 3), (5, 4), (2, 3, 4), (5, 3, 4), (5, 2)],
+            tensor_formats=["dense"] * 5,
+            parameter_indices=frozenset({2}),
+        )
+
+        optimized = OptimizeContractionPaths.apply(program, fuse_logspace_outer_products=True)
+        left = torch.rand((5, 3)) + 0.5
+        right = torch.rand((5, 4)) + 0.5
+        weights = torch.rand((2, 3, 4)) + 0.5
+        backend_program = translate_to_backend_program(optimized, TorchBackendFunctions())
+        result = run_program(backend_program, [left, right, weights])
+
+        self.assertEqual(len(optimized.instructions), 1)
+        self.assertEqual(len(optimized.instructions[0].argument_ssa_ids), 3)
+        torch.testing.assert_close(result, torch.einsum("bi,bj,oij->bo", left, right, weights))
+
     def test_retries_until_path_does_not_increase_dag_depth(self) -> None:
         program = _program(
             instructions=[

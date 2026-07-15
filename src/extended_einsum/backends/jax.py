@@ -38,6 +38,11 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
+    def maximum(array_1: jax.Array, array_2: jax.Array) -> jax.Array:
+        return jnp.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
     def reshape(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
         return jnp.reshape(array, shape)
 
@@ -71,7 +76,7 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def softmax(array: jax.Array, axis: int) -> jax.Array:
+    def softmax(array: jax.Array, axis: int | tuple[int, ...]) -> jax.Array:
         return jax.nn.softmax(array, axis=axis)
 
     @override
