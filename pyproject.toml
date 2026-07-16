@@ -1,38 +1,70 @@
 [project]
 name = "extended-einsum"
 version = "0.1.0"
-description = "Engine for evaluating extended einsum expressions."
+description = "Build, optimize, and execute numerically stable extended Einstein summation expressions with PyTorch, NumPy, and optional JAX."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Christoph Staudt" },
+    { name = "Maurice Wenig" },
+]
+keywords = [
+    "einsum",
+    "machine-learning",
+    "probabilistic circuits",
+    "tensor",
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
-    "jax>=0.10.1",
     "numpy>=2.1.6",
-    "optax>=0.2.8",
-    "torch>=2.12.0",
     "sesum>=0.4.0",
-    "matplotlib>=3.10.9",
-    "networkx>=3.6.1",
-    "libcirkit>=0.2.1",
-    "seaborn>=0.13.2",
+    "torch>=2.12.0",
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.10.1", "jax-triton>=0.3.1"]
+jax = ["jax>=0.10.1"]
+jax-cuda = ["jax[cuda13]>=0.10.1"]
+visualization = [
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
+]
 
-[project.scripts]
-exteinsum = "extended_einsum:main"
+[project.urls]
+Homepage = "https://github.com/ti2-group/extended_einsum"
+Repository = "https://github.com/ti2-group/extended_einsum"
+Issues = "https://github.com/ti2-group/extended_einsum/issues"
+Changelog = "https://github.com/ti2-group/extended_einsum/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["uv_build>=0.10.11,<0.11.0"]
+requires = ["uv_build>=0.11.19,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+constraint-dependencies = [
+    "numpy>=2.3.0; python_version >= '3.14'",
+    "scipy>=1.17.0; python_version >= '3.14'",
+]
 
 [dependency-groups]
 demo = [
-    "einsum-benchmark>=0.1.7",
-    "ipykernel>=7.2.0",
-    "libcirkit>=0.2.1",
+    "libcirkit>=0.2.1; python_version < '3.14'",
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
     "pandas>=2.3.3",
-    "tabulate>=0.10.0",
+    "seaborn>=0.13.2",
     "torchvision>=0.27.0",
 ]
 dev = [
@@ -42,7 +74,7 @@ dev = [
 
 [tool.ruff]
 line-length = 200
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

@@ -2,7 +2,6 @@ import csv
 from collections import Counter
 
 import pytest
-
 from cirkit.symbolic.layers import SumLayer
 
 from demo.cirkit import append_row, make_symbolic_circuit, preprocess_xe_program, translate_cirkit_to_xe
