@@ -185,6 +185,9 @@ def _scaled_positions(
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_position,))
             case "scaled_sum":
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_position,))
+        # The norm only chooses a representation: its derivative cancels
+        # between raw / norm and log(norm) when the scaled pair is consumed.
+        total_position = builder.wrap_and_append(backend_functions.stop_gradient, (total_position,))
         positions[ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_position, total_position))
         positions[ssa_id, "log_scale"] = builder.wrap_and_append(backend_functions.log, (total_position,))
         scale_shapes[ssa_id] = _fiber_scale_shape(value_shapes[ssa_id])
@@ -260,6 +263,10 @@ def _append_rescaled_values(
         common_scale_position = builder.wrap_and_append(backend_functions.maximum, (common_scale_position, log_scale_position))
         if not reduce_scales_to_scalar:
             common_scale_shape = infer_binary_shape(common_scale_shape, scale_shape)
+    # The common scale is a numerical reference: it is subtracted before
+    # exponentiation and restored as the resulting scale. Its derivative
+    # therefore cancels exactly in the represented value.
+    common_scale_position = builder.wrap_and_append(backend_functions.stop_gradient, (common_scale_position,))
     rescaled_positions: list[int] = []
     for normalized_position, log_scale_position in scaled_pairs:
         shift_position = builder.wrap_and_append(backend_functions.subtract, (log_scale_position, common_scale_position))
@@ -315,6 +322,9 @@ def _append_scaled_einsum(
         reduction_axes = tuple(axis for axis, input_label in enumerate(input_string) if input_label not in output_string)
         if reduction_axes and not scale_shape_is_scalar and (not scale_shape_is_known or any(scale_shape[axis] != 1 for axis in reduction_axes)):
             common_scale_position = builder.wrap_and_append(partial(backend_functions.max, axis=reduction_axes, keepdims=True), (log_scale_position,))
+            # This reduction only selects a reference scale for a contraction;
+            # its derivative cancels between rescaling and scale restoration.
+            common_scale_position = builder.wrap_and_append(backend_functions.stop_gradient, (common_scale_position,))
             scale_delta_position = builder.wrap_and_append(backend_functions.subtract, (log_scale_position, common_scale_position))
             scale_factor_position = builder.wrap_and_append(backend_functions.exp, (scale_delta_position,))
             normalized_position = builder.wrap_and_append(backend_functions.multiply, (normalized_position, scale_factor_position))
@@ -354,6 +364,9 @@ def _append_scaled_einsum(
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_einsum_position,))
         case "scaled_sum":
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
+    # As above, this normalization is a gauge transformation, so propagating
+    # through the norm adds work without changing the represented derivative.
+    raw_norm_position = builder.wrap_and_append(backend_functions.stop_gradient, (raw_norm_position,))
     positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
     log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
     result_scale_shape = _fiber_scale_shape(value_shapes[result_ssa_id])
@@ -391,6 +404,8 @@ def _append_scaled_instruction(
             # (entries whose exponent is far below the maximum underflow to zero, the same tradeoff as in softmax)
             raw_position = _raw_position(builder, backend_functions, positions, argument_ssa_ids[0])
             log_scale_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_position,))
+            # exp(x - m) * exp(m) is independent of how m is selected.
+            log_scale_position = builder.wrap_and_append(backend_functions.stop_gradient, (log_scale_position,))
             shifted_position = builder.wrap_and_append(backend_functions.subtract, (raw_position, log_scale_position))
             positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.exp, (shifted_position,))
             positions[result_ssa_id, "log_scale"] = log_scale_position
@@ -441,18 +456,35 @@ def _append_scaled_instruction(
             normalized_axis = normalize_axis(axis, len(value_shapes[result_ssa_id])) if value_shapes[result_ssa_id] else 0
             scale_shapes[result_ssa_id] = common_scale_shape if not common_scale_shape else (*common_scale_shape[:normalized_axis], 1, *common_scale_shape[normalized_axis:])
         case OperatorConcat(axis):
-            # bring all operands to a common log scale, then concatenate the rescaled values
             scaled_pairs = [_scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
-            rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
-                builder,
-                backend_functions,
-                scaled_pairs,
-                [scale_shapes[argument_ssa_id] for argument_ssa_id in argument_ssa_ids],
-                reduce_scales_to_scalar=True,
-            )
-            positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(rescaled_positions))
-            positions[result_ssa_id, "log_scale"] = common_scale_position
-            scale_shapes[result_ssa_id] = common_scale_shape
+            normalized_axis = normalize_axis(axis, len(value_shapes[result_ssa_id]))
+            if normalized_axis == len(value_shapes[result_ssa_id]) - 1:
+                # Concatenating within a fiber requires one common scale for
+                # all of its segments.
+                rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
+                    builder,
+                    backend_functions,
+                    scaled_pairs,
+                    [scale_shapes[argument_ssa_id] for argument_ssa_id in argument_ssa_ids],
+                    reduce_scales_to_scalar=True,
+                )
+                positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(rescaled_positions))
+                positions[result_ssa_id, "log_scale"] = common_scale_position
+                scale_shapes[result_ssa_id] = common_scale_shape
+            else:
+                # Concatenation across fibers can preserve every operand's
+                # scale exactly. Reducing these to one scalar can underflow
+                # complete fibers before their next normalization.
+                normalized_positions = tuple(normalized_position for normalized_position, _ in scaled_pairs)
+                expanded_scale_positions: list[int] = []
+                for argument_ssa_id, (_, log_scale_position) in zip(argument_ssa_ids, scaled_pairs, strict=True):
+                    target_scale_shape = _fiber_scale_shape(value_shapes[argument_ssa_id])
+                    if scale_shapes[argument_ssa_id] != target_scale_shape:
+                        log_scale_position = builder.wrap_and_append(partial(backend_functions.broadcast_to, shape=target_scale_shape), (log_scale_position,))
+                    expanded_scale_positions.append(log_scale_position)
+                positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), normalized_positions)
+                positions[result_ssa_id, "log_scale"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(expanded_scale_positions))
+                scale_shapes[result_ssa_id] = _fiber_scale_shape(value_shapes[result_ssa_id])
         case OperatorTake(_):
             # The indices are integer positions and always used raw. Index a
             # broadcastable scale only when it varies along the selected axis.
@@ -572,6 +604,10 @@ def _append_shifted(
     # TODO: maybe don't stack and aggregate but just aggregate here? we may need to add another backend function for this
     stacked_maxima_position = builder.append(partial(backend_functions.stack, axis=0), norm_positions)
     shift_position = builder.wrap_and_append(norm_backend_function, (stacked_maxima_position,))
+    # The common shift is only a numerical reference. Its derivative cancels
+    # between exp(log_value - shift) and the final + shift, so detaching it
+    # preserves the represented derivative and avoids reduction backward work.
+    shift_position = builder.wrap_and_append(backend_functions.stop_gradient, (shift_position,))
     log_shifted_positions: list[int] = []
     for log_position in log_positions:
         log_shifted_positions.append(builder.wrap_and_append(backend_functions.subtract, (log_position, shift_position)))
@@ -647,6 +683,9 @@ def _append_logspace_einsum(
             shift_position = builder.wrap_and_append(partial(norm_backend_function, axis=reduction_axes, keepdims=True), (log_argument_position,))
         else:
             shift_position = builder.wrap_and_append(norm_backend_function, (log_argument_position,))
+        # As for log-addition above, this shift is a gauge choice whose
+        # derivative cancels exactly in the shifted einsum expression.
+        shift_position = builder.wrap_and_append(backend_functions.stop_gradient, (shift_position,))
         log_shifted_position = builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position))
         raw_argument_positions.append(builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)))
         shift_positions.append((shift_position, input_string, retained_labels))

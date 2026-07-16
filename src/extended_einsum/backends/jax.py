@@ -13,6 +13,11 @@ from extended_einsum.utils import normalize_axis
 class JaxBackendFunctions(BackendFunctions[jax.Array]):
     @override
     @staticmethod
+    def stop_gradient(array: jax.Array) -> jax.Array:
+        return jax.lax.stop_gradient(array)
+
+    @override
+    @staticmethod
     def exp(array: jax.Array) -> jax.Array:
         return jnp.exp(array)
 
@@ -45,6 +50,11 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
     @staticmethod
     def reshape(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
         return jnp.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        return jnp.broadcast_to(array, shape)
 
     @override
     @staticmethod

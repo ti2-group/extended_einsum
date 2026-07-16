@@ -1,8 +1,11 @@
+import csv
 from collections import Counter
+
+import pytest
 
 from cirkit.symbolic.layers import SumLayer
 
-from demo.cirkit import make_symbolic_circuit, preprocess_xe_program, translate_cirkit_to_xe
+from demo.cirkit import append_row, make_symbolic_circuit, preprocess_xe_program, translate_cirkit_to_xe
 
 
 def test_tucker_sum_weights_use_output_first_layout_and_normalize_all_inputs() -> None:
@@ -37,12 +40,48 @@ def test_quad_graph_preserves_shared_layers_and_compact_mixing_weights() -> None
     assert sum(instruction.operator.name == "stack" for instruction in program.instructions) == 5
 
 
-def test_quad_graph_tucker_preprocessing_opts_into_nary_fusion() -> None:
-    circuit = make_symbolic_circuit(width=4, height=4, num_units=3, sum_product_layer="tucker", region_graph="quad-graph")
-    program, _inputs = translate_cirkit_to_xe(circuit, batch_size=2, stability="logspace_max")
+@pytest.mark.parametrize("region_graph", ["quad-tree-2", "quad-graph"])
+@pytest.mark.parametrize("stability_mode", ["logspace_max", "scaled_sum"])
+def test_stable_tucker_preprocessing_uses_nary_fusion(
+    region_graph: str,
+    stability_mode: str,
+) -> None:
+    circuit = make_symbolic_circuit(width=4, height=4, num_units=3, sum_product_layer="tucker", region_graph=region_graph)
+    program, _inputs = translate_cirkit_to_xe(circuit, batch_size=2, stability=stability_mode)
 
-    default = preprocess_xe_program(program, optimize_stacking=True)
-    fused = preprocess_xe_program(program, optimize_stacking=True, fuse_logspace_outer_products=True)
+    fused = preprocess_xe_program(program, optimize_stacking=True)
 
-    assert all(instruction.operator.format_string.count(",") < 2 for instruction in default.instructions if instruction.operator.name == "einsum")
     assert any(instruction.operator.format_string.count(",") == 2 for instruction in fused.instructions if instruction.operator.name == "einsum")
+
+
+def test_new_benchmark_csv_records_reproducibility_fields(tmp_path) -> None:
+    output = tmp_path / "benchmark.csv"
+
+    append_row(
+        output,
+        {
+            "backend": "xe-quad-graph-lse-sum-torch-compile",
+            "backend_type": "xe",
+            "region_graph": "quad-graph",
+            "seed": 2,
+            "warmup_epochs": 5,
+        },
+    )
+
+    with output.open(newline="") as output_file:
+        row = next(csv.DictReader(output_file))
+    assert row["backend_type"] == "xe"
+    assert row["region_graph"] == "quad-graph"
+    assert row["seed"] == "2"
+    assert row["warmup_epochs"] == "5"
+
+
+def test_append_row_keeps_an_existing_legacy_csv_schema(tmp_path) -> None:
+    output = tmp_path / "legacy.csv"
+    output.write_text("backend,status\n")
+
+    append_row(output, {"backend": "xe-lse-sum", "status": "ok", "seed": 2})
+
+    with output.open(newline="") as output_file:
+        rows = list(csv.reader(output_file))
+    assert rows == [["backend", "status"], ["xe-lse-sum", "ok"]]

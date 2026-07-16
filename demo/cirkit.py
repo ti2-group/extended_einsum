@@ -87,6 +87,8 @@ CSV_FIELDS = (
     "memory_backend",
     "peak_memory_bytes",
     "peak_memory_mib",
+    "peak_reserved_memory_bytes",
+    "peak_reserved_memory_mib",
     "reserved_memory_bytes",
     "allocated_memory_bytes",
 )
@@ -212,13 +214,12 @@ def preprocess_xe_program(
     program: RichProgram,
     *,
     optimize_stacking: bool,
-    fuse_logspace_outer_products: bool = False,
 ) -> RichProgram:
     if not optimize_stacking:
         return program
 
     folded = FoldSameShapedOperations.apply(program)
-    return OptimizeContractionPaths.apply(folded, fuse_logspace_outer_products=fuse_logspace_outer_products)
+    return OptimizeContractionPaths.apply(folded)
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -341,11 +342,14 @@ def reset_peak_memory(device: torch.device) -> None:
 
 def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
     if device.type == "cuda":
-        peak = torch.cuda.max_memory_allocated(device)
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
         return {
             "memory_backend": "cuda",
-            "peak_memory_bytes": peak,
-            "peak_memory_mib": peak / 1024**2,
+            "peak_memory_bytes": peak_allocated,
+            "peak_memory_mib": peak_allocated / 1024**2,
+            "peak_reserved_memory_bytes": peak_reserved,
+            "peak_reserved_memory_mib": peak_reserved / 1024**2,
             "reserved_memory_bytes": torch.cuda.memory_reserved(device),
             "allocated_memory_bytes": torch.cuda.memory_allocated(device),
         }
@@ -355,6 +359,8 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
             "memory_backend": "mps_current",
             "peak_memory_bytes": "",
             "peak_memory_mib": "",
+            "peak_reserved_memory_bytes": "",
+            "peak_reserved_memory_mib": "",
             "reserved_memory_bytes": torch.mps.driver_allocated_memory(),
             "allocated_memory_bytes": allocated,
         }
@@ -362,6 +368,8 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
         "memory_backend": "unavailable",
         "peak_memory_bytes": "",
         "peak_memory_mib": "",
+        "peak_reserved_memory_bytes": "",
+        "peak_reserved_memory_mib": "",
         "reserved_memory_bytes": "",
         "allocated_memory_bytes": "",
     }
@@ -468,7 +476,7 @@ def setup_xe_training(
         stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
-    runtime_program = OptimizeContractionPaths.apply(folded.program, fuse_logspace_outer_products=region_graph == "quad-graph")
+    runtime_program = OptimizeContractionPaths.apply(folded.program)
     run = torch_program_runner(runtime_program, use_make_fx=use_torch_compile, device=device)
 
     num_variables = width * height
@@ -527,6 +535,11 @@ def setup_xe_training(
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         data_input = categorical_input(batch)
+        if use_torch_compile and semiring == "scaled-max":
+            # Keep Inductor from fusing categorical indexing/softmax backward
+            # into the much larger scaled-circuit backward graph.  Both sides
+            # of this boundary are still compiled independently.
+            torch._dynamo.graph_break()
         runtime_tensors: list[torch.Tensor] = [original_input_tensor(input_id, data_input) for input_id in retained_input_ids]
         runtime_tensors[data_input_id] = data_input
         runtime_tensors.extend(packed_parameter_inputs)
@@ -802,6 +815,10 @@ def run_training_config(
     args: argparse.Namespace,
     device: torch.device,
 ) -> list[dict]:
+    # Include model construction, compilation, and warmup in the VRAM high-water
+    # mark. Resetting after warmup would hide CUDA graph pools allocated during
+    # capture even though the run needs to keep that reservation.
+    reset_peak_memory(device)
     setup_fn = setup_cirkit_training if backend == "cirkit" else setup_xe_training
     setup_start = time.perf_counter()
     setup_kwargs = {
@@ -843,7 +860,6 @@ def run_training_config(
     )
 
     rows = []
-    reset_peak_memory(device)
     for epoch in range(args.epochs):
         stats = run_epoch(
             step,
@@ -1050,7 +1066,6 @@ def main() -> None:
             preprocessed = preprocess_xe_program(
                 program,
                 optimize_stacking=not args.no_optimize_stacking,
-                fuse_logspace_outer_products=args.region_graph == "quad-graph",
             )
         except NameError as error:
             print()

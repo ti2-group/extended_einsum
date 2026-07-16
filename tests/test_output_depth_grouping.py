@@ -935,7 +935,7 @@ class EinsumLabelAllocationTests(unittest.TestCase):
 
 
 class OptimizeContractionPathsTests(unittest.TestCase):
-    def test_keeps_contraction_free_stable_product_outside_component(self) -> None:
+    def test_fuses_stable_outer_product_with_reduction(self) -> None:
         for stability_mode in ("scaled_min", "scaled_sum", "logspace_min", "logspace_max"):
             with self.subTest(stability_mode=stability_mode):
                 program = RichProgram(
@@ -945,43 +945,21 @@ class OptimizeContractionPathsTests(unittest.TestCase):
                     ],
                     n_inputs=3,
                     stability_mode=stability_mode,
-                    shapes=[
-                        (5, 3),
-                        (5, 4),
-                        (2, 3, 4),
-                        (5, 3, 4),
-                        (5, 2),
-                    ],
+                    shapes=[(5, 3), (5, 4), (2, 3, 4), (5, 3, 4), (5, 2)],
                     tensor_formats=["dense"] * 5,
                     parameter_indices=frozenset({2}),
                 )
 
-                self.assertEqual(extract_connected_einsum_components(program), ())
-                self.assertEqual(OptimizeContractionPaths.apply(program), program)
+                optimized = OptimizeContractionPaths.apply(program)
+                left = torch.rand((5, 3)) + 0.5
+                right = torch.rand((5, 4)) + 0.5
+                weights = torch.rand((2, 3, 4)) + 0.5
+                backend_program = translate_to_backend_program(optimized, TorchBackendFunctions())
+                result = run_program(backend_program, [left, right, weights])
 
-    def test_optionally_fuses_logspace_outer_product_with_reduction(self) -> None:
-        program = RichProgram(
-            instructions=[
-                _einsum_instruction("bi,bj->bij", 0, 1),
-                _einsum_instruction("bij,oij->bo", 3, 2),
-            ],
-            n_inputs=3,
-            stability_mode="logspace_max",
-            shapes=[(5, 3), (5, 4), (2, 3, 4), (5, 3, 4), (5, 2)],
-            tensor_formats=["dense"] * 5,
-            parameter_indices=frozenset({2}),
-        )
-
-        optimized = OptimizeContractionPaths.apply(program, fuse_logspace_outer_products=True)
-        left = torch.rand((5, 3)) + 0.5
-        right = torch.rand((5, 4)) + 0.5
-        weights = torch.rand((2, 3, 4)) + 0.5
-        backend_program = translate_to_backend_program(optimized, TorchBackendFunctions())
-        result = run_program(backend_program, [left, right, weights])
-
-        self.assertEqual(len(optimized.instructions), 1)
-        self.assertEqual(len(optimized.instructions[0].argument_ssa_ids), 3)
-        torch.testing.assert_close(result, torch.einsum("bi,bj,oij->bo", left, right, weights))
+                self.assertEqual(len(optimized.instructions), 1)
+                self.assertEqual(len(optimized.instructions[0].argument_ssa_ids), 3)
+                torch.testing.assert_close(result, torch.einsum("bi,bj,oij->bo", left, right, weights))
 
     def test_retries_until_path_does_not_increase_dag_depth(self) -> None:
         program = _program(

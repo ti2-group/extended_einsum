@@ -12,6 +12,11 @@ from extended_einsum.utils import normalize_axis
 class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @override
     @staticmethod
+    def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+        return array.detach()
+
+    @override
+    @staticmethod
     def exp(array: torch.Tensor) -> torch.Tensor:
         return torch.exp(array)
 
@@ -32,11 +37,23 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @override
     @staticmethod
     def max(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
+        # Stable translations use maxima as numerical reference shifts.  The
+        # value-selecting max has the same forward result as amax but avoids
+        # its costly tie-distributing backward graph.
         if axis is None:
-            if keepdims:
-                return torch.amax(array, dim=tuple(range(array.ndim)), keepdim=True)
-            return torch.max(array)
-        return torch.amax(array, dim=axis, keepdim=keepdims)
+            if not array.ndim:
+                return array
+            result = torch.max(array.reshape(-1), dim=0).values
+            return result.reshape((1,) * array.ndim) if keepdims else result
+        axes = (axis,) if isinstance(axis, int) else axis
+        normalized_axes = tuple(item if item >= 0 else item + array.ndim for item in axes)
+        result = array
+        for reduction_axis in normalized_axes:
+            result = torch.max(result, dim=reduction_axis, keepdim=True).values
+        if not keepdims:
+            for reduction_axis in sorted(normalized_axes, reverse=True):
+                result = result.squeeze(reduction_axis)
+        return result
 
     @override
     @staticmethod
@@ -56,6 +73,11 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @staticmethod
     def reshape(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
         return torch.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.broadcast_to(array, shape)
 
     @override
     @staticmethod

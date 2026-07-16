@@ -630,8 +630,6 @@ def _is_outer_product_einsum(format_string: str) -> bool:
 
 def extract_connected_einsum_components(
     program: RichProgram,
-    *,
-    fuse_logspace_outer_products: bool = False,
 ) -> tuple[_ConnectedEinsumComponent, ...]:
     """Find einsum components by walking from the program output to its inputs."""
     components: list[_ConnectedEinsumComponent] = []
@@ -691,9 +689,8 @@ def extract_connected_einsum_components(
                 if argument_ssa_id >= program.n_inputs:
                     argument_instruction_index = argument_ssa_id - program.n_inputs
                     argument_operator = program.instructions[argument_instruction_index].operator
-                    fusable_logspace_outer_product = (
-                        fuse_logspace_outer_products
-                        and program.stability_mode in {"logspace_min", "logspace_max"}
+                    fusable_stable_outer_product = (
+                        program.stability_mode != "unstable"
                         and isinstance(argument_operator, OperatorEinsum)
                         and _is_outer_product_einsum(argument_operator.format_string)
                     )
@@ -701,12 +698,12 @@ def extract_connected_einsum_components(
                         program.stability_mode != "unstable"
                         and isinstance(argument_operator, OperatorEinsum)
                         and is_contraction_free_einsum(argument_operator.format_string)
-                        and not fusable_logspace_outer_product
+                        and not fusable_stable_outer_product
                     )
                     # A uniquely consumed einsum producer belongs to this component.
-                    # Stable contraction-free products are boundaries: logspace
-                    # lowers them to additions, while scaled mode benchmarks faster
-                    # when the product is kept separate from its later reduction.
+                    # Stable contraction-free products are boundaries unless
+                    # they are outer products that can be fused with their
+                    # later reduction.
                     if (
                         isinstance(argument_operator, OperatorEinsum)
                         and len(program.consumers_of_ssa_id[argument_ssa_id]) == 1
@@ -735,34 +732,30 @@ def extract_connected_einsum_components(
 class OptimizeContractionPaths(PreprocessingRoutine):
     @override
     @staticmethod
-    def apply(program: RichProgram, *, fuse_logspace_outer_products: bool = False) -> RichProgram:
+    def apply(program: RichProgram) -> RichProgram:
         # Compute a replacement contraction path for each extracted component.
         result_depths = _ssa_depths_from_inputs(program)
         blocks: dict[
             int,
             tuple[frozenset[int], tuple[int, ...], tuple[RichInstruction, ...]],
         ] = {}
-        for component in extract_connected_einsum_components(program, fuse_logspace_outer_products=fuse_logspace_outer_products):
+        for component in extract_connected_einsum_components(program):
             if len(component.boundary_arguments) < 2:
                 continue
 
-            fuse_logspace_outer_product = (
-                fuse_logspace_outer_products
-                and program.stability_mode in {"logspace_min", "logspace_max"}
-                and any(
-                    isinstance(program.instructions[op_index].operator, OperatorEinsum)
-                    and _is_outer_product_einsum(program.instructions[op_index].operator.format_string)
-                    for op_index in component.op_indices
-                )
+            fuse_stable_outer_product = program.stability_mode != "unstable" and any(
+                isinstance(program.instructions[op_index].operator, OperatorEinsum)
+                and _is_outer_product_einsum(program.instructions[op_index].operator.format_string)
+                for op_index in component.op_indices
             )
-            if fuse_logspace_outer_product and len(component.op_indices) == 2:
+            if fuse_stable_outer_product and len(component.op_indices) == 2:
                 planned_instructions = (
                     RichInstruction(
                         operator=OperatorEinsum(component.format_string),
                         argument_ssa_ids=tuple(range(len(component.boundary_arguments))),
                     ),
                 )
-            elif fuse_logspace_outer_product:
+            elif fuse_stable_outer_product:
                 # Keep larger connected subgraphs unchanged. Fusing an entire
                 # hierarchy would create a high-arity einsum instead of one
                 # Tucker kernel per outer-product/reduction pair.

@@ -13,6 +13,11 @@ from extended_einsum.utils import normalize_axis
 class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
     @override
     @staticmethod
+    def stop_gradient(array: npt.NDArray) -> npt.NDArray:
+        return array
+
+    @override
+    @staticmethod
     def exp(array: npt.NDArray) -> npt.NDArray:
         return np.exp(array)
 
@@ -45,6 +50,11 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
     @staticmethod
     def reshape(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
         return np.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
+        return np.broadcast_to(array, shape)
 
     @override
     @staticmethod

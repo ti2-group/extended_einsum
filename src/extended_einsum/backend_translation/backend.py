@@ -19,6 +19,9 @@ TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
 class BackendFunctions(Protocol[TBackendArray]):
     @staticmethod
+    def stop_gradient(array: TBackendArray) -> TBackendArray: ...
+
+    @staticmethod
     def exp(array: TBackendArray) -> TBackendArray: ...
 
     @staticmethod
@@ -38,6 +41,9 @@ class BackendFunctions(Protocol[TBackendArray]):
 
     @staticmethod
     def reshape(array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
+
+    @staticmethod
+    def broadcast_to(array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
 
     @staticmethod
     def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
