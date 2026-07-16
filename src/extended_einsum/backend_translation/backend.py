@@ -2,7 +2,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable, Generic, Protocol, TypeVar
 
-import jax
 import numpy as np
 import torch
 
@@ -99,7 +98,13 @@ def get_backend_of_array(array: HasShape) -> Backend:
         return "torch"
     elif isinstance(array, np.ndarray):
         return "numpy"
-    elif isinstance(array, jax.Array):
+
+    try:
+        import jax
+    except ModuleNotFoundError:
+        jax = None  # type: ignore[assignment]
+
+    if jax is not None and isinstance(array, jax.Array):
         return "jax"
-    else:
-        raise ValueError(f"Unsupported array type: {type(array)}")
+
+    raise ValueError(f"Unsupported array type: {type(array)}")

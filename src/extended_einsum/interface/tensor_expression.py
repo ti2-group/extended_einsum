@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Generic, cast, override
 
 from extended_einsum.backend_translation import BackendCompiler, BackendProgram, translate_to_backend_program
-from extended_einsum.backends.registry import BACKEND_TO_COMPILER, BACKEND_TO_FUNCTIONS
+from extended_einsum.backends.registry import get_backend_compiler, get_backend_functions
 from extended_einsum.language.rich_instruction import map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
@@ -103,11 +103,12 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
 
     def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
         self._rich_program, self._input_arguments = extract_program(self, stability_mode)
-        backend_functions = BACKEND_TO_FUNCTIONS[self.backend]
+        backend_functions = get_backend_functions(self.backend)
         self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
-        compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
-        self._backend_code = compiler.compile(self._backend_program, self._input_arguments)
-        backend_array = self._backend_code([argument.backend_array for argument in self._input_arguments])
+        compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
+        backend_inputs = [argument.backend_array for argument in self._input_arguments]
+        self._backend_code = compiler.compile(self._backend_program, backend_inputs)
+        backend_array = self._backend_code(backend_inputs)
 
         # Import locally to avoid the module cycle between the expression and
         # public interface-function modules.

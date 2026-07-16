@@ -1,4 +1,12 @@
 __pycache__
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+examples/*.png
 
 # environment stuff
 .autoenv
