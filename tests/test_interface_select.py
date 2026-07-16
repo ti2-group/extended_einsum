@@ -13,7 +13,7 @@ class SelectInterfaceTests(unittest.TestCase):
 
         self.assertEqual(selected.shape, (3, 4))
         torch.testing.assert_close(
-            selected.materialize(stability_mode="none").backend_array,
+            selected.materialize(stability_mode="unstable").backend_array,
             source.backend_array[1],
         )
 
@@ -24,7 +24,7 @@ class SelectInterfaceTests(unittest.TestCase):
 
         self.assertEqual(selected.shape, (2, 4))
         torch.testing.assert_close(
-            selected.materialize(stability_mode="none").backend_array,
+            selected.materialize(stability_mode="unstable").backend_array,
             source.backend_array[:, 2],
         )
 

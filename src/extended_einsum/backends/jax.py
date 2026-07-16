@@ -13,6 +13,11 @@ from extended_einsum.utils import normalize_axis
 class JaxBackendFunctions(BackendFunctions[jax.Array]):
     @override
     @staticmethod
+    def stop_gradient(array: jax.Array) -> jax.Array:
+        return jax.lax.stop_gradient(array)
+
+    @override
+    @staticmethod
     def exp(array: jax.Array) -> jax.Array:
         return jnp.exp(array)
 
@@ -23,23 +28,43 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def sum(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.sum(array, axis=axis)
+    def sum(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.sum(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def max(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.max(array, axis=axis)
+    def max(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.max(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def min(array: jax.Array, axis: int | None = None) -> jax.Array:
-        return jnp.min(array, axis=axis)
+    def min(array: jax.Array, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> jax.Array:
+        return jnp.min(array, axis=axis, keepdims=keepdims)
+
+    @override
+    @staticmethod
+    def maximum(array_1: jax.Array, array_2: jax.Array) -> jax.Array:
+        return jnp.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
+    def reshape(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        return jnp.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        return jnp.broadcast_to(array, shape)
 
     @override
     @staticmethod
     def stack(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
         return jnp.stack(list(arrays), axis=axis)
+
+    @override
+    @staticmethod
+    def concat(arrays: Sequence[jax.Array], axis: int) -> jax.Array:
+        return jnp.concatenate(list(arrays), axis=axis)
 
     @override
     @staticmethod
@@ -61,7 +86,7 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
 
     @override
     @staticmethod
-    def softmax(array: jax.Array, axis: int) -> jax.Array:
+    def softmax(array: jax.Array, axis: int | tuple[int, ...]) -> jax.Array:
         return jax.nn.softmax(array, axis=axis)
 
     @override

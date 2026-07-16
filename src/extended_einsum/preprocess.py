@@ -21,7 +21,7 @@ from extended_einsum.shapes import (
     Shape,
     infer_einsum_shape,
 )
-from extended_einsum.utils import parse_format_string
+from extended_einsum.utils import is_contraction_free_einsum, parse_format_string
 
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _COMMUTATIVE_OPERATORS = frozenset({"+", "*"})
@@ -620,6 +620,14 @@ class _ConnectedEinsumComponent:
     format_string: str
 
 
+def _is_outer_product_einsum(format_string: str) -> bool:
+    """Whether a contraction-free einsum expands at least one operand with new output axes."""
+
+    input_strings, output_string = parse_format_string(format_string)
+    output_labels = set(output_string)
+    return is_contraction_free_einsum(format_string) and any(set(input_string) != output_labels for input_string in input_strings)
+
+
 def extract_connected_einsum_components(
     program: RichProgram,
 ) -> tuple[_ConnectedEinsumComponent, ...]:
@@ -680,14 +688,26 @@ def extract_connected_einsum_components(
 
                 if argument_ssa_id >= program.n_inputs:
                     argument_instruction_index = argument_ssa_id - program.n_inputs
+                    argument_operator = program.instructions[argument_instruction_index].operator
+                    fusable_stable_outer_product = (
+                        program.stability_mode != "unstable"
+                        and isinstance(argument_operator, OperatorEinsum)
+                        and _is_outer_product_einsum(argument_operator.format_string)
+                    )
+                    cheap_stable_product = (
+                        program.stability_mode != "unstable"
+                        and isinstance(argument_operator, OperatorEinsum)
+                        and is_contraction_free_einsum(argument_operator.format_string)
+                        and not fusable_stable_outer_product
+                    )
                     # A uniquely consumed einsum producer belongs to this component.
-                    # Everything else is a boundary input and a new traversal root.
+                    # Stable contraction-free products are boundaries unless
+                    # they are outer products that can be fused with their
+                    # later reduction.
                     if (
-                        isinstance(
-                            program.instructions[argument_instruction_index].operator,
-                            OperatorEinsum,
-                        )
+                        isinstance(argument_operator, OperatorEinsum)
                         and len(program.consumers_of_ssa_id[argument_ssa_id]) == 1
+                        and not cheap_stable_product
                     ):
                         pending_einsum_instructions.append((argument_instruction_index, relabeled_input))
                         continue
@@ -723,16 +743,34 @@ class OptimizeContractionPaths(PreprocessingRoutine):
             if len(component.boundary_arguments) < 2:
                 continue
 
-            boundary_shapes = tuple(program.shapes[argument] for argument in component.boundary_arguments)
-
-            planned_instructions = _compute_depth_preserving_contraction_plan(
-                component,
-                boundary_shapes,
-                result_depths,
-                program.n_inputs,
+            fuse_stable_outer_product = program.stability_mode != "unstable" and any(
+                isinstance(program.instructions[op_index].operator, OperatorEinsum)
+                and _is_outer_product_einsum(program.instructions[op_index].operator.format_string)
+                for op_index in component.op_indices
             )
-            if planned_instructions is None:
+            if fuse_stable_outer_product and len(component.op_indices) == 2:
+                planned_instructions = (
+                    RichInstruction(
+                        operator=OperatorEinsum(component.format_string),
+                        argument_ssa_ids=tuple(range(len(component.boundary_arguments))),
+                    ),
+                )
+            elif fuse_stable_outer_product:
+                # Keep larger connected subgraphs unchanged. Fusing an entire
+                # hierarchy would create a high-arity einsum instead of one
+                # Tucker kernel per outer-product/reduction pair.
                 continue
+            else:
+                boundary_shapes = tuple(program.shapes[argument] for argument in component.boundary_arguments)
+                planned_instructions = _compute_depth_preserving_contraction_plan(
+                    component,
+                    boundary_shapes,
+                    result_depths,
+                    program.n_inputs,
+                    prioritize_output_labels=program.stability_mode in {"scaled_min", "scaled_sum"},
+                )
+                if planned_instructions is None:
+                    continue
 
             blocks[component.sink_op_index] = (
                 component.op_indices,
@@ -819,6 +857,8 @@ def _compute_depth_preserving_contraction_plan(
     boundary_shapes: tuple[Shape, ...],
     result_depths: dict[int, int],
     n_inputs: int,
+    *,
+    prioritize_output_labels: bool = False,
 ) -> tuple[RichInstruction, ...] | None:
     from sesum import sr
 
@@ -843,6 +883,7 @@ def _compute_depth_preserving_contraction_plan(
                     component.format_string,
                     path,
                     prefer_ascii=True,
+                    prioritize_output_labels=prioritize_output_labels,
                 )
             )
         except (RuntimeError, ValueError):
@@ -2206,7 +2247,9 @@ def _make_batched_operator(operator: RichOperator) -> RichOperator:
         case OperatorSelect(axis, index):
             return OperatorSelect(axis + 1, index)
         case OperatorSoftmax(axis):
-            return OperatorSoftmax(axis + 1)
+            if isinstance(axis, int):
+                return OperatorSoftmax(axis + 1)
+            return OperatorSoftmax(tuple(item + 1 for item in axis))
         case _:
             return operator
 
@@ -2278,6 +2321,8 @@ def to_annotated_ssa_path(
     format_string: str,
     ssa_path: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     prefer_ascii: bool = False,
+    *,
+    prioritize_output_labels: bool = False,
 ) -> list[tuple[int, int, str]]:
     """Annotate an SSA path with the pairwise einsum string for each step."""
     inputs, output = format_string.replace(" ", "").split("->")
@@ -2304,6 +2349,9 @@ def to_annotated_ssa_path(
             t3 = output
         else:
             t3 = "".join(char for char in unique_indices if histogram[char] > 0)
+            if prioritize_output_labels:
+                output_prefix = "".join(char for char in output if char in t3)
+                t3 = output_prefix + "".join(char for char in t3 if char not in output_prefix)
             for char in t3:
                 histogram[char] += 1
 

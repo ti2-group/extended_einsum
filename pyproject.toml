@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib>=3.10.9",
     "networkx>=3.6.1",
     "libcirkit>=0.2.1",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]

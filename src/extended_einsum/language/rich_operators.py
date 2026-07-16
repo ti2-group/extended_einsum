@@ -347,7 +347,7 @@ class OperatorSelect(RichOperator):
 
 @dataclass(frozen=True)
 class OperatorSoftmax(RichOperator):
-    axis: int
+    axis: int | tuple[int, ...]
 
     @property
     @override
@@ -365,8 +365,13 @@ class OperatorSoftmax(RichOperator):
             raise ValueError(f"The softmax operator takes exactly one argument, but {len(operands)} were given.")
         if len(operands[0].shape) == 0:
             raise ValueError(f"The softmax operator takes a non-scalar as first arguments, but the first argument has shape {operands[0].shape}.")
-        if not 0 <= self.axis < len(operands[0].shape):
-            raise ValueError(f"The softmax operator wants to softmax axis {self.axis} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}.")
+        axes = (self.axis,) if isinstance(self.axis, int) else self.axis
+        if not axes:
+            raise ValueError("The softmax operator requires at least one axis.")
+        if len(set(axes)) != len(axes):
+            raise ValueError(f"The softmax operator axes must be unique, got {axes}.")
+        if any(not 0 <= axis < len(operands[0].shape) for axis in axes):
+            raise ValueError(f"The softmax operator wants to softmax axes {axes} but the operand only has {len(operands[0].shape)} axes. Bounds are 0 <= axis < {len(operands[0].shape)}.")
 
     @override
     def propagate_shapes(self, input_shapes: list[Shape]) -> Shape:
@@ -422,7 +427,11 @@ def _get_axis_sizes(index_strings: list[str], tensor_shapes: list[Shape]) -> dic
                 axis_sizes[index] = tensor_shape[index_string.index(index)]
                 size_sources[index] = i
             elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
+                current_size = tensor_shape[index_string.index(index)]
+                previous_source = size_sources[index]
                 raise RuntimeError(
-                    f"Incompatible axis sizes for index {index}: argument {i} says {tensor_shape[index_string.index(index)]} ({index_string} and {tensor_shape}) but tensor {size_sources[index]} says {axis_sizes[index]} ({tensor_shapes[size_sources[index]]} and {index_strings[size_sources[index]]})."
+                    f"Incompatible axis sizes for index {index}: argument {i} says {current_size} "
+                    f"({index_string} and {tensor_shape}) but tensor {previous_source} says {axis_sizes[index]} "
+                    f"({tensor_shapes[previous_source]} and {index_strings[previous_source]})."
                 )
     return axis_sizes

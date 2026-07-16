@@ -1,13 +1,16 @@
 import numpy as np
 import numpy.typing as npt
 import pytest
+import torch
 
 from extended_einsum.backend_translation.runtime import run_program
 from extended_einsum.backend_translation.translate import translate_to_backend_program
 from extended_einsum.backends.numpy import NumpyBackendFunctions
+from extended_einsum.backends.torch import TorchBackendFunctions
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
+    OperatorConcat,
     OperatorDivide,
     OperatorEinsum,
     OperatorExp,
@@ -23,20 +26,26 @@ from extended_einsum.language.rich_operators import (
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichProgram
-from extended_einsum.language.types import StabilityMode
+from extended_einsum.language.types import Shape, StabilityMode
 
 BACKEND_FUNCTIONS = NumpyBackendFunctions()
 
 
-def _dense_program(instructions: list[RichInstruction], n_inputs: int, stability_mode: StabilityMode = "unstable") -> RichProgram:
+def _dense_program(
+    instructions: list[RichInstruction],
+    n_inputs: int,
+    stability_mode: StabilityMode = "unstable",
+    parameter_indices: frozenset[int] = frozenset(),
+    shapes: list[Shape] | None = None,
+) -> RichProgram:
     n_ssa_ids = n_inputs + len(instructions)
     return RichProgram(
         instructions=instructions,
         n_inputs=n_inputs,
         stability_mode=stability_mode,
         tensor_formats=["dense"] * n_ssa_ids,
-        shapes=[()] * n_ssa_ids,
-        parameter_indices=frozenset(),
+        shapes=[()] * n_ssa_ids if shapes is None else shapes,
+        parameter_indices=parameter_indices,
     )
 
 
@@ -59,6 +68,9 @@ OTHER_POSITIVE_MATRIX = np.abs(_RNG.standard_normal((3, 4))) + 0.5
 POSITIVE_RIGHT_MATRIX = np.abs(_RNG.standard_normal((4, 5))) + 0.5
 RIGHT_MATRIX = _RNG.standard_normal((4, 5))
 INDICES = np.array([2, 0, 3])
+TENSOR = _RNG.standard_normal((2, 3, 4))
+MULTI_AXIS_SOFTMAX = np.exp(TENSOR - np.max(TENSOR, axis=(1, 2), keepdims=True))
+MULTI_AXIS_SOFTMAX /= np.sum(MULTI_AXIS_SOFTMAX, axis=(1, 2), keepdims=True)
 
 
 ################################
@@ -78,6 +90,7 @@ UNSTABLE_TRANSLATION_CASES: list[tuple[RichOperator, list[npt.NDArray], npt.NDAr
     (OperatorSelect(axis=0, index=1), [MATRIX], MATRIX[1]),
     (OperatorSlice(start=1, stop=3, axis=1), [MATRIX], MATRIX[:, 1:3]),
     (OperatorSoftmax(axis=1), [MATRIX], np.exp(MATRIX) / np.sum(np.exp(MATRIX), axis=1, keepdims=True)),
+    (OperatorSoftmax(axis=(1, 2)), [TENSOR], MULTI_AXIS_SOFTMAX),
     (OperatorEinsum("ik, kj -> ij"), [MATRIX, RIGHT_MATRIX], MATRIX @ RIGHT_MATRIX),
 ]
 UNSTABLE_TRANSLATION_CASE_IDS = [operator.name for operator, _, _ in UNSTABLE_TRANSLATION_CASES]
@@ -145,6 +158,7 @@ STABLE_TRANSLATION_CASES: list[tuple[str, RichOperator, list[npt.NDArray], npt.N
     ("select", OperatorSelect(axis=0, index=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[1]),
     ("slice", OperatorSlice(start=1, stop=3, axis=1), [POSITIVE_MATRIX], POSITIVE_MATRIX[:, 1:3]),
     ("softmax", OperatorSoftmax(axis=1), [MATRIX], np.exp(MATRIX) / np.sum(np.exp(MATRIX), axis=1, keepdims=True)),
+    ("multi-axis-softmax", OperatorSoftmax(axis=(1, 2)), [TENSOR], MULTI_AXIS_SOFTMAX),
     ("einsum-matmul", OperatorEinsum("ik, kj -> ij"), [POSITIVE_MATRIX, POSITIVE_RIGHT_MATRIX], POSITIVE_MATRIX @ POSITIVE_RIGHT_MATRIX),
     ("einsum-total-sum", OperatorEinsum("ik ->"), [POSITIVE_MATRIX], np.sum(POSITIVE_MATRIX)),
 ]
@@ -192,8 +206,8 @@ def test_scaled_translation_scales_each_value_at_most_once(stability_mode: Stabi
     backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
     result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
 
-    # scaling the two inputs (3 calls each), two multiplications (2 calls each), and the raw conversion of the output (2 calls)
-    assert len(backend_program.backend_calls) == 12
+    # scaling the two inputs (4 calls each), two multiplications (2 calls each), and the raw conversion of the output (2 calls)
+    assert len(backend_program.backend_calls) == 14
     np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
 
 
@@ -216,6 +230,205 @@ def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials(sta
 
     assert np.all(np.isfinite(result))
     np.testing.assert_allclose(result, huge_matrix, rtol=1e-9)
+
+
+def test_scaled_sum_einsum_keeps_parameter_weights_linear_and_scales_each_data_row() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("bi,io->bo"), (2, 1)),  # ssa id 3
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        parameter_indices=frozenset({1}),
+        shapes=[(2, 2)] * 5,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    assert np.all(np.isfinite(result))
+    assert len(backend_program.backend_calls) == 12
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_scaled_sum_preserves_folded_and_batch_scales_through_slicing() -> None:
+    log_values = np.array(
+        [
+            [[0.0, -1.0], [-1000.0, -1001.0]],
+            [[-10.0, -11.0], [-1010.0, -1011.0]],
+            [[-20.0, -21.0], [-1020.0, -1021.0]],
+            [[-30.0, -31.0], [-1030.0, -1031.0]],
+        ]
+    )
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorSlice(start=1, stop=3, axis=0), (2,)),  # ssa id 3
+            RichInstruction(OperatorEinsum("fbi,io->fbo"), (3, 1)),  # ssa id 4
+            RichInstruction(OperatorLog(), (4,)),  # ssa id 5
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        parameter_indices=frozenset({1}),
+        shapes=[(4, 2, 2), (2, 2), (4, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    sliced_values = log_values[1:3]
+    fiber_maxima = np.max(sliced_values, axis=-1, keepdims=True)
+    expected_result = fiber_maxima + np.log(np.einsum("fbi,io->fbo", np.exp(sliced_values - fiber_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_scaled_sum_elementwise_einsum_propagates_scales_directly() -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("ij,ij->ij"), (0, 1)),  # ssa id 2
+            RichInstruction(OperatorLog(), (2,)),  # ssa id 3
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        shapes=[(3, 4)] * 4,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
+
+    # Normalize each input once, then use one einsum and one scale addition;
+    # no output renormalization or scale reshaping is necessary.
+    assert len(backend_program.backend_calls) == 12
+    np.testing.assert_allclose(result, np.log(POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX), rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_kronecker_einsum_broadcasts_scales_without_renormalizing(stability_mode: StabilityMode) -> None:
+    left = POSITIVE_MATRIX[:, :2]
+    right = OTHER_POSITIVE_MATRIX[:, :3]
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("bi,bj->bij"), (0, 1)),
+            RichInstruction(OperatorLog(), (2,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+        shapes=[left.shape, right.shape, (3, 2, 3), (3, 2, 3)],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [left, right])
+
+    # Normalize both operands, multiply them, broadcast their two scales, and
+    # consume the scaled result directly in log form.
+    assert len(backend_program.backend_calls) == 14
+    np.testing.assert_allclose(result, np.log(left[:, :, None] * right[:, None, :]), rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_concat_preserves_independent_fiber_scales(stability_mode: StabilityMode) -> None:
+    large = np.full((2, 3), 1.0e300)
+    small = np.full((1, 3), 1.0e-300)
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorConcat(axis=0), (0, 1)),
+            RichInstruction(OperatorLog(), (2,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+        shapes=[large.shape, small.shape, (3, 3), (3, 3)],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [large, small])
+
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, np.log(np.concatenate((large, small), axis=0)), rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_concat_preserves_gradients(stability_mode: StabilityMode) -> None:
+    input_values = [POSITIVE_MATRIX[:2, :3], 1.0e3 * OTHER_POSITIVE_MATRIX[:1, :3]]
+    instructions = [
+        RichInstruction(OperatorConcat(axis=0), (0, 1)),
+        RichInstruction(OperatorEinsum("ij->"), (2,)),
+    ]
+    shapes = [(2, 3), (1, 3), (3, 3), ()]
+
+    def gradients(mode: StabilityMode) -> tuple[torch.Tensor, ...]:
+        inputs = [torch.tensor(value, dtype=torch.float64, requires_grad=True) for value in input_values]
+        rich_program = _dense_program(instructions, n_inputs=2, stability_mode=mode, shapes=shapes)
+        result = run_program(translate_to_backend_program(rich_program, TorchBackendFunctions()), inputs)
+        return torch.autograd.grad(result, inputs)
+
+    baseline_gradients = gradients("unstable")
+    scaled_gradients = gradients(stability_mode)
+    for gradient, baseline_gradient in zip(scaled_gradients, baseline_gradients, strict=True):
+        torch.testing.assert_close(gradient, baseline_gradient)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_reassociated_tucker_contractions_track_non_fiber_scale_shape(stability_mode: StabilityMode) -> None:
+    data_left = np.abs(_RNG.standard_normal((2, 5, 3))) + 0.5
+    data_right = np.abs(_RNG.standard_normal((2, 5, 4))) + 0.5
+    weights = np.abs(_RNG.standard_normal((2, 6, 3, 4))) + 0.5
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("abcd,aed->abce"), (2, 1)),
+            RichInstruction(OperatorEinsum("abc,adcb->abd"), (0, 3)),
+            RichInstruction(OperatorLog(), (4,)),
+        ],
+        n_inputs=3,
+        stability_mode=stability_mode,
+        parameter_indices=frozenset({2}),
+        shapes=[
+            data_left.shape,
+            data_right.shape,
+            weights.shape,
+            (2, 6, 3, 5),
+            (2, 5, 6),
+            (2, 5, 6),
+        ],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [data_left, data_right, weights])
+
+    intermediate = np.einsum("abcd,aed->abce", weights, data_right)
+    expected = np.log(np.einsum("abc,adcb->abd", data_left, intermediate))
+    np.testing.assert_allclose(result, expected, rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_mixing_einsum_accepts_scalar_scale_from_stack(stability_mode: StabilityMode) -> None:
+    first = np.abs(_RNG.standard_normal((5, 3))) + 0.5
+    second = np.abs(_RNG.standard_normal((5, 3))) + 0.5
+    weights = np.array([[0.25, 0.75], [0.6, 0.4], [0.1, 0.9]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorStack(axis=1), (0, 1)),
+            RichInstruction(OperatorEinsum("bhu,uh->bu"), (3, 2)),
+            RichInstruction(OperatorLog(), (4,)),
+        ],
+        n_inputs=3,
+        stability_mode=stability_mode,
+        parameter_indices=frozenset({2}),
+        shapes=[first.shape, second.shape, weights.shape, (5, 2, 3), (5, 3), (5, 3)],
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [first, second, weights])
+
+    expected = np.log(np.einsum("bhu,uh->bu", np.stack([first, second], axis=1), weights))
+    np.testing.assert_allclose(result, expected, rtol=1e-9)
 
 
 ################################
@@ -260,6 +473,123 @@ def test_logspace_translation_converts_each_value_at_most_once(stability_mode: S
     # converting the two inputs to logspace, two logspace multiplications, and the raw conversion of the output
     assert len(backend_program.backend_calls) == 5
     np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
+
+
+def test_logspace_max_einsum_keeps_parameter_weights_linear_and_shifts_each_data_row() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("bi, io -> bo"), (2, 1)),  # ssa id 3
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+def test_logspace_elementwise_einsum_is_addition(stability_mode: StabilityMode) -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("ij,ij->ij"), (0, 1)),
+            RichInstruction(OperatorLog(), (2,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [POSITIVE_MATRIX, OTHER_POSITIVE_MATRIX])
+
+    # Convert both inputs to log space and add them; the final log instruction
+    # only changes which representation is returned and requires no call.
+    assert len(backend_program.backend_calls) == 3
+    np.testing.assert_allclose(result, np.log(POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX), rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+def test_logspace_kronecker_einsum_is_broadcast_addition(stability_mode: StabilityMode) -> None:
+    left = POSITIVE_MATRIX[:, :2]
+    right = OTHER_POSITIVE_MATRIX[:, :3]
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("bi,bj->bij"), (0, 1)),
+            RichInstruction(OperatorLog(), (2,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [left, right])
+
+    # Two logarithms, two broadcast reshapes, and one addition. In particular,
+    # this must not lower to exp/einsum/log as a general contraction would.
+    assert len(backend_program.backend_calls) == 5
+    np.testing.assert_allclose(result, np.log(left[:, :, None] * right[:, None, :]), rtol=1e-9)
+
+
+def test_logspace_max_einsum_shifts_rows_by_output_label_after_axis_reordering() -> None:
+    log_values = np.array([[0.0, -1000.0], [-1.0, -1001.0]])
+    weights = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+            RichInstruction(OperatorEinsum("ib, io -> bo"), (2, 1)),  # ssa id 3; batch/row label b is axis 1
+            RichInstruction(OperatorLog(), (3,)),  # ssa id 4
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weights])
+
+    column_maxima = np.max(log_values, axis=0, keepdims=True)
+    expected_result = column_maxima.T + np.log(np.einsum("ib,io->bo", np.exp(log_values - column_maxima), weights))
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
+
+
+def test_logspace_max_einsum_keeps_softmax_derived_parameters_linear() -> None:
+    log_values = np.array([[0.0, -1.0], [-1000.0, -1001.0]])
+    weight_logits = np.array([[1.0, 2.0], [3.0, 4.0]])
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorSoftmax(axis=0), (1,)),  # ssa id 2, still parameter-derived
+            RichInstruction(OperatorExp(), (0,)),  # ssa id 3
+            RichInstruction(OperatorEinsum("bi, io -> bo"), (3, 2)),  # ssa id 4
+            RichInstruction(OperatorLog(), (4,)),  # ssa id 5
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+    )
+
+    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    result = run_program(backend_program, [log_values, weight_logits])
+
+    weights = np.exp(weight_logits - np.max(weight_logits, axis=0, keepdims=True))
+    weights /= np.sum(weights, axis=0, keepdims=True)
+    row_maxima = np.max(log_values, axis=1, keepdims=True)
+    expected_result = row_maxima + np.log(np.einsum("bi,io->bo", np.exp(log_values - row_maxima), weights))
+    # softmax, the shifted data operand, the detached numerical shift, the
+    # einsum, and restoring the row shift require ten calls;
+    # converting and shifting the softmax result as another log-space operand would require five more.
+    assert len(backend_program.backend_calls) == 10
+    np.testing.assert_allclose(result, expected_result, rtol=1e-9)
 
 
 ################################
@@ -504,6 +834,106 @@ def test_stability_modes_compute_same_result(case_name: str, instructions: list[
 
     assert result.shape == baseline_result.shape
     np.testing.assert_allclose(result, baseline_result, rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_detached_normalizers_preserve_gradients(stability_mode: StabilityMode) -> None:
+    instructions = [
+        RichInstruction(OperatorStack(axis=1), (0, 1)),  # ssa id 3
+        RichInstruction(OperatorEinsum("bhu,uh->bu"), (3, 2)),  # ssa id 4
+        RichInstruction(OperatorEinsum("bu->"), (4,)),  # ssa id 5
+    ]
+    shapes = [(2, 3), (2, 3), (3, 2), (2, 2, 3), (2, 3), ()]
+    input_values = [
+        POSITIVE_MATRIX[:2, :3],
+        1.0e3 * OTHER_POSITIVE_MATRIX[:2, :3],
+        np.abs(_RNG.standard_normal((3, 2))) + 0.5,
+    ]
+
+    def value_and_grad(mode: StabilityMode) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        inputs = [torch.tensor(value, dtype=torch.float64, requires_grad=True) for value in input_values]
+        rich_program = _dense_program(instructions, n_inputs=3, stability_mode=mode, parameter_indices=frozenset({2}), shapes=shapes)
+        backend_program = translate_to_backend_program(rich_program, TorchBackendFunctions())
+        result = run_program(backend_program, inputs)
+        gradients = torch.autograd.grad(result, inputs)
+        return result, list(gradients)
+
+    baseline_result, baseline_gradients = value_and_grad("unstable")
+    result, gradients = value_and_grad(stability_mode)
+
+    torch.testing.assert_close(result, baseline_result)
+    for gradient, baseline_gradient in zip(gradients, baseline_gradients, strict=True):
+        torch.testing.assert_close(gradient, baseline_gradient)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_detached_reference_scales_preserve_gradients(stability_mode: StabilityMode) -> None:
+    first = np.asarray([[0.2, -0.3, 0.7], [1.1, -0.4, 0.5]])
+    second = np.asarray([[-0.2, 0.8, 0.1]])
+    instructions = [
+        RichInstruction(OperatorExp(), (0,)),  # ssa id 2
+        RichInstruction(OperatorExp(), (1,)),  # ssa id 3
+        RichInstruction(OperatorConcat(axis=0), (2, 3)),  # ssa id 4
+        RichInstruction(OperatorEinsum("ij->j"), (4,)),  # ssa id 5
+        RichInstruction(OperatorLog(), (5,)),  # ssa id 6
+        RichInstruction(OperatorEinsum("j->"), (6,)),  # ssa id 7
+    ]
+    shapes = [first.shape, second.shape, first.shape, second.shape, (3, 3), (3,), (3,), ()]
+
+    def value_and_grad(mode: StabilityMode) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        inputs = [torch.tensor(value, dtype=torch.float64, requires_grad=True) for value in (first, second)]
+        rich_program = _dense_program(instructions, n_inputs=2, stability_mode=mode, shapes=shapes)
+        result = run_program(translate_to_backend_program(rich_program, TorchBackendFunctions()), inputs)
+        return result, torch.autograd.grad(result, inputs)
+
+    baseline_result, baseline_gradients = value_and_grad("unstable")
+    result, gradients = value_and_grad(stability_mode)
+
+    torch.testing.assert_close(result, baseline_result)
+    for gradient, baseline_gradient in zip(gradients, baseline_gradients, strict=True):
+        torch.testing.assert_close(gradient, baseline_gradient)
+
+
+@pytest.mark.parametrize("stability_mode", LOGSPACE_MODES)
+@pytest.mark.parametrize("fused_tucker", [False, True])
+def test_logspace_detached_shifts_preserve_tucker_gradients(stability_mode: StabilityMode, fused_tucker: bool) -> None:
+    left = np.abs(_RNG.standard_normal((2, 3))) + 0.5
+    right = np.abs(_RNG.standard_normal((2, 4))) + 0.5
+    weights = np.abs(_RNG.standard_normal((5, 3, 4))) + 0.5
+    if fused_tucker:
+        instructions = [
+            RichInstruction(OperatorEinsum("bi,bj,kij->bk"), (0, 1, 2)),
+            RichInstruction(OperatorEinsum("bk->"), (3,)),
+            RichInstruction(OperatorLog(), (4,)),
+        ]
+        shapes = [left.shape, right.shape, weights.shape, (2, 5), (), ()]
+    else:
+        instructions = [
+            RichInstruction(OperatorEinsum("bi,bj->bij"), (0, 1)),
+            RichInstruction(OperatorEinsum("bij,kij->bk"), (3, 2)),
+            RichInstruction(OperatorEinsum("bk->"), (4,)),
+            RichInstruction(OperatorLog(), (5,)),
+        ]
+        shapes = [left.shape, right.shape, weights.shape, (2, 3, 4), (2, 5), (), ()]
+
+    def value_and_grad(mode: StabilityMode) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        inputs = [torch.tensor(value, dtype=torch.float64, requires_grad=True) for value in (left, right, weights)]
+        rich_program = _dense_program(
+            instructions,
+            n_inputs=3,
+            stability_mode=mode,
+            parameter_indices=frozenset({2}),
+            shapes=shapes,
+        )
+        result = run_program(translate_to_backend_program(rich_program, TorchBackendFunctions()), inputs)
+        return result, torch.autograd.grad(result, inputs)
+
+    baseline_result, baseline_gradients = value_and_grad("unstable")
+    result, gradients = value_and_grad(stability_mode)
+
+    torch.testing.assert_close(result, baseline_result)
+    for gradient, baseline_gradient in zip(gradients, baseline_gradients, strict=True):
+        torch.testing.assert_close(gradient, baseline_gradient)
 
 
 def test_unstable_mode_overflows_on_huge_intermediate_values() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable, Generic, override
+from typing import Callable, Generic, cast, override
 
 from extended_einsum.backend_translation import BackendCompiler, BackendProgram, translate_to_backend_program
 from extended_einsum.backends.registry import BACKEND_TO_COMPILER, BACKEND_TO_FUNCTIONS
@@ -107,7 +107,13 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
         compiler: BackendCompiler[TArray] = BACKEND_TO_COMPILER[self.backend]
         self._backend_code = compiler.compile(self._backend_program, self._input_arguments)
-        return self._backend_code([argument.backend_array for argument in self._input_arguments])
+        backend_array = self._backend_code([argument.backend_array for argument in self._input_arguments])
+
+        # Import locally to avoid the module cycle between the expression and
+        # public interface-function modules.
+        from extended_einsum.interface.functions import BackendArrayWrapper
+
+        return cast(TArray, BackendArrayWrapper(backend_array, self.format))
 
     def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorAdd(), [self, other])

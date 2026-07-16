@@ -158,12 +158,16 @@ def select(
 
 def softmax(
     a: TensorExpression[TArray] | TArray,
-    axis: int = 0,
+    axis: int | tuple[int, ...] = 0,
 ) -> TensorExpression[TArray]:
     """Applies the softmax function to the input tensor."""
 
     if not a.shape:
         raise ValueError("softmax requires an input tensor with at least one axis")
 
-    axis = normalize_axis(axis, len(a.shape))
-    return TensorExpression(OperatorSoftmax(axis), [a])
+    axes = (axis,) if isinstance(axis, int) else axis
+    if not axes:
+        raise ValueError("softmax requires at least one axis")
+    normalized_axes = tuple(normalize_axis(item, len(a.shape)) for item in axes)
+    normalized_axis: int | tuple[int, ...] = normalized_axes[0] if len(normalized_axes) == 1 else normalized_axes
+    return TensorExpression(OperatorSoftmax(normalized_axis), [a])

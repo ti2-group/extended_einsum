@@ -12,6 +12,11 @@ from extended_einsum.utils import normalize_axis
 class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @override
     @staticmethod
+    def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+        return array.detach()
+
+    @override
+    @staticmethod
     def exp(array: torch.Tensor) -> torch.Tensor:
         return torch.exp(array)
 
@@ -22,29 +27,67 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
-    def sum(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def sum(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
+            if keepdims:
+                return torch.sum(array, dim=tuple(range(array.ndim)), keepdim=True)
             return torch.sum(array)
-        return torch.sum(array, dim=axis)
+        return torch.sum(array, dim=axis, keepdim=keepdims)
 
     @override
     @staticmethod
-    def max(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def max(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
+        # Stable translations use maxima as numerical reference shifts.  The
+        # value-selecting max has the same forward result as amax but avoids
+        # its costly tie-distributing backward graph.
         if axis is None:
-            return torch.max(array)
-        return torch.amax(array, dim=axis)
+            if not array.ndim:
+                return array
+            result = torch.max(array.reshape(-1), dim=0).values
+            return result.reshape((1,) * array.ndim) if keepdims else result
+        axes = (axis,) if isinstance(axis, int) else axis
+        normalized_axes = tuple(item if item >= 0 else item + array.ndim for item in axes)
+        result = array
+        for reduction_axis in normalized_axes:
+            result = torch.max(result, dim=reduction_axis, keepdim=True).values
+        if not keepdims:
+            for reduction_axis in sorted(normalized_axes, reverse=True):
+                result = result.squeeze(reduction_axis)
+        return result
 
     @override
     @staticmethod
-    def min(array: torch.Tensor, axis: int | None = None) -> torch.Tensor:
+    def min(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
+            if keepdims:
+                return torch.amin(array, dim=tuple(range(array.ndim)), keepdim=True)
             return torch.min(array)
-        return torch.amin(array, dim=axis)
+        return torch.amin(array, dim=axis, keepdim=keepdims)
+
+    @override
+    @staticmethod
+    def maximum(array_1: torch.Tensor, array_2: torch.Tensor) -> torch.Tensor:
+        return torch.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
+    def reshape(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.broadcast_to(array, shape)
 
     @override
     @staticmethod
     def stack(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
         return torch.stack(list(arrays), dim=axis)
+
+    @override
+    @staticmethod
+    def concat(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+        return torch.cat(list(arrays), dim=axis)
 
     @override
     @staticmethod
@@ -66,8 +109,16 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
 
     @override
     @staticmethod
-    def softmax(array: torch.Tensor, axis: int) -> torch.Tensor:
-        return torch.softmax(array, dim=axis)
+    def softmax(array: torch.Tensor, axis: int | tuple[int, ...]) -> torch.Tensor:
+        if isinstance(axis, int):
+            return torch.softmax(array, dim=axis)
+        normalized_axes = tuple(item if item >= 0 else item + array.ndim for item in axis)
+        if normalized_axes == tuple(range(normalized_axes[0], array.ndim)):
+            flattened = torch.flatten(array, start_dim=normalized_axes[0])
+            return torch.softmax(flattened, dim=normalized_axes[0]).reshape(array.shape)
+        shifted = array - torch.amax(array, dim=axis, keepdim=True)
+        exp_array = torch.exp(shifted)
+        return exp_array / torch.sum(exp_array, dim=axis, keepdim=True)
 
     @override
     @staticmethod

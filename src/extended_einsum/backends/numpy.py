@@ -13,6 +13,11 @@ from extended_einsum.utils import normalize_axis
 class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
     @override
     @staticmethod
+    def stop_gradient(array: npt.NDArray) -> npt.NDArray:
+        return array
+
+    @override
+    @staticmethod
     def exp(array: npt.NDArray) -> npt.NDArray:
         return np.exp(array)
 
@@ -23,23 +28,43 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
-    def sum(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.sum(array, axis=axis)
+    def sum(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.sum(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def max(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.max(array, axis=axis)
+    def max(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.max(array, axis=axis, keepdims=keepdims)
 
     @override
     @staticmethod
-    def min(array: npt.NDArray, axis: int | None = None) -> npt.NDArray:
-        return np.min(array, axis=axis)
+    def min(array: npt.NDArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> npt.NDArray:
+        return np.min(array, axis=axis, keepdims=keepdims)
+
+    @override
+    @staticmethod
+    def maximum(array_1: npt.NDArray, array_2: npt.NDArray) -> npt.NDArray:
+        return np.maximum(array_1, array_2)
+
+    @override
+    @staticmethod
+    def reshape(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
+        return np.reshape(array, shape)
+
+    @override
+    @staticmethod
+    def broadcast_to(array: npt.NDArray, shape: tuple[int, ...]) -> npt.NDArray:
+        return np.broadcast_to(array, shape)
 
     @override
     @staticmethod
     def stack(arrays: Sequence[npt.NDArray], axis: int) -> npt.NDArray:
         return np.stack(list(arrays), axis=axis)
+
+    @override
+    @staticmethod
+    def concat(arrays: Sequence[npt.NDArray], axis: int) -> npt.NDArray:
+        return np.concatenate(list(arrays), axis=axis)
 
     @override
     @staticmethod
@@ -61,7 +86,7 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
 
     @override
     @staticmethod
-    def softmax(array: npt.NDArray, axis: int) -> npt.NDArray:
+    def softmax(array: npt.NDArray, axis: int | tuple[int, ...]) -> npt.NDArray:
         shifted = array - np.max(array, axis=axis, keepdims=True)
         exp_array = np.exp(shifted)
         return exp_array / np.sum(exp_array, axis=axis, keepdims=True)

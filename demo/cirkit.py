@@ -25,6 +25,7 @@ from cirkit.pipeline import PipelineContext
 from cirkit.symbolic.layers import HadamardLayer, InputLayer, KroneckerLayer, SumLayer
 from cirkit.templates import data_modalities, utils
 from torch import optim
+from torch.fx.experimental.proxy_tensor import make_fx
 
 import extended_einsum.interface as xe
 from extended_einsum.backend_translation import run_program, translate_to_backend_program
@@ -38,8 +39,6 @@ WIDTH = 4
 HEIGHT = 4
 DEFAULT_UNITS = 64
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_UNIT_SIZES = (64,)
-DEFAULT_BATCH_SIZES = (256,)
 DEFAULT_EPOCHS = 1
 DEFAULT_NUM_SAMPLES = 0
 DEFAULT_PIXEL_VALUES = 256
@@ -62,10 +61,14 @@ CSV_FIELDS = (
     "max_batches",
     "num_samples",
     "dataset",
+    "region_graph",
     "sum_product_layer",
     "semiring",
+    "backend_type",
     "torch_compile",
+    "seed",
     "warmup_steps",
+    "warmup_epochs",
     "setup_ms",
     "warmup_ms",
     "epoch_total_ms",
@@ -84,6 +87,8 @@ CSV_FIELDS = (
     "memory_backend",
     "peak_memory_bytes",
     "peak_memory_mib",
+    "peak_reserved_memory_bytes",
+    "peak_reserved_memory_mib",
     "reserved_memory_bytes",
     "allocated_memory_bytes",
 )
@@ -95,10 +100,11 @@ def make_symbolic_circuit(
     height: int,
     num_units: int,
     sum_product_layer: str,
+    region_graph: str = "quad-tree-2",
 ):
     return data_modalities.image_data(
         (1, width, height),
-        region_graph="quad-tree-2",
+        region_graph=region_graph,
         input_layer="categorical",
         num_input_units=num_units,
         sum_product_layer=sum_product_layer,
@@ -122,47 +128,63 @@ def generate_symbols(count: int) -> str:
     return EINSUM_SYMBOLS[:count]
 
 
-def to_xe_expression(symbolic_circuit, layer, data_by_scope):
+def to_xe_expression(symbolic_circuit, layer, data_by_scope, expression_by_layer=None):
+    if expression_by_layer is None:
+        expression_by_layer = {}
+    if layer in expression_by_layer:
+        return expression_by_layer[layer]
+
     children = symbolic_circuit.layer_inputs(layer)
     child_nodes = [
         to_xe_expression(
             symbolic_circuit,
             child,
             data_by_scope,
+            expression_by_layer,
         )
         for child in children
     ]
 
     if not children:
         scope_id = get_scope_id(layer.scope)
-        return xe.select(data_by_scope, scope_id)
-
-    if isinstance(layer, HadamardLayer):
+        result = xe.select(data_by_scope, scope_id)
+    elif isinstance(layer, HadamardLayer):
         format_string = ",".join(["ab"] * len(child_nodes)) + "->ab"
         if not all(child.shape == child_nodes[0].shape for child in child_nodes):
             raise ValueError("Hadamard layer children must have the same shape")
-        return xe.einsum(format_string, *child_nodes)
-
-    if isinstance(layer, KroneckerLayer):
+        result = xe.einsum(format_string, *child_nodes)
+    elif isinstance(layer, KroneckerLayer):
         child_indices = generate_symbols(len(child_nodes) + 1)
         batched_child_indices = [f"a{symbol}" for symbol in child_indices[1:]]
         format_string = ",".join(batched_child_indices) + "->" + "".join(child_indices)
-        return xe.einsum(format_string, *child_nodes)
+        result = xe.einsum(format_string, *child_nodes)
+    elif isinstance(layer, SumLayer):
+        output_units = layer.params["weight"].shape[0]
+        if len(children) > 1:
+            if layer.num_input_units != output_units or not all(child.shape == child_nodes[0].shape for child in child_nodes):
+                raise ValueError("Multi-input sum layers must be mixing layers over equally shaped children")
+            stacked_children = xe.stack(child_nodes, axis=1)
+            mixing_logits = Parameter(xe.array(torch.empty((output_units, len(children)), dtype=torch.float32)))
+            mixing_weights = xe.softmax(mixing_logits, axis=1)
+            result = xe.einsum("bhu,uh->bu", stacked_children, mixing_weights)
+        else:
+            child = child_nodes[0]
+            child_indices = generate_symbols(len(child.shape))
+            weight_shape = (output_units, *child.shape[1:])
+            output_unit_index = generate_symbols(len(child.shape) + 1)[-1]
+            weight_indices = output_unit_index + child_indices[1:]
+            out_indices = child_indices[0] + output_unit_index
+            format_string = f"{child_indices},{weight_indices}->{out_indices}"
+            weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
+            weight_input_axes = tuple(range(1, len(weight_shape)))
+            softmax_axis: int | tuple[int, ...] = weight_input_axes[0] if len(weight_input_axes) == 1 else weight_input_axes
+            weights = xe.softmax(weight_logits, axis=softmax_axis)
+            result = xe.einsum(format_string, child, weights)
+    else:
+        raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
 
-    if isinstance(layer, SumLayer):
-        if len(children) != 1:
-            raise ValueError("Sum layers are expected to have exactly one child")
-        child = child_nodes[0]
-        child_indices = generate_symbols(len(child.shape))
-        weight_shape = child.shape[1:] + (layer.params["weight"].shape[0],)
-        weight_indices = generate_symbols(len(child.shape) + 1)[1:]
-        out_indices = child_indices[0] + weight_indices[-1]
-        format_string = f"{child_indices},{weight_indices}->{out_indices}"
-        weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
-        weights = xe.softmax(weight_logits, axis=0)
-        return xe.einsum(format_string, child, weights)
-
-    raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
+    expression_by_layer[layer] = result
+    return result
 
 
 def translate_cirkit_to_xe(
@@ -170,7 +192,6 @@ def translate_cirkit_to_xe(
     *,
     batch_size: int,
     stability: StabilityMode,
-    log_floor: float | None = None,
 ) -> tuple[RichProgram, list[object]]:
     input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
     data_by_scope = xe.array(
@@ -185,15 +206,12 @@ def translate_cirkit_to_xe(
         symbolic_circuit.layers[-1],
         data_by_scope,
     )
-    if log_floor is not None:
-        expression = expression + xe.array(torch.full(expression.shape, log_floor, dtype=torch.float32))
     expression = xe.log(expression)
     return xe.extract_program(expression, stability_mode=stability)
 
 
 def preprocess_xe_program(
     program: RichProgram,
-    inputs: Sequence[object],
     *,
     optimize_stacking: bool,
 ) -> RichProgram:
@@ -243,12 +261,22 @@ def print_instructions(program: RichProgram, limit: int) -> None:
         print(f"  {instruction}")
 
 
-def parse_ints(value: str) -> tuple[int, ...]:
-    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+def parse_positive_ints(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("values must be positive")
+    return values
 
 
 def parse_backends(value: str) -> tuple[str, ...]:
     backends = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not backends:
+        raise argparse.ArgumentTypeError("expected at least one backend")
     unknown = set(backends) - {"xe", "cirkit"}
     if unknown:
         raise argparse.ArgumentTypeError(f"Unknown backend(s): {sorted(unknown)}")
@@ -314,11 +342,14 @@ def reset_peak_memory(device: torch.device) -> None:
 
 def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
     if device.type == "cuda":
-        peak = torch.cuda.max_memory_allocated(device)
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
         return {
             "memory_backend": "cuda",
-            "peak_memory_bytes": peak,
-            "peak_memory_mib": peak / 1024**2,
+            "peak_memory_bytes": peak_allocated,
+            "peak_memory_mib": peak_allocated / 1024**2,
+            "peak_reserved_memory_bytes": peak_reserved,
+            "peak_reserved_memory_mib": peak_reserved / 1024**2,
             "reserved_memory_bytes": torch.cuda.memory_reserved(device),
             "allocated_memory_bytes": torch.cuda.memory_allocated(device),
         }
@@ -328,6 +359,8 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
             "memory_backend": "mps_current",
             "peak_memory_bytes": "",
             "peak_memory_mib": "",
+            "peak_reserved_memory_bytes": "",
+            "peak_reserved_memory_mib": "",
             "reserved_memory_bytes": torch.mps.driver_allocated_memory(),
             "allocated_memory_bytes": allocated,
         }
@@ -335,6 +368,8 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
         "memory_backend": "unavailable",
         "peak_memory_bytes": "",
         "peak_memory_mib": "",
+        "peak_reserved_memory_bytes": "",
+        "peak_reserved_memory_mib": "",
         "reserved_memory_bytes": "",
         "allocated_memory_bytes": "",
     }
@@ -390,15 +425,25 @@ def load_train_images(
     return train_images.to(device)
 
 
-def torch_program_runner(program: RichProgram, *, use_torch_compile: bool) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+def torch_program_runner(program: RichProgram, *, use_make_fx: bool, device: torch.device) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
     backend_program = translate_to_backend_program(program, TorchBackendFunctions())
 
     def run(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
         return run_program(backend_program, inputs)
 
-    if use_torch_compile:
-        return torch.compile(run)
-    return run
+    if not use_make_fx:
+        return run
+
+    def run_flat(*inputs: torch.Tensor) -> torch.Tensor:
+        return run_program(backend_program, inputs)
+
+    example_inputs = [torch.empty(tuple(program.shapes[input_id]), dtype=torch.float32, device=device) for input_id in range(program.n_inputs)]
+    graph_module = make_fx(run_flat, tracing_mode="fake")(*example_inputs)
+
+    def run_graph(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
+        return graph_module(*inputs)
+
+    return run_graph
 
 
 def setup_xe_training(
@@ -408,6 +453,7 @@ def setup_xe_training(
     num_units: int,
     batch_size: int,
     sum_product_layer: str,
+    region_graph: str,
     device: torch.device,
     dataset: str,
     data_dir: str,
@@ -422,20 +468,22 @@ def setup_xe_training(
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
+        region_graph=region_graph,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=batch_size,
         stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
-        log_floor=1e-12 if semiring == "scaled-max" else None,
     )
     folded = FoldSameShapedOperations.apply_with_metadata(program)
     runtime_program = OptimizeContractionPaths.apply(folded.program)
-    run = torch_program_runner(runtime_program, use_torch_compile=use_torch_compile)
+    run = torch_program_runner(runtime_program, use_make_fx=use_torch_compile, device=device)
 
     num_variables = width * height
     input_shape = input_shape_tuple(inputs[0])
     categorical_units = input_shape[-1]
+    data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
+    data_axis_order_tensor = torch.tensor(data_axis_order, dtype=torch.long, device=device)
     train_images = load_train_images(
         dataset=dataset,
         device=device,
@@ -444,37 +492,39 @@ def setup_xe_training(
         num_variables=num_variables,
         pixel_values=pixel_values,
     )
+    train_images = train_images.index_select(1, data_axis_order_tensor)
     categorical_logits = torch.nn.Parameter(
         torch.normal(
             mean=0.0,
             std=1.0,
             size=(num_variables, pixel_values, categorical_units),
             device=device,
-        )
+        ).index_select(0, data_axis_order_tensor)
     )
-    parameter_inputs = {
-        input_id: torch.nn.Parameter(
-            torch.normal(
-                mean=0.0,
-                std=1.0,
-                size=input_shape_tuple(inputs[input_id]),
-                device=device,
-            )
+    used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
+    packed_parameter_input_sequence = tuple(input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order)
+    packed_parameter_input_ids = set(packed_parameter_input_sequence)
+    if len(packed_parameter_input_sequence) != len(packed_parameter_input_ids):
+        raise ValueError("A parameter input cannot occur in more than one packed stack.")
+    retained_input_ids = tuple(input_id for input_id in range(program.n_inputs) if input_id in used_input_ids and input_id not in packed_parameter_input_ids)
+    data_input_id = retained_input_ids.index(0)
+    initialized_parameter_inputs = {
+        input_id: torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=input_shape_tuple(inputs[input_id]),
+            device=device,
         )
         for input_id in sorted(program.parameter_indices)
     }
+    parameter_inputs = {input_id: torch.nn.Parameter(tensor) for input_id, tensor in initialized_parameter_inputs.items() if input_id not in packed_parameter_input_ids}
+    packed_parameter_inputs = [torch.nn.Parameter(torch.stack([initialized_parameter_inputs[input_id] for input_id in stack_order], dim=0)) for stack_order in folded.parameter_stack_orders]
     constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
-    used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
-    packed_parameter_input_ids = {input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order}
-    retained_input_ids = tuple(input_id for input_id in range(program.n_inputs) if input_id in used_input_ids and input_id not in packed_parameter_input_ids)
-    data_input_id = retained_input_ids.index(0)
-    data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
     pixel_range = torch.arange(num_variables, device=device)[:, None]
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:
         probabilities = F.softmax(categorical_logits, dim=1)
-        data = probabilities[pixel_range, batch.T].contiguous()
-        return data[list(data_axis_order)]
+        return probabilities[pixel_range, batch.T].contiguous()
 
     def original_input_tensor(input_id: int, data_input: torch.Tensor) -> torch.Tensor:
         if input_id == 0:
@@ -485,16 +535,23 @@ def setup_xe_training(
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         data_input = categorical_input(batch)
+        if use_torch_compile and semiring == "scaled-max":
+            # Keep Inductor from fusing categorical indexing/softmax backward
+            # into the much larger scaled-circuit backward graph.  Both sides
+            # of this boundary are still compiled independently.
+            torch._dynamo.graph_break()
         runtime_tensors: list[torch.Tensor] = [original_input_tensor(input_id, data_input) for input_id in retained_input_ids]
         runtime_tensors[data_input_id] = data_input
-        for stack_order in folded.parameter_stack_orders:
-            runtime_tensors.append(torch.stack([parameter_inputs[input_id] for input_id in stack_order], dim=0))
+        runtime_tensors.extend(packed_parameter_inputs)
         if len(runtime_tensors) != runtime_program.n_inputs:
             raise RuntimeError(f"Expected {runtime_program.n_inputs} runtime inputs, got {len(runtime_tensors)}")
         log_likelihoods = run(runtime_tensors)
         return -torch.mean(log_likelihoods)
 
-    optimizer = make_optimizer((categorical_logits, *parameter_inputs.values()), device, lr)
+    if use_torch_compile:
+        step = torch.compile(step, mode="reduce-overhead" if device.type == "cuda" else None)
+
+    optimizer = make_optimizer((categorical_logits, *parameter_inputs.values(), *packed_parameter_inputs), device, lr)
     return step, optimizer, train_images, runtime_program
 
 
@@ -510,8 +567,8 @@ def setup_cirkit_training(
     width: int,
     height: int,
     num_units: int,
-    batch_size: int,
     sum_product_layer: str,
+    region_graph: str,
     device: torch.device,
     dataset: str,
     data_dir: str,
@@ -525,6 +582,7 @@ def setup_cirkit_training(
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
+        region_graph=region_graph,
     )
     ctx = PipelineContext(
         backend="torch",
@@ -572,6 +630,31 @@ def run_warmup(
         loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+    return elapsed_wall_ms(start, device)
+
+
+def run_warmup_epochs(
+    step: Callable,
+    optimizer,
+    train_images: torch.Tensor,
+    *,
+    batch_size: int,
+    max_batches: int | None,
+    warmup_epochs: int,
+    device: torch.device,
+) -> float:
+    if warmup_epochs <= 0:
+        return 0.0
+    start = time.perf_counter()
+    for _ in range(warmup_epochs):
+        run_epoch(
+            step,
+            optimizer,
+            train_images,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            device=device,
+        )
     return elapsed_wall_ms(start, device)
 
 
@@ -654,12 +737,18 @@ def run_epoch(
 
 def append_row(output_path: Path, row: dict) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = output_path.exists()
+    file_has_header = output_path.exists() and output_path.stat().st_size > 0
+    fieldnames = CSV_FIELDS
+    if file_has_header:
+        with output_path.open(newline="") as existing_file:
+            existing_header = next(csv.reader(existing_file), None)
+        if existing_header:
+            fieldnames = tuple(existing_header)
     with output_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not file_exists:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_has_header:
             writer.writeheader()
-        writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+        writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
 def print_epoch_summary(row: dict) -> None:
@@ -672,12 +761,13 @@ def print_epoch_summary(row: dict) -> None:
 
 
 def display_backend(backend: str, args: argparse.Namespace) -> str:
+    backend_name = backend if args.region_graph == "quad-tree-2" else f"{backend}-{args.region_graph}"
     if backend != "xe":
-        return backend
+        return backend_name
     suffixes = [args.semiring]
     if args.torch_compile:
         suffixes.append("torch-compile")
-    return "-".join((backend, *suffixes))
+    return "-".join((backend_name, *suffixes))
 
 
 def base_row(
@@ -706,10 +796,14 @@ def base_row(
         "max_batches": args.max_batches or "",
         "num_samples": args.num_samples,
         "dataset": args.dataset,
+        "region_graph": args.region_graph,
         "sum_product_layer": args.sum_product_layer,
         "semiring": args.semiring,
+        "backend_type": "cirkit" if backend.startswith("cirkit") else "xe",
         "torch_compile": args.torch_compile,
+        "seed": args.seed,
         "warmup_steps": args.warmup_steps,
+        "warmup_epochs": args.warmup_epochs,
     }
 
 
@@ -721,14 +815,18 @@ def run_training_config(
     args: argparse.Namespace,
     device: torch.device,
 ) -> list[dict]:
+    # Include model construction, compilation, and warmup in the VRAM high-water
+    # mark. Resetting after warmup would hide CUDA graph pools allocated during
+    # capture even though the run needs to keep that reservation.
+    reset_peak_memory(device)
     setup_fn = setup_cirkit_training if backend == "cirkit" else setup_xe_training
     setup_start = time.perf_counter()
     setup_kwargs = {
         "width": args.width,
         "height": args.height,
         "num_units": num_units,
-        "batch_size": batch_size,
         "sum_product_layer": args.sum_product_layer,
+        "region_graph": args.region_graph,
         "device": device,
         "dataset": args.dataset,
         "data_dir": args.data_dir,
@@ -738,6 +836,7 @@ def run_training_config(
         "lr": args.lr,
     }
     if backend == "xe":
+        setup_kwargs["batch_size"] = batch_size
         setup_kwargs["semiring"] = args.semiring
     step, optimizer, train_images, _program = setup_fn(**setup_kwargs)
     setup_ms = elapsed_wall_ms(setup_start, device)
@@ -750,9 +849,17 @@ def run_training_config(
         warmup_steps=args.warmup_steps,
         device=device,
     )
+    warmup_ms += run_warmup_epochs(
+        step,
+        optimizer,
+        train_images,
+        batch_size=batch_size,
+        max_batches=args.max_batches,
+        warmup_epochs=args.warmup_epochs,
+        device=device,
+    )
 
     rows = []
-    reset_peak_memory(device)
     for epoch in range(args.epochs):
         stats = run_epoch(
             step,
@@ -781,6 +888,7 @@ def run_training_sweep(args: argparse.Namespace) -> None:
     device = get_device(args.device)
     print(f"device={device} ({get_device_name(device)})")
     print(f"writing results to {args.output}")
+    print(f"region_graph={args.region_graph}")
 
     for backend, num_units, batch_size in itertools.product(args.backends, args.unit_sizes, args.batch_sizes):
         cleanup_device(device)
@@ -829,13 +937,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
-    parser.add_argument("--units", type=int, default=DEFAULT_UNITS)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--units",
+        "--unit-sizes",
+        dest="unit_sizes",
+        type=parse_positive_ints,
+        default=(DEFAULT_UNITS,),
+        metavar="N[,N...]",
+        help="Unit count, or comma-separated counts for a training sweep.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        "--batch-sizes",
+        dest="batch_sizes",
+        type=parse_positive_ints,
+        default=(DEFAULT_BATCH_SIZE,),
+        metavar="N[,N...]",
+        help="Batch size, or comma-separated sizes for a training sweep.",
+    )
     parser.add_argument("--sum-product-layer", choices=("cp", "tucker"), default="cp")
+    parser.add_argument("--region-graph", choices=("quad-tree-2", "quad-graph"), default="quad-tree-2")
     parser.add_argument(
         "--semiring",
         choices=("scaled-max", "lse-sum"),
-        default="scaled-max",
+        default="lse-sum",
         help="Numerical-stability mode to request from XE.",
     )
     parser.add_argument(
@@ -876,18 +1001,6 @@ def parse_args() -> argparse.Namespace:
         default=("xe",),
         help="Comma-separated subset of: xe,cirkit.",
     )
-    parser.add_argument(
-        "--unit-sizes",
-        type=parse_ints,
-        default=DEFAULT_UNIT_SIZES,
-        help="Comma-separated training unit sizes.",
-    )
-    parser.add_argument(
-        "--batch-sizes",
-        type=parse_ints,
-        default=DEFAULT_BATCH_SIZES,
-        help="Comma-separated training batch sizes.",
-    )
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument(
         "--max-batches",
@@ -903,13 +1016,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pixel-values", type=int, default=DEFAULT_PIXEL_VALUES)
     parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--verbose-errors", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.train and (len(args.unit_sizes) != 1 or len(args.batch_sizes) != 1):
+        parser.error("multiple --units or --batch-size values require --train")
+    return args
 
 
 def main() -> None:
@@ -921,20 +1038,26 @@ def main() -> None:
         run_training_sweep(args)
         return
 
+    num_units = args.unit_sizes[0]
+    batch_size = args.batch_sizes[0]
+
     symbolic_circuit = make_symbolic_circuit(
         width=args.width,
         height=args.height,
-        num_units=args.units,
+        num_units=num_units,
         sum_product_layer=args.sum_product_layer,
+        region_graph=args.region_graph,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
-        batch_size=args.batch_size,
-        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_sum",
-        log_floor=1e-12 if args.semiring == "scaled-max" else None,
+        batch_size=batch_size,
+        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_min",
     )
 
-    print(f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={args.units}, sum_product_layer={args.sum_product_layer}")
+    print(
+        f"symbolic circuit: layers={len(symbolic_circuit.layers)}, variables={symbolic_circuit.num_variables}, units={num_units}, "
+        f"sum_product_layer={args.sum_product_layer}, region_graph={args.region_graph}"
+    )
     print_program_summary("direct XE program", program, inputs, shape_preview=args.shape_preview)
 
     final_program = program
@@ -942,7 +1065,6 @@ def main() -> None:
         try:
             preprocessed = preprocess_xe_program(
                 program,
-                inputs,
                 optimize_stacking=not args.no_optimize_stacking,
             )
         except NameError as error:
