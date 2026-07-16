@@ -9,8 +9,6 @@
 
 The package is an expression engine, not a drop-in replacement for `torch.einsum` or `numpy.einsum`. Wrap backend arrays with `xe.array`, compose operations lazily, then call `materialize`.
 
-> **Status:** `0.1.0` is an alpha release. The public expression API is usable, but indexing and some operators or stability-mode combinations are not implemented yet.
-
 ## Installation
 
 Python 3.12, 3.13, and 3.14 are supported.
