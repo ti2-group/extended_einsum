@@ -18,6 +18,7 @@ LABELS = {"xe": "Extended Einsum", "cirkit": "Cirkit", "pyjuice": "PyJuice"}
 COLORS = {"xe": "#0072B2", "cirkit": "#666666", "pyjuice": "#009E73"}
 FORWARD_COLOR = "#56B4E9"
 BACKWARD_COLOR = "#D55E00"
+SIZE_PAIRS = ((256, 64), (512, 64), (256, 128), (512, 512))
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,13 +43,13 @@ def load(path: Path) -> pd.DataFrame:
 
 
 def plot_forward(results: pd.DataFrame, output: Path) -> None:
-    pairs = ((256, 128), (512, 512))
-    x = np.arange(len(pairs), dtype=float)
+    x = np.arange(len(SIZE_PAIRS), dtype=float)
     width = 0.25
-    fig, ax = plt.subplots(figsize=(7.0, 4.3), layout="constrained")
+    fig, ax = plt.subplots(figsize=(10.0, 4.3), layout="constrained")
+    summaries: dict[tuple[str, int], tuple[float, float, float]] = {}
     for backend_index, backend in enumerate(BACKENDS):
         centers, lows, highs = [], [], []
-        for pair_index, (batch, units) in enumerate(pairs):
+        for pair_index, (batch, units) in enumerate(SIZE_PAIRS):
             values = results.loc[
                 results["backend"].eq(backend) & results["batch_size"].eq(batch) & results["units"].eq(units),
                 "forward_microseconds_per_patch_batch",
@@ -57,6 +58,7 @@ def plot_forward(results: pd.DataFrame, output: Path) -> None:
             centers.append(center)
             lows.append(low)
             highs.append(high)
+            summaries[(backend, pair_index)] = (center, low, high)
         positions = x + (backend_index - 1) * width
         ax.bar(positions, centers, width, color=COLORS[backend], label=LABELS[backend])
         ax.errorbar(
@@ -67,18 +69,51 @@ def plot_forward(results: pd.DataFrame, output: Path) -> None:
             color="#202020",
             capsize=3,
         )
-    ax.set_xticks(x, [f"Batch {batch}, units {units}" for batch, units in pairs])
+    y_padding = 0.035 * max(high for _, _, high in summaries.values())
+    for backend_index, backend in enumerate(BACKENDS):
+        positions = x + (backend_index - 1) * width
+        for pair_index, position in enumerate(positions):
+            center, _low, high = summaries[(backend, pair_index)]
+            pyjuice_center = summaries[("pyjuice", pair_index)][0]
+            ax.text(
+                position,
+                high + y_padding,
+                f"{pyjuice_center / center:.2f}×",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+    ax.set_xticks(
+        x,
+        [f"Batch {batch}\nUnits {units}" for batch, units in SIZE_PAIRS],
+    )
     ax.set_ylabel("Forward time per CP-T patch (µs)")
     ax.set_title("Parameter-Matched CP-T Forward Pass")
+    ax.set_ylim(top=max(high for _, _, high in summaries.values()) * 1.18)
     ax.legend(loc="upper left")
+    ax.text(
+        0.98,
+        0.98,
+        "Bar labels: speedup over PyJuice",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+    )
     save_pdf(fig, output)
 
 
 def plot_forward_backward(results: pd.DataFrame, output: Path) -> None:
-    pairs = ((256, 128), (512, 512))
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2), layout="constrained", sharey=False)
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(11.0, 7.6),
+        layout="constrained",
+        sharey=False,
+    )
+    flat_axes = axes.ravel()
     x = np.arange(len(BACKENDS))
-    for pair_index, ((batch, units), ax) in enumerate(zip(pairs, axes, strict=True)):
+    for pair_index, ((batch, units), ax) in enumerate(zip(SIZE_PAIRS, flat_axes, strict=True)):
         forwards, backwards, totals, lows, highs = [], [], [], [], []
         for backend_index, backend in enumerate(BACKENDS):
             rows = results.loc[results["backend"].eq(backend) & results["batch_size"].eq(batch) & results["units"].eq(units)]
@@ -101,11 +136,31 @@ def plot_forward_backward(results: pd.DataFrame, output: Path) -> None:
             color="#202020",
             capsize=3,
         )
+        pyjuice_total = totals[BACKENDS.index("pyjuice")]
+        y_padding = 0.035 * max(highs)
+        for position, total, high in zip(x, totals, highs, strict=True):
+            ax.text(
+                position,
+                high + y_padding,
+                f"{pyjuice_total / total:.2f}×",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
         ax.set_xticks(x, [LABELS[item] for item in BACKENDS], rotation=15, ha="right")
         ax.set_title(f"Batch {batch}, units {units}")
         ax.set_ylabel("Time per batch (ms)")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2)
+        ax.set_ylim(top=max(highs) * 1.28)
+    flat_axes[1].legend(loc="upper left")
+    flat_axes[1].text(
+        0.98,
+        0.98,
+        "Bar labels: speedup over PyJuice",
+        transform=flat_axes[1].transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+    )
     fig.suptitle("Parameter-Matched CP-T Forward and Backward")
     save_pdf(fig, output)
 

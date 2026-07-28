@@ -10,8 +10,9 @@ the count is
 784 * U * 256 + 782 * U^2 + U.
 ```
 
-The two configurations are batch 256/units 128 and batch 512/units 512. Each
-uses 30 warmup batches, 90 measured batches, and seeds 0--4. Every
+The configurations are batch 256/units 64, batch 512/units 64, batch 256/units
+128, and batch 512/units 512. Each uses 30 warmup batches, 90 measured batches,
+and seeds 0--4. Every
 backend/configuration/seed runs in a fresh process, with shuffled paired blocks
 and alternating backend order. Each backend receives the same seed-specific
 synthetic categorical batch repeatedly, avoiding data-loading effects in this
@@ -35,3 +36,10 @@ they are not the same optimization update; the CSV records
 `backward_quantity` explicitly. Consequently, `forward_per_patch.pdf` is the
 primary cross-system result and `forward_backward.pdf` is a transparent systems
 comparison, not a claim of optimizer-equivalent training work.
+
+PyJuice uses custom kernels designed to support block-sparse circuit
+computations. This experiment deliberately uses an exactly matched dense
+circuit, for which Extended Einsum and Cirkit can rely on highly optimized
+dense matrix-multiplication kernels. PyJuice's more general sparse-capable path
+does not reach the same dense-kernel efficiency here; this observation should
+not be extrapolated to circuits with exploitable structural sparsity.
