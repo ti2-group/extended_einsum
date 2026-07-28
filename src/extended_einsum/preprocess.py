@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, override
@@ -13,6 +13,7 @@ from extended_einsum.language.rich_operators import (
     OperatorSlice,
     OperatorSoftmax,
     OperatorStack,
+    OperatorTake,
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichProgram
@@ -194,6 +195,321 @@ def group_identical_ops_by_output_depth(
         tuple(groups),
         min_group_size=min_group_size,
     )
+
+
+def group_identical_ops_by_input_depth(
+    program: RichProgram,
+    *,
+    min_group_size: int = 2,
+    split_by_routing: bool = False,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Group live, batchable, canonically identical ops by input frontier.
+
+    Ordinary SSA values use their longest-path depth from the program inputs.
+    Parameter-only preprocessing is different: independent weight transforms
+    would otherwise all sit at depth one even though they belong to different
+    circuit layers. Such values inherit the earliest live frontier at which
+    they are consumed.
+
+    Unlike output-directed grouping, operations at a true input depth cannot
+    depend on one another. Reusing one operand in several group members is
+    allowed: the materialization rewrite can route or repeat that operand. This
+    is what permits the input-directed schedule to form the larger native XE
+    folds.
+    """
+    if min_group_size < 1:
+        raise ValueError("min_group_size must be at least 1")
+
+    live_ssa_ids = frozenset(_nearest_output_depths(program))
+    input_depths = _input_frontier_depths(program, live_ssa_ids)
+    result_dependencies = _instruction_result_dependencies(program)
+    groups: list[OutputDepthOpGroup] = []
+
+    grouped_input_pointwise_ops = _append_input_pointwise_groups(
+        program,
+        input_depths,
+        result_dependencies,
+        groups,
+        min_group_size,
+    )
+    buckets: dict[_OutputDepthOpSignature, list[OutputDepthOpGroupMember]] = {}
+    for op_index, instruction in enumerate(program.instructions):
+        if op_index in grouped_input_pointwise_ops:
+            continue
+        if instruction.operator.name not in _BATCHABLE_OPERATOR_NAMES:
+            continue
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+
+        signature, member = _canonicalize_output_depth_op(
+            program,
+            op_index,
+            input_depths[result_id],
+        )
+        buckets.setdefault(signature, []).append(member)
+
+    for signature, members in buckets.items():
+        for dependency_safe_group in _split_dependency_only_op_groups(
+            members,
+            result_dependencies,
+        ):
+            if len(dependency_safe_group) < min_group_size:
+                continue
+            groups.append(
+                OutputDepthOpGroup(
+                    depth=signature.depth,
+                    operator=signature.operator,
+                    operand_shapes=signature.operand_shapes,
+                    operand_tensor_formats=signature.operand_tensor_formats,
+                    members=dependency_safe_group,
+                )
+            )
+
+    result = tuple(groups)
+    if split_by_routing:
+        result = _split_input_depth_groups_by_routing(
+            program,
+            result,
+            live_ssa_ids=live_ssa_ids,
+            min_group_size=min_group_size,
+        )
+    return result
+
+
+def _split_input_depth_groups_by_routing(
+    program: RichProgram,
+    groups: tuple[OutputDepthOpGroup, ...],
+    *,
+    live_ssa_ids: frozenset[int],
+    min_group_size: int,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Keep differently routed branches independently schedulable.
+
+    Input-depth equality alone can merge operations whose operands have
+    different fan-out or whose results feed different operator kinds. Those
+    members cannot necessarily share a good future-consumer order. Splitting
+    them uses only the flattened SSA graph and preserves all groups that still
+    meet ``min_group_size``.
+    """
+
+    consumers: dict[int, list[int]] = defaultdict(list)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+        for argument in instruction.argument_ssa_ids:
+            consumers[argument].append(result_id)
+
+    split_groups: list[OutputDepthOpGroup] = []
+    for group in groups:
+        buckets: dict[
+            tuple[tuple[int, ...], tuple[str, ...]],
+            list[OutputDepthOpGroupMember],
+        ] = {}
+        for member in group.members:
+            ordered_arguments = tuple(
+                member.arguments[position]
+                for position in member.canonical_argument_order
+            )
+            argument_fanouts = tuple(
+                len(consumers[argument])
+                for argument in ordered_arguments
+            )
+            consumer_operators = tuple(
+                sorted(
+                    program.instructions[consumer - program.n_inputs].operator.name
+                    for consumer in consumers[member.result_id]
+                    if consumer >= program.n_inputs
+                )
+            )
+            buckets.setdefault(
+                (argument_fanouts, consumer_operators),
+                [],
+            ).append(member)
+
+        split_groups.extend(
+            replace(group, members=tuple(members))
+            for members in buckets.values()
+            if len(members) >= min_group_size
+        )
+    return tuple(split_groups)
+
+
+_InputAccessToken = tuple[int, int]
+
+
+def _order_input_depth_groups_by_input_access(
+    program: RichProgram,
+    groups: tuple[OutputDepthOpGroup, ...],
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Use the input traversal as the canonical order within native folds.
+
+    The flattened instruction list is commonly depth-first, so preserving its
+    order interleaves spatially distant branches.  Input-frontier folding is
+    instead given a stable, metadata-free order by the axis-0 input elements
+    that can reach each result. Parameter-only transforms inherit the access
+    scope of their consumers so weights remain aligned with the data branch
+    that uses them.
+    """
+
+    scopes = _input_access_scopes(program)
+
+    def member_key(
+        member: OutputDepthOpGroupMember,
+    ) -> tuple[tuple[_InputAccessToken, ...], int, int]:
+        scope = scopes.get(member.result_id, frozenset())
+        ordered_scope = tuple(sorted(scope))
+        return ordered_scope, len(scope), member.op_index
+
+    return tuple(
+        replace(
+            group,
+            members=tuple(sorted(group.members, key=member_key)),
+        )
+        for group in groups
+    )
+
+
+def _has_same_index_product_contraction(program: RichProgram) -> bool:
+    """Detect CP's elementwise product contraction from the tensor program."""
+
+    for instruction in program.instructions:
+        if _is_same_index_product_operator(instruction.operator):
+            return True
+    return False
+
+
+def _is_same_index_product_operator(operator: RichOperator) -> bool:
+    if not isinstance(operator, OperatorEinsum):
+        return False
+    input_strings, output_string = parse_format_string(
+        operator.format_string
+    )
+    return (
+        len(input_strings) == 2
+        and input_strings[0] == input_strings[1]
+        and input_strings[0] == output_string
+    )
+
+
+def _input_access_scopes(
+    program: RichProgram,
+) -> dict[int, frozenset[_InputAccessToken]]:
+    """Return the non-parameter axis-0 input elements reaching each SSA value."""
+
+    live_ssa_ids = frozenset(_nearest_output_depths(program))
+    scopes: dict[int, frozenset[_InputAccessToken]] = {}
+    for input_id in range(program.n_inputs):
+        if input_id in program.parameter_indices or not program.shapes[input_id]:
+            scopes[input_id] = frozenset()
+            continue
+        scopes[input_id] = frozenset(
+            (input_id, index)
+            for index in range(program.shapes[input_id][0])
+        )
+
+    parameter_derived_ssa_ids = set(program.parameter_indices)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if instruction.argument_ssa_ids and all(
+            argument in parameter_derived_ssa_ids
+            for argument in instruction.argument_ssa_ids
+        ):
+            parameter_derived_ssa_ids.add(result_id)
+
+        direct_scope = _direct_non_parameter_input_access_scope(
+            program,
+            instruction,
+        )
+        if direct_scope is not None:
+            scopes[result_id] = direct_scope
+        else:
+            scopes[result_id] = frozenset().union(
+                *(scopes[argument] for argument in instruction.argument_ssa_ids)
+            )
+
+    for ssa_id in sorted(
+        parameter_derived_ssa_ids.intersection(live_ssa_ids),
+        reverse=True,
+    ):
+        consumer_scopes = [
+            scopes[consumer]
+            for consumer in program.consumers_of_ssa_id[ssa_id]
+            if consumer in live_ssa_ids
+        ]
+        if consumer_scopes:
+            scopes[ssa_id] = frozenset().union(*consumer_scopes)
+
+    return scopes
+
+
+def _direct_non_parameter_input_access_scope(
+    program: RichProgram,
+    instruction: RichInstruction,
+) -> frozenset[_InputAccessToken] | None:
+    if len(instruction.argument_ssa_ids) != 1:
+        return None
+    input_id = instruction.argument_ssa_ids[0]
+    if input_id >= program.n_inputs or input_id in program.parameter_indices:
+        return None
+
+    operator = instruction.operator
+    if isinstance(operator, OperatorSelect) and operator.axis == 0:
+        return frozenset({(input_id, operator.index)})
+    if isinstance(operator, OperatorSlice) and operator.axis == 0:
+        return frozenset(
+            (input_id, index)
+            for index in range(operator.start, operator.stop)
+        )
+    return None
+
+
+def _input_frontier_depths(
+    program: RichProgram,
+    live_ssa_ids: frozenset[int],
+) -> dict[int, int]:
+    depths = _ssa_depths_from_inputs(program)
+    parameter_derived_ssa_ids = set(program.parameter_indices)
+    for op_index, instruction in enumerate(program.instructions):
+        if instruction.argument_ssa_ids and all(
+            argument in parameter_derived_ssa_ids
+            for argument in instruction.argument_ssa_ids
+        ):
+            parameter_derived_ssa_ids.add(program.n_inputs + op_index)
+
+    consumers: dict[int, list[int]] = defaultdict(list)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+        for argument in instruction.argument_ssa_ids:
+            consumers[argument].append(result_id)
+
+    inherited_depths: dict[int, int] = {}
+    for ssa_id in sorted(
+        parameter_derived_ssa_ids.intersection(live_ssa_ids),
+        reverse=True,
+    ):
+        consumer_depths = [
+            (
+                inherited_depths[consumer]
+                if consumer in parameter_derived_ssa_ids
+                else depths[consumer]
+            )
+            for consumer in consumers[ssa_id]
+            if consumer not in parameter_derived_ssa_ids
+            or consumer in inherited_depths
+        ]
+        if consumer_depths:
+            inherited_depths[ssa_id] = min(consumer_depths)
+
+    depths.update(inherited_depths)
+    return {
+        ssa_id: depth
+        for ssa_id, depth in depths.items()
+        if ssa_id in live_ssa_ids
+    }
 
 
 def _append_input_pointwise_groups(
@@ -420,6 +736,28 @@ def _split_dependency_safe_op_groups(
         else:
             groups.append([member])
     return [tuple(group) for group in groups]
+
+
+def _split_dependency_only_op_groups(
+    members: list[OutputDepthOpGroupMember],
+    result_dependencies: dict[int, frozenset[int]],
+) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
+    groups: list[list[OutputDepthOpGroupMember]] = []
+    for member in sorted(members, key=lambda item: item.op_index):
+        for group in groups:
+            if all(
+                not _op_members_depend_on_each_other(
+                    member,
+                    existing_member,
+                    result_dependencies,
+                )
+                for existing_member in group
+            ):
+                group.append(member)
+                break
+        else:
+            groups.append([member])
+    return tuple(tuple(group) for group in groups)
 
 
 def _split_operand_source_safe_op_groups(
@@ -767,7 +1105,8 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                     boundary_shapes,
                     result_depths,
                     program.n_inputs,
-                    prioritize_output_labels=program.stability_mode in {"scaled_min", "scaled_sum"},
+                    prioritize_output_labels=program.stability_mode
+                    in {"scaled_min", "scaled_max", "scaled_sum"},
                 )
                 if planned_instructions is None:
                     continue
@@ -950,6 +1289,7 @@ class FoldSameShapedOperationsResult:
     parameter_stack_orders: tuple[tuple[int, ...], ...]
     input_axis0_orders: dict[int, tuple[int, ...]]
     concatenated_batch_orders: tuple[tuple[int, ...], ...]
+    gather_index_orders: tuple[tuple[int, ...], ...]
 
 
 _TensorValueRef = _TensorRef | _InputRef | _BatchElementRef
@@ -964,7 +1304,11 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         return result.program
 
     @staticmethod
-    def apply_with_metadata(program: RichProgram) -> FoldSameShapedOperationsResult:
+    def apply_with_metadata(
+        program: RichProgram,
+        *,
+        optimize_group_order: bool = True,
+    ) -> FoldSameShapedOperationsResult:
         groups = group_identical_ops_by_output_depth(program)
         if not groups:
             return FoldSameShapedOperationsResult(
@@ -974,12 +1318,68 @@ class FoldSameShapedOperations(PreprocessingRoutine):
                 parameter_stack_orders=(),
                 input_axis0_orders={},
                 concatenated_batch_orders=(),
+                gather_index_orders=(),
             )
 
         events = _topologically_order_output_depth_events(program, groups)
-        ordered_events = _order_group_members_for_future_consumers(events, program)
+        ordered_events = _order_group_members_for_future_consumers(events, program) if optimize_group_order else events
         return _rewrite_output_depth_group_events(program, ordered_events)
 
+    @staticmethod
+    def apply_with_input_depth_metadata(
+        program: RichProgram,
+        *,
+        optimize_group_order: bool = True,
+        order_by_input_access: bool | None = None,
+        split_by_routing: bool | None = None,
+    ) -> FoldSameShapedOperationsResult:
+        """Fold using XE-native input frontiers without source metadata.
+
+        By default, programs containing CP's same-index product contraction use
+        input-access order within each fold. This prevents a depth-first
+        instruction traversal from interleaving distant CP branches. Other
+        contraction structures retain their original order; callers can force
+        either behavior with ``order_by_input_access``.
+        """
+
+        is_same_index_product_program = _has_same_index_product_contraction(
+            program
+        )
+        if split_by_routing is None:
+            split_by_routing = is_same_index_product_program
+        groups = group_identical_ops_by_input_depth(
+            program,
+            split_by_routing=split_by_routing,
+        )
+        if order_by_input_access is None:
+            order_by_input_access = is_same_index_product_program
+        if order_by_input_access:
+            groups = _order_input_depth_groups_by_input_access(
+                program,
+                groups,
+            )
+        if not groups:
+            return FoldSameShapedOperationsResult(
+                program=program,
+                batched_result_orders=(),
+                non_parameter_stack_orders=(),
+                parameter_stack_orders=(),
+                input_axis0_orders={},
+                concatenated_batch_orders=(),
+                gather_index_orders=(),
+            )
+
+        events = _topologically_order_output_depth_events(program, groups)
+        ordered_events = (
+            _order_group_members_for_future_consumers(events, program)
+            if optimize_group_order
+            else events
+        )
+        return _rewrite_output_depth_group_events(
+            program,
+            ordered_events,
+            emit_fragmented_batch_gathers=True,
+        )
 
 def _topologically_order_output_depth_events(
     program: RichProgram,
@@ -1755,6 +2155,8 @@ def _canonical_operand_position(
 def _rewrite_output_depth_group_events(
     program: RichProgram,
     events: tuple[_ScheduledOutputDepthEvent, ...],
+    *,
+    emit_fragmented_batch_gathers: bool = False,
 ) -> FoldSameShapedOperationsResult:
     parameter_stack_orders = _parameter_input_stack_orders_for_events(program, events)
     input_axis0_orders = _input_axis0_orders_for_events(program, events)
@@ -1770,6 +2172,7 @@ def _rewrite_output_depth_group_events(
     batched_result_orders: list[tuple[int, ...]] = []
     non_parameter_stack_orders: list[tuple[int, ...]] = []
     concatenated_batch_orders: list[tuple[int, ...]] = []
+    gather_index_orders: list[tuple[int, ...]] = []
 
     def append_instruction(
         instruction: RichInstruction,
@@ -1779,8 +2182,15 @@ def _rewrite_output_depth_group_events(
     ) -> int:
         result_id = input_plan.n_inputs + len(instructions)
         instructions.append(instruction)
-        argument_shapes = [shapes[argument] for argument in instruction.argument_ssa_ids]
-        shapes.append(instruction.operator.propagate_shapes(argument_shapes) if output_shape is None else output_shape)
+        if output_shape is None:
+            argument_shapes = [
+                shapes[argument]
+                for argument in instruction.argument_ssa_ids
+            ]
+            output_shape = instruction.operator.propagate_shapes(
+                argument_shapes
+            )
+        shapes.append(output_shape)
         if output_format is None:
             output_format = _infer_generated_tensor_format(
                 instruction.operator,
@@ -1855,6 +2265,56 @@ def _rewrite_output_depth_group_events(
             ref, start, stop = segments[0]
             return materialize_batch_segment(ref, start, stop)
 
+        if emit_fragmented_batch_gathers:
+            sources = tuple(
+                dict.fromkeys(
+                    ref.source_ssa_id
+                    for ref, _start, _stop in segments
+                )
+            )
+            if len(sources) == 1:
+                gathered_source = sources[0]
+            else:
+                gathered_source = append_instruction(
+                    RichInstruction(
+                        operator=OperatorConcat(axis=0),
+                        argument_ssa_ids=sources,
+                    ),
+                    output_format=ref_format(batch_refs[0]),
+                )
+
+            offsets: dict[int, int] = {}
+            offset = 0
+            for source in sources:
+                offsets[source] = offset
+                offset += shapes[source][0]
+            indices = tuple(
+                offsets[ref.source_ssa_id] + index
+                for ref, start, stop in segments
+                for index in range(start, stop)
+            )
+            gather_input_id = -len(gather_index_orders) - 1
+            gather_index_orders.append(indices)
+            result_id = append_instruction(
+                RichInstruction(
+                    operator=OperatorTake(axis=0),
+                    argument_ssa_ids=(
+                        gathered_source,
+                        gather_input_id,
+                    ),
+                ),
+                output_shape=(
+                    len(batch_refs),
+                    *ref_shape(batch_refs[0]),
+                ),
+                output_format=ref_format(batch_refs[0]),
+            )
+            concatenated_batches[batch_key] = result_id
+            original_order = _original_ssa_order(batch_refs)
+            if original_order is not None:
+                concatenated_batch_orders.append(original_order)
+            return result_id
+
         segment_ids = tuple(materialize_batch_segment(ref, start, stop) for ref, start, stop in segments)
         result_id = append_instruction(
             RichInstruction(
@@ -1898,7 +2358,10 @@ def _rewrite_output_depth_group_events(
     for event in events:
         if not isinstance(event, int):
             grouped_refs = _group_refs_by_canonical_operand(event, tensor_map)
-            batched_arguments = tuple(materialize_batch(refs) for refs in grouped_refs)
+            batched_arguments = tuple(
+                materialize_batch(refs)
+                for refs in grouped_refs
+            )
             batched_operator = _make_batched_operator(event.operator)
             batched_result_id = append_instruction(
                 RichInstruction(
@@ -1959,9 +2422,37 @@ def _rewrite_output_depth_group_events(
     if not _is_last_result(output_id, input_plan.n_inputs, instructions):
         raise RuntimeError("rewritten program output was not materialized as the last result")
 
+    gather_count = len(gather_index_orders)
+    if gather_count:
+
+        def remap_gather_argument(argument: int) -> int:
+            if argument < 0:
+                return input_plan.n_inputs + (-argument - 1)
+            if argument >= input_plan.n_inputs:
+                return argument + gather_count
+            return argument
+
+        instructions = [
+            map_instruction_arguments(
+                instruction,
+                remap_gather_argument,
+            )
+            for instruction in instructions
+        ]
+        shapes = [
+            *shapes[: input_plan.n_inputs],
+            *((len(indices),) for indices in gather_index_orders),
+            *shapes[input_plan.n_inputs :],
+        ]
+        tensor_formats = [
+            *tensor_formats[: input_plan.n_inputs],
+            *("dense" for _ in gather_index_orders),
+            *tensor_formats[input_plan.n_inputs :],
+        ]
+
     rewritten_program = RichProgram(
         instructions=instructions,
-        n_inputs=input_plan.n_inputs,
+        n_inputs=input_plan.n_inputs + gather_count,
         stability_mode=program.stability_mode,
         shapes=shapes,
         tensor_formats=tensor_formats,
@@ -1974,6 +2465,7 @@ def _rewrite_output_depth_group_events(
         parameter_stack_orders=parameter_stack_orders,
         input_axis0_orders=input_plan.input_axis0_orders,
         concatenated_batch_orders=tuple(concatenated_batch_orders),
+        gather_index_orders=tuple(gather_index_orders),
     )
 
 
