@@ -6,7 +6,7 @@ import torch
 from cirkit.symbolic.layers import SumLayer
 
 from demo.cirkit import append_row, make_symbolic_circuit, preprocess_xe_program, set_seed, setup_xe_training, translate_cirkit_to_xe
-from demo.cirkit_logspace_ablation import TUCKER_VARIANTS, VARIANTS
+from experiments.ablation import VARIANTS
 from extended_einsum.preprocess import FoldSameShapedOperations
 
 
@@ -20,46 +20,26 @@ def run_compiled_steps_eagerly_in_unit_tests(monkeypatch) -> None:
 
 
 def test_scaled_ablation_defaults_to_maximum_normalization() -> None:
-    assert VARIANTS["xe-scaled"].semiring == "scaled-max"
-    assert VARIANTS["xe-scaled"].optimize_group_order
-    assert VARIANTS["xe-scaled-differentiable"].semiring == "scaled-max"
-    assert VARIANTS["xe-scaled-differentiable"].shift_mode == "differentiable"
-    assert VARIANTS["xe-scaled-differentiable"].optimize_group_order
-    assert TUCKER_VARIANTS["xe-tucker-scaled"].semiring == "scaled-max"
-    assert (
-        TUCKER_VARIANTS[
-            "xe-tucker-logspace-differentiable"
-        ].shift_mode
-        == "differentiable"
-    )
-    assert TUCKER_VARIANTS[
-        "xe-tucker-logspace-differentiable"
-    ].optimize_group_order
-    assert not TUCKER_VARIANTS[
-        "xe-tucker-scaled-unordered"
-    ].optimize_group_order
-    assert (
-        TUCKER_VARIANTS[
-            "xe-tucker-scaled-differentiable"
-        ].shift_mode
-        == "differentiable"
-    )
-    assert TUCKER_VARIANTS[
-        "xe-tucker-scaled-differentiable"
-    ].optimize_group_order
-    assert VARIANTS["xe-scaled-sum"].semiring == "scaled-sum"
-    assert TUCKER_VARIANTS["xe-tucker-scaled-sum"].semiring == "scaled-sum"
+    assert VARIANTS["xe"].semiring == "scaled-max"
+    assert VARIANTS["xe"].optimize_group_order
+    assert VARIANTS["shift-gradients"].semiring == "scaled-max"
+    assert VARIANTS["shift-gradients"].shift_mode == "differentiable"
+    assert VARIANTS["shift-gradients"].optimize_group_order
+    assert VARIANTS["logspace"].semiring == "lse-sum"
+    assert VARIANTS["logspace"].shift_mode == "xe"
+    assert VARIANTS["logspace"].optimize_group_order
+    assert not VARIANTS["no-ordering"].optimize_group_order
+    assert VARIANTS["logspace-shift-gradients"].semiring == "lse-sum"
+    assert VARIANTS["logspace-shift-gradients"].shift_mode == "differentiable"
+    assert VARIANTS["logspace-shift-gradients"].optimize_group_order
 
 
 def test_cp_counterfactuals_remove_one_production_optimization() -> None:
-    production = VARIANTS["xe-scaled"]
-    unordered = VARIANTS["xe-scaled-unordered"]
-    differentiable = VARIANTS["xe-scaled-differentiable"]
-    logspace = VARIANTS["xe-logspace"]
-    unoptimized_stability = VARIANTS["xe-logspace-differentiable"]
-    unoptimized_stability_unordered = VARIANTS[
-        "xe-logspace-differentiable-unordered"
-    ]
+    production = VARIANTS["xe"]
+    unordered = VARIANTS["no-ordering"]
+    differentiable = VARIANTS["shift-gradients"]
+    logspace = VARIANTS["logspace"]
+    unoptimized_stability = VARIANTS["logspace-shift-gradients"]
 
     assert (
         production.shift_mode,
@@ -86,11 +66,6 @@ def test_cp_counterfactuals_remove_one_production_optimization() -> None:
         unoptimized_stability.semiring,
         unoptimized_stability.optimize_group_order,
     ) == ("differentiable", "lse-sum", True)
-    assert (
-        unoptimized_stability_unordered.shift_mode,
-        unoptimized_stability_unordered.semiring,
-        unoptimized_stability_unordered.optimize_group_order,
-    ) == ("differentiable", "lse-sum", False)
 
 
 def test_tucker_sum_weights_use_output_first_layout_and_normalize_all_inputs() -> None:
@@ -347,6 +322,7 @@ def test_input_depth_fold_reproduces_metadata_free_quad_graph_structure(
     )
     for operator, expected_count in expected_counts.items():
         assert operator_counts[operator] == expected_count
+
 
 def test_input_depth_fold_emits_fragmented_batch_gathers_directly() -> None:
     circuit = make_symbolic_circuit(width=4, height=4, num_units=3, sum_product_layer="cp")

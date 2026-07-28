@@ -66,7 +66,7 @@ The public interface currently includes:
 - `exp`, `log`, `sin`, `cos`, `tan`, `sqrt`, `inverse`, and `softmax`
 - `TensorExpression.materialize` and `extract_program`
 
-Supported execution backends are PyTorch, NumPy, and optional JAX. Rich programs can be evaluated in `unstable`, `scaled_min`, `scaled_sum`, `logspace_min`, or `logspace_max` mode. Support is operator-dependent; unsupported combinations raise `NotImplementedError` instead of silently changing semantics.
+Supported execution backends are PyTorch, NumPy, and optional JAX. Rich programs can be evaluated in `unstable`, `scaled_min`, `scaled_max`, `scaled_sum`, `logspace_min`, or `logspace_max` mode. Support is operator-dependent; unsupported combinations raise `NotImplementedError` instead of silently changing semantics.
 
 The preprocessing API also provides expression folding and contraction-path optimization. DAG plotting is available from `extended_einsum.visualization` when the visualization extra is installed.
 
@@ -82,7 +82,48 @@ python examples/jax_backend.py                    # requires [jax]
 python examples/visualize_expression.py graph.png # requires [visualization]
 ```
 
-The advanced [`demo/cirkit.py`](https://github.com/ti2-group/extended_einsum/blob/main/demo/cirkit.py) integration is also standalone, but requires the repository demo dependencies and currently Python 3.12 or 3.13 because of Cirkit's SciPy constraint. Its defaults use a small synthetic circuit; training and benchmark sweeps are opt-in. Generated benchmark data and plots are repository artifacts and are never included in distributions.
+The advanced [`demo/cirkit.py`](demo/cirkit.py) integration requires the repository demo dependencies and currently Python 3.12 or 3.13 because of Cirkit's SciPy constraint. The publication experiments use it as the shared Cirkit/XE model adapter.
+
+## Reproducing the paper experiments
+
+The complete, current reproduction workflow is documented in
+[`experiments/README.md`](experiments/README.md). The publication suite has
+three isolated experiments:
+
+- CP and Tucker runtime and peak-memory comparisons between production
+  Extended Einsum and untouched Cirkit.
+- CP and Tucker ablations of log-space arithmetic, shift gradients, their
+  combined effect, and consumer ordering.
+- An exactly parameter-matched CP-T comparison with PyJuice 2.6.1, production
+  Extended Einsum, and Cirkit.
+
+Every configuration runs in a fresh Python process. The common training
+protocol uses 30 warmup batches, 90 measured batches, and five seeds. The
+compact CSVs contain one summary row per seed and configuration.
+
+Run the complete suite sequentially on one GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 experiments/run_all.sh
+```
+
+Or run and plot the experiments individually:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/speedup.py
+CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/ablation.py
+CUDA_VISIBLE_DEVICES=0 uv run --group demo --with pyjuice==2.6.1 \
+  python experiments/pyjuice_cp_t/benchmark.py
+
+uv run --group demo python experiments/plot_speedup.py
+uv run --group demo python experiments/plot_ablation.py
+uv run --group demo python experiments/pyjuice_cp_t/plot.py
+```
+
+Results are written to `experiments/results/` and
+`experiments/pyjuice_cp_t/results/`. Paper-ready PDFs are written to
+`experiments/plots/` and `experiments/pyjuice_cp_t/plots/`. Generated CSVs are
+excluded from distributions.
 
 ## Development
 
