@@ -8,9 +8,10 @@ versioned result files, legacy backends, or compatibility columns.
 
 | Experiment | Runner | Plotter | Results | Figures |
 |---|---|---|---|---|
-| CP and Tucker speedup/memory | `speedup.py` | `plot_speedup.py` | `results/speedup.csv` | `plots/speedup_{cp,tucker}.pdf`, `plots/memory_reduction_{cp,tucker}.pdf` |
+| CP and Tucker speedup/memory | `speedup.py` | `plot_speedup.py` | `results/speedup.csv` | `plots/speedup_{cp,tucker}.pdf`, `plots/memory_{reduction,usage}_{cp,tucker}.pdf` |
 | CP and Tucker ablations | `ablation.py` | `plot_ablation.py` | `results/ablation.csv` | `plots/ablation_{cp,tucker}.pdf` |
 | Parameter-matched CP-T comparison | `pyjuice_cp_t/benchmark.py` | `pyjuice_cp_t/plot.py` | `pyjuice_cp_t/results/comparison.csv` | `pyjuice_cp_t/plots/*.pdf` |
+| Dense/Monarch full-image comparison | `monarch/benchmark.py` | `monarch/table.py` | `monarch/results/performance.csv` | `monarch/tables/performance_{main,supplement}.tex` |
 
 Runners resume automatically from successful rows. Every configuration is run
 in a fresh Python process, so compiled graphs and CUDA allocator state cannot
@@ -50,7 +51,8 @@ implementation: scaled-max stability, detached shifts, input-depth folding,
 contraction-path optimization, and consumer ordering. Cirkit remains its native
 log-space baseline. Both CP and Tucker are evaluated on quad trees and quad
 graphs at batches 256 and 512. The grid in `speedup.py` is explicit and excludes
-the configurations already established to run out of memory.
+the configurations already established to run out of memory. CP widths start
+at 64 units for every graph and batch-size series.
 
 Run and plot:
 
@@ -91,11 +93,30 @@ CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/ablation.py
 uv run --group demo python experiments/plot_ablation.py
 ```
 
+## Monarch full-image experiment
+
+The Monarch experiment uses full `64 x 64` grayscale ImageNet64 images and CP
+quad-tree/quad-graph circuits. Within each scale point, Cirkit and XE use
+identical canonical logits, trainable tensors, and deterministic image orders.
+Cirkit performs its native folding; XE uses only the current input-depth
+folding implementation. Dense and Monarch parameterizations are both included,
+with larger hidden widths for the structured Monarch sums. In addition to the
+compact summary CSV, the runner records one raw timing row per measured batch.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --group demo \
+  python experiments/monarch/benchmark.py
+uv run --group demo python experiments/monarch/table.py
+```
+
+See [`monarch/README.md`](monarch/README.md) for the layouts, factor shapes,
+safe grid, and matching guarantees.
+
 ## Complete sequential run
 
-`run_all.sh` executes the speedup, ablation, and CP-T experiments sequentially
-on one visible GPU, then renders every PDF. Sequential execution avoids
-cross-experiment GPU and compilation interference.
+`run_all.sh` executes the speedup, ablation, CP-T, and Monarch experiments
+sequentially on one visible GPU, then renders every PDF and LaTeX table.
+Sequential execution avoids cross-experiment GPU and compilation interference.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 experiments/run_all.sh

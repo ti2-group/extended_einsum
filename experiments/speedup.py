@@ -26,8 +26,8 @@ VARIANTS = {
 # Explicitly list only configurations established to fit in GPU memory.
 SAFE_GRID = {
     "cp": {
-        "quad-tree-2": {256: (128, 256, 512, 1024), 512: (128, 256, 512, 1024)},
-        "quad-graph": {256: (128, 256, 512), 512: (128, 256, 512)},
+        "quad-tree-2": {256: (64, 128, 256, 512, 1024), 512: (64, 128, 256, 512, 1024)},
+        "quad-graph": {256: (64, 128, 256, 512), 512: (64, 128, 256, 512)},
     },
     "tucker": {
         "quad-tree-2": {256: (32, 64), 512: (32, 64)},

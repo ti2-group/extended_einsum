@@ -37,6 +37,7 @@ VARIANT_LABELS = {
 }
 FORWARD_COLOR = "#56B4E9"
 BACKWARD_COLOR = "#D55E00"
+LAYER_LABELS = {"cp": "CP", "tucker": "Tucker"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,7 +130,7 @@ def plot_layer(rows: pd.DataFrame, *, layer: str, output: Path) -> None:
                 ax.set_ylabel("Runtime relative to XE")
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.07, 0.98), ncol=2)
-    fig.suptitle(f"Extended Einsum {layer.upper()} Ablation", y=1.02)
+    fig.suptitle(f"Extended Einsum {LAYER_LABELS[layer]} Ablation", y=1.02)
     save_pdf(fig, output)
 
 

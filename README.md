@@ -88,7 +88,7 @@ The advanced [`demo/cirkit.py`](demo/cirkit.py) integration requires the reposit
 
 The complete, current reproduction workflow is documented in
 [`experiments/README.md`](experiments/README.md). The publication suite has
-three isolated experiments:
+four isolated experiments:
 
 - CP and Tucker runtime and peak-memory comparisons between production
   Extended Einsum and untouched Cirkit.
@@ -96,6 +96,8 @@ three isolated experiments:
   combined effect, and consumer ordering.
 - An exactly parameter-matched CP-T comparison with PyJuice 2.6.1, production
   Extended Einsum, and Cirkit.
+- A matched dense/Monarch CP comparison on full `64 x 64` grayscale ImageNet64
+  inputs, using native Cirkit folding and Extended Einsum input-depth folding.
 
 Every configuration runs in a fresh Python process. The common training
 protocol uses 30 warmup batches, 90 measured batches, and five seeds. The
@@ -114,16 +116,21 @@ CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/speedup.py
 CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/ablation.py
 CUDA_VISIBLE_DEVICES=0 uv run --group demo --with pyjuice==2.6.1 \
   python experiments/pyjuice_cp_t/benchmark.py
+CUDA_VISIBLE_DEVICES=0 uv run --group demo \
+  python experiments/monarch/benchmark.py
 
 uv run --group demo python experiments/plot_speedup.py
 uv run --group demo python experiments/plot_ablation.py
 uv run --group demo python experiments/pyjuice_cp_t/plot.py
+uv run --group demo python experiments/monarch/table.py
 ```
 
 Results are written to `experiments/results/` and
 `experiments/pyjuice_cp_t/results/`. Paper-ready PDFs are written to
 `experiments/plots/` and `experiments/pyjuice_cp_t/plots/`. Generated CSVs are
-excluded from distributions.
+excluded from distributions. The Monarch experiment keeps its results under
+`experiments/monarch/results/` and its LaTeX tables under
+`experiments/monarch/tables/`.
 
 ## Development
 
