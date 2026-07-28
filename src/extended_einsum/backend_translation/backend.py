@@ -19,6 +19,8 @@ TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 class BackendFunctions(Protocol[TBackendArray]):
     @staticmethod
     def stop_gradient(array: TBackendArray) -> TBackendArray: ...
+    # Paper "Detached reference shifts" (sec:numerical-stability): translations
+    # call this on every shift/normalizer whose derivative cancels exactly.
 
     @staticmethod
     def exp(array: TBackendArray) -> TBackendArray: ...

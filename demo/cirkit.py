@@ -233,6 +233,9 @@ def preprocess_xe_program(
     if not optimize_stacking:
         return program
 
+    # Paper compiler pipeline (sec:compiler-optimizations): first apply
+    # "IR-Level Folding" plus the consumer ordering of sec:memory-layout, then
+    # merge nested einsums and choose pairwise paths (sec:contraction-path).
     folded = FoldSameShapedOperations.apply(program)
     return OptimizeContractionPaths.apply(folded)
 
@@ -455,6 +458,9 @@ def torch_program_runner(
     class DifferentiableShiftTorchBackendFunctions(TorchBackendFunctions):
         @staticmethod
         def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+            # Paper ablation "What drives the gains?": this deliberately
+            # disables "Detached reference shifts" while leaving the forward
+            # log-space/scaled formulas unchanged.
             return array
 
     if shift_mode not in {"differentiable", "xe"}:
@@ -521,11 +527,16 @@ def setup_xe_training(
             "scaled-sum": "scaled_sum",
         }[semiring],
     )
+    # Publication implementation of paper "IR-Level Folding" and
+    # sec:memory-layout. Metadata records one-time parameter/input packing and
+    # any unavoidable gather indices used by the rewritten program.
     folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
         program,
         optimize_group_order=optimize_group_order,
     )
     runtime_program = (
+        # Paper sec:contraction-path: merge nested einsums and lower them to the
+        # optimizer-selected pairwise schedule.
         OptimizeContractionPaths.apply(folded.program)
         if optimize_contraction_paths
         else folded.program

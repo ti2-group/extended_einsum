@@ -13,6 +13,8 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @override
     @staticmethod
     def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+        # Paper "Detached reference shifts" (sec:numerical-stability):
+        # remove the backward path through max-based reference shifts.
         return array.detach()
 
     @override

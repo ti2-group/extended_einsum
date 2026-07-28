@@ -28,8 +28,25 @@ from extended_einsum.utils import is_contraction_free_einsum, normalize_axis, pa
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
+# Paper implementation map ("Automatic Numerical Stability",
+# sec:numerical-stability):
+# - _append_logspace_einsum implements "Log-space einsum".
+# - every stop_gradient applied to a shift/normalizer implements "Detached
+#   reference shifts".
+# - _scaled_positions and _append_scaled_einsum implement "Scaled evaluation".
+# The remaining instruction translators propagate those representations through
+# the extended language described in "Beyond Standard Einsum".
+
 
 def translate_to_backend_program(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
+    """Insert the paper's stability transformation while lowering the IR.
+
+    This is the final backend-independent compiler stage in Figure
+    ``fig:pipeline`` and sec:compiler-optimizations. The selected stability mode
+    chooses direct evaluation, conventional log-space evaluation, or the
+    paper's scaled representation before backend compilation.
+    """
+
     match rich_program.stability_mode:
         case "unstable":
             return _translate_unstable(rich_program, backend_functions)
@@ -118,11 +135,10 @@ def _translate_unstable(rich_program: RichProgram, backend_functions: BackendFun
     return builder.build()
 
 
-# in the scaled translation, an SSA value is available in some of three parts:
-# "raw" is the value itself, while "normalized" and "log_scale" form a scaled
-# pair with raw = normalized * exp(log_scale).  The log scale is broadcastable
-# to the value; for batched or folded tensors it keeps one independent scale
-# per last-axis fiber.
+# Paper "Scaled evaluation": represent every positive value as
+# X = X_hat * exp(s). "raw" is X, while "normalized" and "log_scale" are
+# X_hat and s. The scale broadcasts to X; folded tensors keep one scale per
+# last-axis fiber.
 _ScaledPart = Literal["raw", "normalized", "log_scale"]
 _ScaledPositions = dict[tuple[int, _ScaledPart], int]
 _ScaledShapes = dict[int, Shape]
@@ -135,6 +151,7 @@ def _translate_scaled(
 ) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are scaled pairs of a normalized tensor and a broadcastable log scale.
 
+    Paper reference: "Scaled evaluation" in sec:numerical-stability.
     Scaling is lazy: a value stays a raw tensor until an operator consumes it as a scaled pair, then each last-axis fiber is normalized by its sum
     (scaled_sum), maximum (scaled_max), or minimum (scaled_min), which assumes strictly positive values. The log and softmax operators eliminate the scale again,
     so their results are stored as raw tensors. Parameter-derived values stay linear in einsums.
@@ -163,7 +180,7 @@ def _translate_scaled(
 
 
 def _raw_position(builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], positions: _ScaledPositions, ssa_id: int) -> int:
-    """Position of the value as a raw tensor, converting it from its scaled pair at most once."""
+    """Recover ``X = X_hat * exp(s)`` from paper "Scaled evaluation" once."""
 
     if (ssa_id, "raw") not in positions:
         scale_factor_position = builder.wrap_and_append(backend_functions.exp, (positions[ssa_id, "log_scale"],))
@@ -180,7 +197,13 @@ def _scaled_positions(
     ssa_id: int,
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
 ) -> tuple[int, int]:
-    """Positions of the value as a scaled pair, converting it from its raw tensor at most once by normalizing each last-axis fiber."""
+    """Construct the scaled pair from paper "Scaled evaluation".
+
+    For maximum normalization this emits exactly
+    ``n = sg(max(X))``, ``X_hat = X / n``, and ``s = log(n)`` for each
+    last-axis fiber. The min/sum modes are implementation variants using the
+    same representation identity.
+    """
 
     if (ssa_id, "normalized") not in positions:
         raw_position = positions[ssa_id, "raw"]
@@ -191,8 +214,9 @@ def _scaled_positions(
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_position,))
             case "scaled_sum":
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_position,))
-        # The norm only chooses a representation: its derivative cancels
-        # between raw / norm and log(norm) when the scaled pair is consumed.
+        # Paper "Detached reference shifts": n only chooses a representation,
+        # because (X / n) * exp(log(n)) = X. Detaching n is therefore exact and
+        # removes the reduction's backward graph.
         total_position = builder.wrap_and_append(backend_functions.stop_gradient, (total_position,))
         positions[ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_position, total_position))
         positions[ssa_id, "log_scale"] = builder.wrap_and_append(backend_functions.log, (total_position,))
@@ -254,7 +278,12 @@ def _append_rescaled_values(
     *,
     reduce_scales_to_scalar: bool = False,
 ) -> tuple[list[int], int, Shape]:
-    """Brings scaled pairs to a common log scale, the maximum of their log scales, and returns the positions of the rescaled values and of the common log scale."""
+    """Align scaled values using the reference-shift rule from the paper.
+
+    Paper reference: the contracted-scale alignment at the end of "Scaled
+    evaluation". Each value absorbs ``exp(s - s_bar)`` while ``s_bar`` is
+    retained as the common output scale.
+    """
 
     if not scaled_pairs:
         raise ValueError("At least one scaled pair is required")
@@ -269,9 +298,8 @@ def _append_rescaled_values(
         common_scale_position = builder.wrap_and_append(backend_functions.maximum, (common_scale_position, log_scale_position))
         if not reduce_scales_to_scalar:
             common_scale_shape = infer_binary_shape(common_scale_shape, scale_shape)
-    # The common scale is a numerical reference: it is subtracted before
-    # exponentiation and restored as the resulting scale. Its derivative
-    # therefore cancels exactly in the represented value.
+    # Paper "Detached reference shifts": s_bar is subtracted before
+    # exponentiation and restored afterward, so its derivative cancels exactly.
     common_scale_position = builder.wrap_and_append(backend_functions.stop_gradient, (common_scale_position,))
     rescaled_positions: list[int] = []
     for normalized_position, log_scale_position in scaled_pairs:
@@ -302,7 +330,13 @@ def _append_scaled_einsum(
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
-    """Einsum on fiber-scaled data operands and linear parameter-derived operands."""
+    """Implement an einsum on the paper's ``(X_hat, s)`` representation.
+
+    Paper reference: "Scaled evaluation". Linear parameter-derived operands
+    remain unchanged; data operands keep normalized values and broadcastable
+    log scales. Contracted scale axes are aligned before the dense contraction,
+    and the result is normalized for direct consumption by the next layer.
+    """
 
     input_strings, output_string = parse_format_string(format_string)
     if len(input_strings) != len(argument_ssa_ids):
@@ -327,6 +361,9 @@ def _append_scaled_einsum(
         retained_labels = "".join(output_label for output_label in output_string if output_label in input_string)
         reduction_axes = tuple(axis for axis, input_label in enumerate(input_string) if input_label not in output_string)
         if reduction_axes and not scale_shape_is_scalar and (not scale_shape_is_known or any(scale_shape[axis] != 1 for axis in reduction_axes)):
+            # Paper's Tucker example: when s varies on a contracted label,
+            # compute s_bar = sg(max(s)), absorb exp(s - s_bar) into X_hat,
+            # and propagate only s_bar to the output.
             common_scale_position = builder.wrap_and_append(partial(backend_functions.max, axis=reduction_axes, keepdims=True), (log_scale_position,))
             # This reduction only selects a reference scale for a contraction;
             # its derivative cancels between rescaling and scale restoration.
@@ -341,9 +378,9 @@ def _append_scaled_einsum(
         einsum_argument_positions.append(normalized_position)
         shift_positions.append((common_scale_position, common_scale_shape, scale_shape_is_known, input_string, retained_labels))
 
-    # A contraction-free einsum only multiplies and broadcasts its operands.
-    # Keep the normalized tensors and their log scales separate instead of
-    # renormalizing a materialized Kronecker product.
+    # Paper "Log-space einsum" notes that contraction-free Hadamard/Kronecker
+    # products need no shift. In scaled form, multiply/broadcast X_hat and add
+    # the log scales without renormalizing a materialized outer product.
     if is_contraction_free_einsum(format_string) and all(scale_shape_is_known for _, _, scale_shape_is_known, _, _ in shift_positions):
         positions[result_ssa_id, "normalized"] = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
         result_scale_position: int | None = None
@@ -364,6 +401,8 @@ def _append_scaled_einsum(
         scale_shapes[result_ssa_id] = result_scale_shape
         return
 
+    # Paper "Scaled evaluation": contract normalized data with the unchanged
+    # linear weights using an ordinary dense backend einsum.
     raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
     match stability_mode:
         case "scaled_min":
@@ -372,12 +411,14 @@ def _append_scaled_einsum(
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_einsum_position,))
         case "scaled_sum":
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
-    # As above, this normalization is a gauge transformation, so propagating
-    # through the norm adds work without changing the represented derivative.
+    # Paper "Detached reference shifts": output normalization changes only the
+    # (X_hat, s) representation, so stop-gradient preserves the derivative.
     raw_norm_position = builder.wrap_and_append(backend_functions.stop_gradient, (raw_norm_position,))
     positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
     log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
     result_scale_shape = _fiber_scale_shape(value_shapes[result_ssa_id])
+    # Restore every operand's retained scale on the corresponding output labels,
+    # which is the "+ s" step of the paper's scaled sum-layer construction.
     for operand_scale_position, operand_scale_shape, scale_shape_is_known, input_string, retained_labels in shift_positions:
         scale_already_broadcasts_to_output = scale_shape_is_known and len(operand_scale_shape) == len(output_string) and all(
             dimension == 1 or input_label == output_label for dimension, input_label, output_label in zip(operand_scale_shape, input_string, output_string, strict=True)
@@ -405,10 +446,21 @@ def _append_scaled_instruction(
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
+    """Propagate the pair from paper "Scaled evaluation" through the IR.
+
+    Multiplication/division add/subtract scales; layout operations transform
+    values and their broadcastable scales together; log reconstructs
+    ``log(X_hat) + s``; and softmax stays raw because the backend primitive
+    already performs its stable shift.
+    """
+
     argument_ssa_ids = instruction.argument_ssa_ids
     match instruction.operator:
         case OperatorExp():
-            # exp(a) = exp(a - m) * e^m with m = max(a) per fiber: the raw argument moves into the log scale, keeping the normalized values in (0, 1]
+            # Paper "Scaled evaluation" applied to explicit exp:
+            # exp(a) = exp(a - m) * exp(m), with m = sg(max(a)) per fiber.
+            # The raw argument moves into the log scale and normalized values
+            # remain in (0, 1].
             # (entries whose exponent is far below the maximum underflow to zero, the same tradeoff as in softmax)
             raw_position = _raw_position(builder, backend_functions, positions, argument_ssa_ids[0])
             log_scale_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_position,))
@@ -419,7 +471,8 @@ def _append_scaled_instruction(
             positions[result_ssa_id, "log_scale"] = log_scale_position
             scale_shapes[result_ssa_id] = _fiber_scale_shape(value_shapes[result_ssa_id])
         case OperatorLog():
-            # log(n * e^s) = log(n) + s, which is safe to store as a raw tensor
+            # Paper "Scaled evaluation" root reconstruction:
+            # log(X_hat * exp(s)) = log(X_hat) + s.
             normalized_position, log_scale_position = _scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_ids[0], stability_mode)
             log_position = builder.wrap_and_append(backend_functions.log, (normalized_position,))
             positions[result_ssa_id, "raw"] = builder.wrap_and_append(backend_functions.add, (log_position, log_scale_position))
@@ -428,7 +481,9 @@ def _append_scaled_instruction(
             raw_position = _raw_position(builder, backend_functions, positions, argument_ssa_ids[0])
             positions[result_ssa_id, "raw"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (raw_position,))
         case OperatorAdd() | OperatorSubtract():
-            # n1 * e^s1 ± n2 * e^s2 = (n1 * e^(s1 - m) ± n2 * e^(s2 - m)) * e^m with m = max(s1, s2)
+            # Paper's scale-alignment rule:
+            # X1_hat*e^s1 ± X2_hat*e^s2 =
+            # (X1_hat*e^(s1-m) ± X2_hat*e^(s2-m))*e^m.
             combine = backend_functions.add if isinstance(instruction.operator, OperatorAdd) else backend_functions.subtract
             scaled_pairs = [_scaled_positions(builder, backend_functions, positions, scale_shapes, value_shapes, argument_ssa_id, stability_mode) for argument_ssa_id in argument_ssa_ids]
             rescaled_positions, common_scale_position, common_scale_shape = _append_rescaled_values(
@@ -585,8 +640,9 @@ def _append_scaled_instruction(
             raise NotImplementedError(f"The operator {instruction.operator.name} has no scaled backend translation.")
 
 
-# in the logspace translation, an SSA value is available in some of two parts:
-# "raw" is the value itself and "logspace" is its natural logarithm, with raw = exp(logspace)
+# Paper "Log-space einsum": an SSA value is available as the positive value
+# itself ("raw") or as its natural logarithm ("logspace"), with
+# raw = exp(logspace).
 _LogspacePart = Literal["raw", "logspace"]
 _LogspacePositions = dict[tuple[int, _LogspacePart], int]
 
@@ -604,6 +660,7 @@ def _parameter_derived_ssa_ids(rich_program: RichProgram) -> frozenset[int]:
 def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray], stability_mode: Literal["logspace_min", "logspace_max"]) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are the natural logarithms of the actual values.
 
+    Paper reference: "Log-space einsum" in sec:numerical-stability.
     Conversion is lazy: a value stays a raw tensor until an operator consumes it in logspace, then it is converted with log,
     which assumes strictly positive values. The exp and log operators only move values between the raw and logspace parts, so a
     chain like log(einsum(exp(a), exp(b))) never materializes the raw exponentials.
@@ -647,7 +704,11 @@ def _as_logspace_position(builder: _ProgramBuilder[TBackendArray], backend_funct
 def _append_shifted(
     builder: _ProgramBuilder[TBackendArray], backend_functions: BackendFunctions[TBackendArray], log_positions: list[int], stability_mode: Literal["logspace_min", "logspace_max"]
 ) -> tuple[list[int], int]:
-    """Shifts logspace values by the scalar minimum/maximum over all of them, returning the positions of the shifted logspace values and of the shift."""
+    """Apply the paper's detached reference shift to log-space values.
+
+    This is ``m = sg(max(ell))`` from "Detached reference shifts"; the min mode
+    is an implementation variant with the same cancellation identity.
+    """
 
     norm_backend_function = backend_functions.max if stability_mode == "logspace_max" else backend_functions.min
     norm_positions = tuple(builder.wrap_and_append(norm_backend_function, (log_position,)) for log_position in log_positions)
@@ -693,16 +754,21 @@ def _append_logspace_einsum(
     stability_mode: Literal["logspace_min", "logspace_max"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
-    """Stable einsum that keeps parameter-derived weights linear and shifts other operands in log space."""
+    """Implement the paper's shifted log-space einsum formula.
+
+    For each data operand this computes its retained-index shift ``m``, forms
+    ``exp(ell - m)``, executes an ordinary linear einsum with parameter weights,
+    and returns ``log(result) + m``. See "Log-space einsum" and "Detached
+    reference shifts" in sec:numerical-stability.
+    """
 
     norm_backend_function = backend_functions.max if stability_mode == "logspace_max" else backend_functions.min
     input_strings, output_string = parse_format_string(format_string)
     if len(input_strings) != len(argument_ssa_ids):
         raise ValueError(f"The einsum format string has {len(input_strings)} inputs, but the instruction has {len(argument_ssa_ids)} arguments.")
 
-    # A contraction-free einsum is multiplication with broadcasting, which is
-    # addition with broadcasting in log space. This includes both Hadamard and
-    # Kronecker products and avoids an exp/einsum/log roundtrip.
+    # Paper "Log-space einsum": a contraction-free Hadamard or Kronecker product
+    # is broadcasted addition in log space, so omit the exp/einsum/log sequence.
     if is_contraction_free_einsum(format_string) and all(argument_ssa_id not in parameter_derived_ssa_ids for argument_ssa_id in argument_ssa_ids):
         log_argument_positions = [_as_logspace_position(builder, backend_functions, positions, argument_ssa_id) for argument_ssa_id in argument_ssa_ids]
         broadcast_positions = [
@@ -735,21 +801,27 @@ def _append_logspace_einsum(
         log_argument_position = _as_logspace_position(builder, backend_functions, positions, argument_ssa_id)
         retained_labels = "".join(output_label for output_label in output_string if output_label in input_string)
         reduction_axes = tuple(axis for axis, input_label in enumerate(input_string) if input_label not in output_string)
+        # Paper formula m = reduce_max(ell) over exactly the contracted labels;
+        # retained labels remain so m broadcasts over the corresponding output.
         if not reduction_axes:
             shift_position = log_argument_position
         elif retained_labels:
             shift_position = builder.wrap_and_append(partial(norm_backend_function, axis=reduction_axes, keepdims=True), (log_argument_position,))
         else:
             shift_position = builder.wrap_and_append(norm_backend_function, (log_argument_position,))
-        # As for log-addition above, this shift is a gauge choice whose
-        # derivative cancels exactly in the shifted einsum expression.
+        # Paper "Detached reference shifts": m is subtracted before contraction
+        # and restored afterward, hence its derivative path contributes zero.
         shift_position = builder.wrap_and_append(backend_functions.stop_gradient, (shift_position,))
         log_shifted_position = builder.wrap_and_append(backend_functions.subtract, (log_argument_position, shift_position))
         raw_argument_positions.append(builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)))
         shift_positions.append((shift_position, input_string, retained_labels))
 
+    # Central operation from paper "Log-space einsum": the shifted positive
+    # operands and unchanged linear weights use the ordinary dense kernel.
     raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_argument_positions))
     log_einsum_position = builder.wrap_and_append(backend_functions.log, (raw_einsum_position,))
+    # Restore every operand shift on the retained output labels: the final
+    # ``+ m`` in the paper's log Y formula.
     for shift_position, input_string, retained_labels in shift_positions:
         if retained_labels:
             shift_position = builder.wrap_and_append(partial(backend_functions.einsum, f"{input_string}->{retained_labels}"), (shift_position,))
@@ -767,6 +839,12 @@ def _append_logspace_instruction(
     stability_mode: Literal["logspace_min", "logspace_max"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
+    """Propagate the representation from paper "Log-space einsum" through IR.
+
+    Products/divisions become addition/subtraction, layout operations commute
+    with elementwise log, and explicit exp/log only move between stored parts.
+    """
+
     argument_ssa_ids = instruction.argument_ssa_ids
     match instruction.operator:
         case OperatorExp():

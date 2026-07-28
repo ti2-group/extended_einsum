@@ -451,10 +451,14 @@ def setup_xe(
     )
     canonical = canonicalize_parameters(symbolic, seed=seed)
     program, inputs = translate_to_xe(symbolic, batch_size=batch_size)
+    # Paper "IR-Level Folding" and sec:memory-layout: batch matching Monarch
+    # operations and choose a consumer-aware fold-axis/input layout.
     folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
         program,
         optimize_group_order=True,
     )
+    # Paper sec:contraction-path: fuse factor construction with its consumer
+    # and emit the size-optimized pairwise contraction schedule.
     runtime_program = OptimizeContractionPaths.apply(folded.program)
     gather_orders = folded.gather_index_orders
     index_input_ids = frozenset(

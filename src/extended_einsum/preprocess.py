@@ -64,6 +64,14 @@ _BATCHABLE_OPERATOR_NAMES = frozenset(
 _CONTRACTION_PATH_ATTEMPTS = 8
 _GROUP_ORDER_BEAM_WIDTH = 16
 
+# Paper implementation map ("Compiler Optimizations",
+# sec:compiler-optimizations):
+# - extract_connected_einsum_components and OptimizeContractionPaths implement
+#   "Contraction Path" (sec:contraction-path).
+# - grouping and FoldSameShapedOperations implement "IR-Level Folding".
+# - the group-order search, materialization cost, and rewrite helpers implement
+#   "Memory Layout Optimizations" (sec:memory-layout).
+
 
 class _EinsumLabelAllocator:
     def __init__(
@@ -151,7 +159,12 @@ def group_identical_ops_by_output_depth(
     *,
     min_group_size: int = 2,
 ) -> tuple[OutputDepthOpGroup, ...]:
-    """Group live, batchable, canonically identical ops by nearest output depth."""
+    """Find the shape-compatible parallel operations folded by one batched op.
+
+    Paper reference: "IR-Level Folding". Grouping uses operator semantics,
+    operand shapes/formats, and compatible graph depth; canonical operand order
+    lets equivalent commutative/einsum operations share the added fold axis.
+    """
     if min_group_size < 1:
         raise ValueError("min_group_size must be at least 1")
 
@@ -214,6 +227,11 @@ def group_identical_ops_by_input_depth(
     split_by_routing: bool = False,
 ) -> tuple[OutputDepthOpGroup, ...]:
     """Group live, batchable, canonically identical ops by input frontier.
+
+    This is the input-oriented implementation of paper "IR-Level Folding" used
+    by the publication's metadata-free Cirkit/Monarch integration. It retains
+    the paper's matching-shape batching rule while choosing compatible groups
+    from their nearest input frontier rather than nearest output depth.
 
     Ordinary SSA values use their longest-path depth from the program inputs.
     Parameter-only preprocessing is different: independent weight transforms
@@ -981,7 +999,13 @@ def _is_outer_product_einsum(format_string: str) -> bool:
 def extract_connected_einsum_components(
     program: RichProgram,
 ) -> tuple[_ConnectedEinsumComponent, ...]:
-    """Find einsum components by walking from the program output to its inputs."""
+    """Merge nested einsums into candidate n-ary contraction components.
+
+    This is the format-string substitution in paper "Contraction Path"
+    (sec:contraction-path): for example, the producer ``kij,ljk->klij`` is
+    substituted into its consumer ``ij,klij->kl`` to obtain
+    ``ij,kij,ljk->kl``. Consistent component-wide labels prevent collisions.
+    """
     components: list[_ConnectedEinsumComponent] = []
     visited: set[int] = set()
     pending_ssa_ids = [program.output_ssa]
@@ -1080,10 +1104,18 @@ def extract_connected_einsum_components(
 
 
 class OptimizeContractionPaths(PreprocessingRoutine):
+    """Apply the paper's contraction merging and pairwise path optimization.
+
+    See "Contraction Path" (sec:contraction-path). The output replaces a fused
+    n-ary component by pairwise einsums such as ``ij,kij->kj`` followed by
+    ``kj,ljk->kl``, avoiding materialization of the full weight tensor.
+    """
+
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
-        # Compute a replacement contraction path for each extracted component.
+        # Paper "Contraction Path", step 1: merge every eligible, uniquely
+        # consumed einsum tree by substituting producer index strings.
         result_depths = _ssa_depths_from_inputs(program)
         blocks: dict[
             int,
@@ -1112,6 +1144,8 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 continue
             else:
                 boundary_shapes = tuple(program.shapes[argument] for argument in component.boundary_arguments)
+                # Paper "Contraction Path", step 2: pass the merged n-ary
+                # expression to the contraction-path optimizer.
                 planned_instructions = _compute_depth_preserving_contraction_plan(
                     component,
                     boundary_shapes,
@@ -1132,8 +1166,9 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         if not blocks:
             return program
 
-        # Operations in a planned component are omitted from the old program and
-        # replaced by the new pairwise contractions when its sink is reached.
+        # Paper "Contraction Path", step 3: replace the component with the
+        # optimizer's pairwise schedule so large intermediates such as W in the
+        # Monarch example are never materialized.
         block_ops = {op_index for component, _arguments, _instructions in blocks.values() for op_index in component}
         tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
         instructions: list[RichInstruction] = []
@@ -1211,9 +1246,18 @@ def _compute_depth_preserving_contraction_plan(
     *,
     prioritize_output_labels: bool = False,
 ) -> tuple[RichInstruction, ...] | None:
+    """Choose the paper's pairwise schedule with the sesum/cgreedy optimizer.
+
+    The depth guard is an implementation constraint: it keeps the rewritten
+    graph no deeper than the original component while minimizing intermediate
+    size, matching the paper's goal of avoiding materialized weight tensors.
+    """
+
     from sesum import sr
 
     original_sink_depth = result_depths[n_inputs + component.sink_op_index]
+    # Multiple deterministic seeds are tried because the paper permits a
+    # heuristic contraction-path optimizer rather than prescribing one path.
     for seed in range(_CONTRACTION_PATH_ATTEMPTS):
         try:
             path, _flops, _size = sr.compute_path(
@@ -1309,6 +1353,14 @@ _ScheduledOutputDepthEvent = int | OutputDepthOpGroup
 
 
 class FoldSameShapedOperations(PreprocessingRoutine):
+    """Batch shape-compatible IR operations and optimize their fold-axis layout.
+
+    Paper references: "IR-Level Folding" for adding the fold axis and evaluating
+    a group with one batched operator; "Memory Layout Optimizations"
+    (sec:memory-layout) for permuting group members to reduce downstream
+    slices/concatenations without changing the computed function.
+    """
+
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
@@ -1321,6 +1373,15 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         *,
         optimize_group_order: bool = True,
     ) -> FoldSameShapedOperationsResult:
+        """Fold output-depth groups and expose all required input permutations.
+
+        ``optimize_group_order`` enables the consumer-aware ordering described
+        in paper sec:memory-layout. Metadata lets callers pack parameters and
+        permute input features once, as specified in that section's example.
+        """
+
+        # Paper "IR-Level Folding": detect operations with matching semantics,
+        # operand shapes, tensor formats, and compatible graph depth.
         groups = group_identical_ops_by_output_depth(program)
         if not groups:
             return FoldSameShapedOperationsResult(
@@ -1333,7 +1394,11 @@ class FoldSameShapedOperations(PreprocessingRoutine):
                 gather_index_orders=(),
             )
 
+        # Keep the original DAG dependencies while replacing every group by one
+        # batched event with a leading fold axis.
         events = _topologically_order_output_depth_events(program, groups)
+        # Paper sec:memory-layout: the members are semantically permutable, so
+        # choose a physical order informed by downstream operand sequences.
         ordered_events = _order_group_members_for_future_consumers(events, program) if optimize_group_order else events
         return _rewrite_output_depth_group_events(program, ordered_events)
 
@@ -1346,6 +1411,12 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         split_by_routing: bool | None = None,
     ) -> FoldSameShapedOperationsResult:
         """Fold using XE-native input frontiers without source metadata.
+
+        This is the publication experiment path for paper "IR-Level Folding"
+        and "Memory Layout Optimizations" (sec:memory-layout). It applies the
+        same fold-axis batching, consumer ordering, and input-permutation
+        metadata as :meth:`apply_with_metadata`, but discovers layers from
+        input frontiers when no symbolic-circuit layer metadata is available.
 
         By default, programs containing CP's same-index product contraction use
         input-access order within each fold. This prevents a depth-first
@@ -1469,7 +1540,13 @@ def _order_group_members_for_future_consumers(
     events: tuple[_ScheduledOutputDepthEvent, ...],
     program: RichProgram,
 ) -> tuple[_ScheduledOutputDepthEvent, ...]:
-    """Sort members inside each group to align batch axes with future consumers."""
+    """Order fold axes using the paper's consumer-aware layout optimization.
+
+    Paper reference: "Memory Layout Optimizations" (sec:memory-layout),
+    especially "Layout objective". Groups are first visited in reverse
+    topological order so consumer preferences are known, then a bounded global
+    search allows dependent producers and consumers to move together.
+    """
     consumers = _result_consumers_with_positions(program)
     event_index_by_op_index: dict[int, int] = {}
     group_position_by_result_id: dict[int, tuple[int, int]] = {}
@@ -1538,6 +1615,13 @@ def _group_member_order_candidates(
     group_position_by_result_id: dict[int, tuple[int, int]],
     future_order_keys: dict[int, tuple[int, ...]],
 ) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
+    """Build the bounded candidate set from paper "Layout objective".
+
+    Candidates include the original order, consumer-induced orders, and orders
+    grouped by each operand's source tensor/source position. Operation indices
+    provide deterministic tie-breaking.
+    """
+
     candidates: list[tuple[OutputDepthOpGroupMember, ...]] = []
 
     def add_candidate(members: Sequence[OutputDepthOpGroupMember]) -> None:
@@ -1713,6 +1797,13 @@ def _optimize_group_member_orders_by_materialization_cost(
     events: tuple[_ScheduledOutputDepthEvent, ...],
     program: RichProgram,
 ) -> tuple[_ScheduledOutputDepthEvent, ...]:
+    """Run the narrow beam search specified in paper sec:memory-layout.
+
+    States are complete fold-axis layouts scored by the estimated number of
+    emitted layout instructions. The fixed width bounds the search instead of
+    enumerating all p! permutations of every p-member group.
+    """
+
     group_event_indices = tuple(event_index for event_index, event in enumerate(events) if not isinstance(event, int))
     consumers = _result_consumers_with_positions(program)
     event_index_by_op_index = {
@@ -1751,8 +1842,8 @@ def _optimize_group_member_orders_by_materialization_cost(
         tuple[int, tuple[tuple[int, ...], ...]],
         tuple[tuple[OutputDepthOpGroupMember, ...], ...],
     ] = {}
-    # Some useful reorderings require several dependent groups to move together;
-    # a narrow beam keeps those temporary regressions available until they pay off.
+    # Paper "Layout objective": retain several partial layouts because a
+    # producer reorder can look locally worse until its consumer is also moved.
     for group_position, event_index in enumerate(group_event_indices):
         candidate_states: list[_GroupOrderBeamState] = []
         for state in states:
@@ -1913,6 +2004,8 @@ def _best_unique_order_states(
     program: RichProgram,
     states: Sequence[_GroupOrderBeamState],
 ) -> tuple[_GroupOrderBeamState, ...]:
+    # Paper "Layout objective": lowest estimated total materialization cost
+    # wins; the original operation-index key resolves ties deterministically.
     unique_states = {state.key: state for state in states}
     return tuple(
         sorted(
@@ -2111,6 +2204,13 @@ def _estimated_event_materialization_instruction_count(
     input_axis0_position_by_index: dict[int, dict[int, int]],
     direct_axis0_select_keys: dict[int, tuple[int, int] | None] | None = None,
 ) -> int:
+    """Evaluate C(S_1, ..., S_k) from paper "Layout objective".
+
+    Every strict slice contributes one and combining multiple maximal
+    contiguous source runs contributes one more for concatenation. A run that
+    covers its complete source tensor contributes zero.
+    """
+
     event = events[event_index]
     if isinstance(event, int):
         return 0
@@ -2227,6 +2327,8 @@ def _estimated_ref_materialization_instruction_count(
 def _estimated_ref_segments(
     refs: tuple[tuple[tuple[Any, ...], int], ...],
 ) -> tuple[tuple[tuple[Any, ...], int, int], ...]:
+    # Paper sec:memory-layout: decompose a requested operand sequence into
+    # maximal contiguous runs from the same source tensor.
     if not refs:
         return ()
 
@@ -2541,6 +2643,17 @@ def _rewrite_output_depth_group_events(
     *,
     emit_fragmented_batch_gathers: bool = False,
 ) -> FoldSameShapedOperationsResult:
+    """Emit folded operations and their optimized physical layouts.
+
+    Implements the rewrite in paper "IR-Level Folding" and
+    sec:memory-layout: stack each canonical operand position, add a leading
+    batch label to the operator, remap every logical result to its new physical
+    position, and materialize downstream operands as full tensors, slices, or
+    concatenations/gathers.
+    """
+
+    # Paper sec:memory-layout: pack parameters and permute feature inputs once
+    # in the chosen member order instead of indexing them every training step.
     parameter_stack_orders = _parameter_input_stack_orders_for_events(program, events)
     input_axis0_orders = _input_axis0_orders_for_events(program, events)
     input_plan = _make_rewrite_input_plan(program, parameter_stack_orders, input_axis0_orders)
@@ -2616,6 +2729,8 @@ def _rewrite_output_depth_group_events(
         return result_id
 
     def materialize_batch_segment(ref: _BatchElementRef, start: int, stop: int) -> int:
+        # Paper layout cost: a complete source is free and a strict contiguous
+        # run becomes one slice view.
         if start == 0 and shapes[ref.source_ssa_id][0] == stop:
             return ref.source_ssa_id
         segment_key = (ref.source_ssa_id, start, stop)
@@ -2698,6 +2813,8 @@ def _rewrite_output_depth_group_events(
                 concatenated_batch_orders.append(original_order)
             return result_id
 
+        # Paper layout cost C(S_1, ..., S_k): slice each non-complete run, then
+        # concatenate the k > 1 runs into the requested folded operand.
         segment_ids = tuple(materialize_batch_segment(ref, start, stop) for ref, start, stop in segments)
         result_id = append_instruction(
             RichInstruction(
@@ -2740,6 +2857,8 @@ def _rewrite_output_depth_group_events(
 
     for event in events:
         if not isinstance(event, int):
+            # Paper "IR-Level Folding": operands at the same canonical position
+            # are stacked, and one batched operator evaluates all group members.
             grouped_refs = _group_refs_by_canonical_operand(event, tensor_map)
             batched_arguments = tuple(
                 materialize_batch(refs)
@@ -2755,6 +2874,8 @@ def _rewrite_output_depth_group_events(
             )
             batched_result_orders.append(tuple(member.result_id for member in event.members))
             for index, member in enumerate(event.members):
+                # Paper sec:memory-layout: propagate pi^{-1} consistently by
+                # remapping each logical result to its new fold-axis position.
                 tensor_map[member.result_id] = _BatchElementRef(
                     source_ssa_id=batched_result_id,
                     index=index,
@@ -3109,6 +3230,8 @@ def _original_input_order(
 
 
 def _make_batched_operator(operator: RichOperator) -> RichOperator:
+    """Add the fold axis from paper "IR-Level Folding" to an operator."""
+
     match operator:
         case OperatorEinsum(format_string):
             input_strings, output_string = parse_format_string(format_string)
@@ -3130,6 +3253,8 @@ def _make_batched_operator(operator: RichOperator) -> RichOperator:
 
 
 def _batched_einsum_format(input_strings: Sequence[str], output_string: str) -> str:
+    # Implements the paper's A^(i), B^(i) -> X, Y rewrite: introduce one fresh
+    # leading label on every operand and on the result.
     batch_label = _new_unused_einsum_label(f"{''.join(input_strings)}{output_string}")
     batched_inputs = ",".join(f"{batch_label}{input_string}" for input_string in input_strings)
     return f"{batched_inputs}->{batch_label}{output_string}"

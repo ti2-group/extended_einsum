@@ -14,6 +14,8 @@ class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
     @override
     @staticmethod
     def stop_gradient(array: npt.NDArray) -> npt.NDArray:
+        # NumPy has no autodiff graph; this is the identity implementation of
+        # paper "Detached reference shifts" (sec:numerical-stability).
         return array
 
     @override
