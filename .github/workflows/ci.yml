@@ -71,7 +71,12 @@ jobs:
       - name: Run small synthetic integration tests
         env:
           MPLBACKEND: Agg
-        run: uv run --frozen pytest -q tests/test_cirkit_demo.py tests/test_cirkit_benchmark_plots.py
+        run: |
+          uv run --frozen pytest -q \
+            tests/test_cirkit_demo.py \
+            tests/test_cirkit_benchmark_plots.py \
+            tests/test_monarch_experiment.py \
+            tests/test_monarch_imagenet64.py
 
   package:
     name: Build and inspect distributions
