@@ -1,0 +1,10 @@
+\begin{tabular}{lllrrrrr}
+\toprule
+Execution & Graph & Layer & Units & Forward rel. & Data grad rel. & Param. grad rel. & Finite gradients \\
+\midrule
+NVIDIA RTX A6000 (compiled) & Quad tree & CP & 512 & $7.9\mathbin{\times}10^{-8}$ & $2.9\mathbin{\times}10^{-7}$ & $2.0\mathbin{\times}10^{-4}$ & 100.0\% \\
+NVIDIA RTX A6000 (compiled) & Quad tree & Tucker & 64 & $7.9\mathbin{\times}10^{-8}$ & $2.5\mathbin{\times}10^{-7}$ & $3.0\mathbin{\times}10^{-5}$ & 100.0\% \\
+NVIDIA RTX A6000 (compiled) & Quad graph & CP & 512 & $3.5\mathbin{\times}10^{-7}$ & $6.3\mathbin{\times}10^{-5}$ & $5.2\mathbin{\times}10^{-4}$ & 100.0\% \\
+NVIDIA RTX A6000 (compiled) & Quad graph & Tucker & 64 & $7.9\mathbin{\times}10^{-8}$ & $3.0\mathbin{\times}10^{-7}$ & $4.7\mathbin{\times}10^{-4}$ & 100.0\% \\
+\bottomrule
+\end{tabular}

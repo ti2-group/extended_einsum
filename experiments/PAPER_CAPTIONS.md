@@ -146,6 +146,101 @@ Tucker multiplication and reduction work. Consequently, the forward times and
 matrix-multiplication costs remain nearly unchanged, while the ordered
 variant's backward pass is a few percent slower.
 
+## JAX and PyTorch backend comparison
+
+### Experimental setup
+
+We execute the five Extended Einsum ablation variants through both the
+PyTorch/Inductor and JAX/XLA backends on the same RTX A6000 GPU. The circuit
+structure, folded tensor program, contraction-path optimization, consumer
+ordering, stability mode, tensor shapes, batch sizes, and unit counts are
+identical across backends. Each backend/configuration/run is isolated in a
+fresh process and uses 30 warmup followed by 90 measured batches. Bars report
+the median over five runs, and error bars show 95% bootstrap intervals.
+
+For JAX, the forward loss, `value_and_grad`, and Adam update are separately
+traced, lowered, and compiled for the concrete parameter and batch shapes
+before warmup. Compilation time is excluded. XLA stages the forward and
+reverse-mode computations as one executable, so the directly comparable
+quantity is combined forward-plus-backward time. We do not stack the JAX
+forward and inferred backward components in these figures. Optimizer time is
+excluded for both backends.
+
+The seed labels identify independent runs, but JAX and PyTorch use their native
+random-number generators and therefore do not receive bitwise-identical
+initial values or minibatch permutations. This does not alter the static tensor
+program or dense kernel shapes and the observed run-to-run ranges are small,
+but the comparison should be interpreted as a backend execution comparison
+rather than a numerical trajectory comparison.
+
+### `jax_torch_ablation_cp.pdf`
+
+**Backend comparison for the Extended Einsum CP ablation.** Paired PyTorch and
+JAX bars report absolute forward-plus-backward time for identical compiled
+tensor-program structures and concrete shapes. The final gray bar is untouched
+Cirkit, included once as an external reference rather than repeated for every
+XE counterfactual. Error bars are 95% bootstrap intervals over five independent
+runs. Every percentage uses PyTorch production XE in the same panel as its
+single reference. Labels above the PyTorch counterfactuals, all JAX bars, and
+Cirkit therefore report slowdown relative to the same production
+implementation; the unlabelled PyTorch XE bar is the zero reference. Positive
+values indicate additional runtime. On production XE, JAX is within 0.3% of
+PyTorch for the largest quad graph but is 7--22% slower on the other
+configurations. Both backends preserve the main CP conclusions:
+differentiating through the stability shifts and disabling consumer ordering
+increase runtime.
+
+### `jax_torch_ablation_tucker.pdf`
+
+**Backend comparison for the Extended Einsum Tucker ablation.** Paired
+PyTorch/JAX bars show absolute compiled forward-plus-backward time, and the
+final gray bar shows untouched Cirkit once as an external reference. Error bars
+show 95% bootstrap intervals over five independent runs. All percentage labels
+are normalized to PyTorch production XE in the same panel: the PyTorch
+counterfactuals, every JAX variant, and Cirkit can therefore be read as one
+ablation sequence with a common zero reference. JAX is 39--87% slower for
+production XE across the four Tucker configurations. Unlike PyTorch, JAX also
+benefits consistently from consumer ordering. The combined log-space and
+differentiable-shift variant is unexpectedly favorable under XLA, particularly
+for the large quad graph, demonstrating that stability transformations can
+interact strongly with backend fusion and contraction lowering.
+
+### Suggested results text
+
+The backend comparison separates improvements in the Extended Einsum tensor
+program from behavior specific to PyTorch compilation. For CP layers, the
+optimized program transfers well to XLA. JAX is only 0.3% slower than PyTorch
+on the largest quad graph and 7--22% slower on the remaining configurations.
+Untouched Cirkit requires 34--47% more time than PyTorch XE, providing the
+external baseline for these within-XE backend and ablation comparisons.
+The relative ablations are consistent across compilers: consumer ordering
+reduces JAX runtime by 15--26%, while differentiating through the reference
+shifts increases it by 17--31%. Thus, the two principal CP optimizations are
+not artifacts of Inductor's code generation.
+
+Tucker contractions exhibit a stronger backend dependence. Production JAX
+requires 1.39--1.87x the PyTorch time, and the gap does not disappear at the
+larger problem sizes. PyTorch XE nevertheless remains 8--22% faster than
+untouched Cirkit on the same configurations. Because both backends receive the same folded
+program structure and contraction paths, these measurements point to different
+lowering and fusion quality for the Tucker contraction and routing pattern
+rather than Python overhead or shape polymorphism. In particular, disabling
+consumer ordering slows JAX by 6--30%, whereas it makes PyTorch approximately
+2--5% faster. The layout selected by consumer ordering is therefore favorable
+to XLA even though Inductor can exploit the alternative indexed-gather route.
+
+The numerical-stability variants also reveal an XLA-specific interaction.
+Log-space arithmetic alone is 5--14% slower than scaled-max under JAX, but
+combining log space with differentiable shifts makes the Tucker program
+3--29% faster than production JAX. The reversal is stable across five runs and
+is largest for the 512/64 quad graph. We interpret it as a compiler interaction
+rather than an algorithmic advantage of differentiable shifts: PyTorch does
+not show the reversal, and the mathematical transformation adds rather than
+removes gradient dependencies. Accordingly, the main optimization claims
+should continue to use the PyTorch ablation, while the JAX results demonstrate
+both the portability of the CP gains and the backend sensitivity of Tucker
+lowering.
+
 ## PyJuice captions and comparability
 
 ### `pyjuice_cp_t/plots/forward_per_patch.pdf`
