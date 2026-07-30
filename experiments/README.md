@@ -10,8 +10,9 @@ versioned result files, legacy backends, or compatibility columns.
 |---|---|---|---|---|
 | CP and Tucker speedup/memory | `speedup.py` | `plot_speedup.py` | `results/speedup.csv` | `plots/speedup_{cp,tucker}.pdf`, `plots/memory_{reduction,usage}_{cp,tucker}.pdf` |
 | CP and Tucker ablations | `ablation.py` | `plot_ablation.py` | `results/ablation.csv` | `plots/ablation_{cp,tucker}.pdf` |
+| Compiler breakdown | `diagnose_compile.py` | `compile_table.py` | `results/compile_breakdown.csv` | `tables/compile_breakdown.tex` |
 | JAX CP and Tucker ablations | `ablation_jax.py` | `plot_jax_ablation.py` | `results/ablation_jax.csv` | `plots/jax_torch_ablation_{cp,tucker}.pdf` |
-| Numerical correctness and underflow | `correctness.py` | `plot_correctness.py` | `results/correctness.csv` | `tables/correctness_{agreement,mnist}.tex`, `plots/correctness_underflow.pdf` |
+| Numerical correctness, underflow, and MNIST convergence | `correctness.py` | `plot_correctness.py` | `results/correctness.csv`, `results/correctness_mnist_training.csv` | `tables/correctness_{agreement,mnist,mnist_training}.tex`, `plots/correctness_{underflow,mnist_training}.pdf` |
 | Parameter-matched CP-T comparison | `pyjuice_cp_t/benchmark.py` | `pyjuice_cp_t/plot.py` | `pyjuice_cp_t/results/comparison.csv` | `pyjuice_cp_t/plots/*.pdf` |
 | Dense/Monarch full-image comparison | `monarch/benchmark.py` | `monarch/table.py` | `monarch/results/performance.csv` | `monarch/tables/performance_{main,supplement}.tex` |
 
@@ -82,27 +83,66 @@ uv run --group demo python experiments/correctness.py \
   --device cpu --seeds 0 --output /tmp/correctness-smoke.csv
 ```
 
-For the publication run, select an idle GPU explicitly. The agreement suite
-uses the same FX/`torch.compile` path as the performance experiment. The
+For the complete publication run, select an idle GPU explicitly. The agreement
+suite uses the same FX/`torch.compile` path as the performance experiment. The
 synthetic stress suite deliberately leaves contraction-path fusion and
 `torch.compile` disabled so it isolates stability lowering across hundreds of
-dependent layers rather than attempting to fuse the artificial chain:
+dependent layers rather than attempting to fuse the artificial chain. The
+first command covers agreement, width-64 stress, and MNIST; the next two add
+the width-256 and width-512 `high`-precision stress sweeps:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/correctness.py \
-  --suites agreement,stress --device cuda --torch-compile
+  --suites agreement,stress,mnist --device cuda --torch-compile --download
+CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/correctness.py \
+  --suites stress --device cuda --stress-units 256 --precisions high
+CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/correctness.py \
+  --suites stress --device cuda --stress-units 512 --precisions high
 uv run --group demo python experiments/plot_correctness.py
 ```
 
-The optional `mnist` suite evaluates identical MNIST batches and parameters
-with the complete optimized scaled and log-space pipelines. It uses 512 CP
-units and 64 Tucker units on both region graphs. MNIST is never downloaded
-unless `--download` is passed. Select an idle GPU explicitly:
+The MNIST suite evaluates identical batches and parameters with the complete
+optimized scaled and log-space pipelines. It uses 512 CP units and 64 Tucker
+units on both region graphs. MNIST is never downloaded unless `--download` is
+passed. All commands resume from successful rows in the shared
+`results/correctness.csv`.
+
+The separate `mnist-training` suite is an end-to-end convergence check. It
+trains a 512-unit CP circuit on the MNIST training split for 20 epochs with
+batch size 512, comparing untouched Cirkit log-space execution with Extended
+Einsum log-space and scaled-max execution. Each epoch uses all 117 complete
+fixed-shape batches (59,904 samples); the 96-sample remainder changes with the
+seeded permutation and is dropped. The default region graph is the quad tree;
+`--mnist-training-region-graph quad-graph` selects the shared quad graph
+instead. Each implementation runs in a fresh process. There is no training
+warmup, so epoch 1 begins from the seeded initialization. Setup RNG consumption
+is isolated by resetting the minibatch seed before training, which gives all
+three implementations the same epoch permutations. The two Extended Einsum
+variants also share identical initial parameters. Cirkit uses its native
+seeded parameter initialization and is therefore a convergence baseline, not
+a bitwise parameter-matched trajectory.
+
+One row per epoch is written to
+`results/correctness_mnist_training.csv`. A complete variant trajectory is
+committed together, and later invocations skip variants for which all 20
+epochs are already present. The plotter generates a combined NLL trajectory
+and a final-NLL comparison table:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/correctness.py \
-  --suites mnist --device cuda --torch-compile --download
+  --suites mnist-training --device cuda --download
 uv run --group demo python experiments/plot_correctness.py
+```
+
+For a short pipeline check, cap the number of epochs and batches without
+writing into the publication CSV:
+
+```bash
+uv run --group demo python experiments/correctness.py \
+  --suites mnist-training --device cpu \
+  --mnist-training-epochs 2 --mnist-training-units 8 \
+  --mnist-training-batch-size 8 --mnist-training-max-batches 2 \
+  --mnist-training-output /tmp/correctness-mnist-training-smoke.csv
 ```
 
 All non-index model inputs and parameters use `torch.float32`; gather indices
@@ -113,23 +153,6 @@ uses FP64 and `highest`; the MNIST comparison uses the production `high`
 setting for both stable implementations. Every row records the storage and
 reference dtypes, matmul settings, PyTorch/CUDA versions, device, finite-value
 fractions, compilation state, and parameter counts.
-
-### Verified handoff from the JAX run
-
-`run_correctness_after_jax.py` can run as a lightweight user service while the
-JAX ablation is active. It binds to the active systemd invocation ID, requires
-that invocation to end without systemd failure metadata, and validates the
-exact set of 200 unique successful JAX rows with no failed or unexpected rows.
-Only then does it run all three correctness suites, validate the exact 820
-expected correctness rows, and render the tables and underflow plot. A changed
-invocation, incomplete CSV, duplicate, or failed row blocks the handoff.
-
-Monitor a queued handoff with:
-
-```bash
-systemctl --user status extended-einsum-correctness-after-jax.service
-journalctl --user -fu extended-einsum-correctness-after-jax.service
-```
 
 ## Speedup experiment
 
@@ -179,6 +202,39 @@ Every pair is run on both region graphs.
 CUDA_VISIBLE_DEVICES=0 uv run --group demo python experiments/ablation.py
 uv run --group demo python experiments/plot_ablation.py
 ```
+
+## Compiler breakdown
+
+The compiler experiment reuses the complete ablation grid and the four
+dense/Monarch full-image configurations. It measures five independent runs in
+fresh processes with private Inductor and Triton cache directories, preventing
+compiled artifacts from carrying across repetitions. For XE, the CSV records
+expression extraction, input-depth
+folding and consumer ordering, contraction-path optimization, and backend/FX
+lowering separately, as well as their sum. For Cirkit, it records native
+lowering. In both systems, the `torch.compile` measurement is the synchronized
+first forward and backward call: PyTorch compilation is lazy, and both calls
+are needed to compile the training graph used by the performance experiments.
+The reported compile time therefore includes one execution of the compiled
+graph.
+
+Run the experiment on the same GPU used for the runtime measurements, then
+generate the supplementary table:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --group demo \
+  python experiments/diagnose_compile.py
+uv run --group demo python experiments/compile_table.py
+```
+
+The runner resumes successful configuration/run pairs from
+`results/compile_breakdown.csv`. Each configuration has a 15-minute
+parent-enforced timeout by default. The generated
+`tables/compile_breakdown.tex` reports the median and
+`[minimum, maximum]` in seconds across the five process-isolated runs. Filters
+such as `--suites`, `--runs`, `--layers`, `--graphs`, `--variants`, and
+`--parameterizations` are intended for smoke runs; the table generator
+deliberately requires the complete grid for the selected run IDs.
 
 ### JAX ablation
 

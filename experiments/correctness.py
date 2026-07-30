@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, replace
@@ -23,6 +24,10 @@ import extended_einsum.interface as xe
 from demo.cirkit import (
     cleanup_device,
     make_symbolic_circuit,
+    run_epoch,
+    set_seed,
+    setup_cirkit_training,
+    setup_xe_training,
     translate_cirkit_to_xe,
 )
 from extended_einsum.backend_translation import (
@@ -40,9 +45,11 @@ from extended_einsum.preprocess import (
 from torch.fx.experimental.proxy_tensor import make_fx
 
 RESULTS = _HERE / "results" / "correctness.csv"
+MNIST_TRAINING_RESULTS = _HERE / "results" / "correctness_mnist_training.csv"
 SEEDS = (0, 1, 2, 3, 4)
 REGION_GRAPHS = ("quad-tree-2", "quad-graph")
 LAYERS = ("cp", "tucker")
+MNIST_TRAINING_VARIANTS = ("cirkit", "logspace", "scaled-max")
 AGREEMENT_VARIANTS: dict[str, StabilityMode] = {
     "scaled-max": "scaled_max",
     "logspace-max": "logspace_max",
@@ -93,6 +100,36 @@ CSV_FIELDS = (
     "reference_gradient_finite_fraction",
     "parameter_tensors",
     "parameters",
+)
+MNIST_TRAINING_CSV_FIELDS = (
+    "status",
+    "error",
+    "variant",
+    "backend",
+    "seed",
+    "region_graph",
+    "layer",
+    "units",
+    "batch_size",
+    "epoch",
+    "epochs",
+    "max_batches",
+    "batches",
+    "samples",
+    "avg_nll",
+    "lr",
+    "dataset",
+    "pixel_values",
+    "device",
+    "device_name",
+    "torch_version",
+    "cuda_version",
+    "matmul_precision",
+    "torch_compile",
+    "optimizer",
+    "optimizer_fused",
+    "parameter_initialization",
+    "minibatch_pairing",
 )
 
 
@@ -146,7 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--suites",
         default="agreement,stress",
-        help="agreement, stress, mnist, or a comma-separated combination",
+        help="agreement, stress, mnist, mnist-training, or a comma-separated combination",
     )
     parser.add_argument("--seeds", default="0,1,2,3,4")
     parser.add_argument("--layers", default="cp,tucker")
@@ -172,6 +209,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stress-batch-size", type=int, default=4)
     parser.add_argument("--stress-factor-scale", type=float, default=0.01)
     parser.add_argument("--mnist-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--mnist-training-output",
+        type=Path,
+        default=MNIST_TRAINING_RESULTS,
+    )
+    parser.add_argument("--mnist-training-seed", type=int, default=0)
+    parser.add_argument("--mnist-training-epochs", type=int, default=20)
+    parser.add_argument("--mnist-training-units", type=int, default=512)
+    parser.add_argument("--mnist-training-batch-size", type=int, default=512)
+    parser.add_argument(
+        "--mnist-training-region-graph",
+        choices=REGION_GRAPHS,
+        default="quad-tree-2",
+    )
+    parser.add_argument(
+        "--mnist-training-variants",
+        default="cirkit,logspace,scaled-max",
+    )
+    parser.add_argument(
+        "--mnist-training-max-batches",
+        type=int,
+        default=None,
+        help="cap batches per epoch for a smoke test; omitted means the full training split",
+    )
+    parser.add_argument("--mnist-training-lr", type=float, default=0.01)
     parser.add_argument("--data-dir", default="datasets")
     parser.add_argument(
         "--download",
@@ -179,11 +241,16 @@ def parse_args() -> argparse.Namespace:
         help="allow torchvision to download MNIST if it is not present",
     )
     parser.add_argument("--verbose-errors", action="store_true")
+    parser.add_argument(
+        "--_mnist-training-single",
+        choices=MNIST_TRAINING_VARIANTS,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     try:
         args.suites = parse_names(
             args.suites,
-            choices=("agreement", "stress", "mnist"),
+            choices=("agreement", "stress", "mnist", "mnist-training"),
             label="suites",
         )
         args.seeds = parse_ints(args.seeds)
@@ -203,6 +270,11 @@ def parse_args() -> argparse.Namespace:
             label="matmul precisions",
         )
         args.stress_depths = parse_ints(args.stress_depths, positive=True)
+        args.mnist_training_variants = parse_names(
+            args.mnist_training_variants,
+            choices=MNIST_TRAINING_VARIANTS,
+            label="MNIST training variants",
+        )
     except ValueError as error:
         parser.error(str(error))
     positive_values = (
@@ -214,11 +286,23 @@ def parse_args() -> argparse.Namespace:
         args.stress_units,
         args.stress_batch_size,
         args.mnist_batch_size,
+        args.mnist_training_epochs,
+        args.mnist_training_units,
+        args.mnist_training_batch_size,
     )
     if any(value <= 0 for value in positive_values):
         parser.error("all dimensions, units, and batch sizes must be positive")
     if not 0.0 < args.stress_factor_scale < 1.0:
         parser.error("--stress-factor-scale must be strictly between zero and one")
+    if args.mnist_training_seed < 0:
+        parser.error("--mnist-training-seed must be non-negative")
+    if (
+        args.mnist_training_max_batches is not None
+        and args.mnist_training_max_batches <= 0
+    ):
+        parser.error("--mnist-training-max-batches must be positive")
+    if args.mnist_training_lr <= 0.0:
+        parser.error("--mnist-training-lr must be positive")
     return args
 
 
@@ -245,6 +329,84 @@ def append_row(path: Path, row: dict[str, object]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+
+def append_mnist_training_rows(
+    path: Path,
+    rows: list[dict[str, object]],
+) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    if not write_header:
+        with path.open(newline="") as stream:
+            header = tuple(next(csv.reader(stream), ()))
+        if header != MNIST_TRAINING_CSV_FIELDS:
+            raise ValueError(
+                f"{path} does not use the MNIST training schema; move or remove it"
+            )
+    with path.open("a", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=MNIST_TRAINING_CSV_FIELDS,
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerows(
+            {
+                field: row.get(field, "")
+                for field in MNIST_TRAINING_CSV_FIELDS
+            }
+            for row in rows
+        )
+
+
+def completed_mnist_training_variants(
+    path: Path,
+    *,
+    seed: int,
+    region_graph: str,
+    units: int,
+    batch_size: int,
+    epochs: int,
+    max_batches: int | None,
+    lr: float,
+    device: torch.device,
+) -> set[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != MNIST_TRAINING_CSV_FIELDS:
+            raise ValueError(
+                f"{path} does not use the MNIST training schema; move or remove it"
+            )
+        matching_epochs: dict[str, set[int]] = {}
+        expected_max_batches = "" if max_batches is None else str(max_batches)
+        for row in reader:
+            if (
+                row["status"] != "ok"
+                or int(row["seed"]) != seed
+                or row["region_graph"] != region_graph
+                or row["layer"] != "cp"
+                or int(row["units"]) != units
+                or int(row["batch_size"]) != batch_size
+                or int(row["epochs"]) != epochs
+                or row["max_batches"] != expected_max_batches
+                or float(row["lr"]) != lr
+                or row["device"] != str(device)
+            ):
+                continue
+            matching_epochs.setdefault(row["variant"], set()).add(
+                int(row["epoch"])
+            )
+    expected_epochs = set(range(1, epochs + 1))
+    return {
+        variant
+        for variant, observed_epochs in matching_epochs.items()
+        if observed_epochs == expected_epochs
+    }
 
 
 def successful_keys(path: Path) -> set[tuple[str, ...]]:
@@ -1055,11 +1217,249 @@ def run_mnist(args: argparse.Namespace, device: torch.device) -> None:
                 cleanup_device(device)
 
 
+def mnist_training_base_row(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    variant: str,
+) -> dict[str, object]:
+    is_cirkit = variant == "cirkit"
+    return {
+        "status": "",
+        "error": "",
+        "variant": variant,
+        "backend": "cirkit" if is_cirkit else "extended-einsum",
+        "seed": args.mnist_training_seed,
+        "region_graph": args.mnist_training_region_graph,
+        "layer": "cp",
+        "units": args.mnist_training_units,
+        "batch_size": args.mnist_training_batch_size,
+        "epochs": args.mnist_training_epochs,
+        "max_batches": args.mnist_training_max_batches or "",
+        "lr": args.mnist_training_lr,
+        "dataset": "mnist-train",
+        "pixel_values": 256,
+        "device": str(device),
+        "device_name": device_name(device),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "",
+        "matmul_precision": "high",
+        "torch_compile": True,
+        "optimizer": "adam",
+        "optimizer_fused": device.type == "cuda",
+        "parameter_initialization": (
+            "native-cirkit-seeded"
+            if is_cirkit
+            else "paired-xe-seeded"
+        ),
+        "minibatch_pairing": f"torch-seed-{1_000_000 + args.mnist_training_seed}",
+    }
+
+
+def run_mnist_training_variant(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    variant: str,
+) -> None:
+    torch.set_float32_matmul_precision("high")
+    set_seed(args.mnist_training_seed)
+    base = mnist_training_base_row(
+        args,
+        device,
+        variant=variant,
+    )
+    common = {
+        "width": 28,
+        "height": 28,
+        "num_units": args.mnist_training_units,
+        "sum_product_layer": "cp",
+        "region_graph": args.mnist_training_region_graph,
+        "device": device,
+        "dataset": "mnist",
+        "data_dir": args.data_dir,
+        "num_samples": 0,
+        "pixel_values": 256,
+        "lr": args.mnist_training_lr,
+        "download": args.download,
+    }
+    try:
+        if variant == "cirkit":
+            step, optimizer, train_images, _program = setup_cirkit_training(
+                **common,
+                semiring="lse-sum",
+            )
+        else:
+            semiring = {
+                "logspace": "lse-sum",
+                "scaled-max": "scaled-max",
+            }[variant]
+            step, optimizer, train_images, _program = setup_xe_training(
+                **common,
+                batch_size=args.mnist_training_batch_size,
+                semiring=semiring,
+                shift_mode="xe",
+                optimize_group_order=True,
+                preorder_inputs=True,
+                optimize_contraction_paths=True,
+            )
+
+        # Setup consumes a backend-dependent amount of randomness. Reset here
+        # so each variant sees the same permutation in each numbered epoch.
+        set_seed(1_000_000 + args.mnist_training_seed)
+        rows: list[dict[str, object]] = []
+        for epoch in range(1, args.mnist_training_epochs + 1):
+            stats = run_epoch(
+                step,
+                optimizer,
+                train_images,
+                batch_size=args.mnist_training_batch_size,
+                max_batches=args.mnist_training_max_batches,
+                device=device,
+            )
+            row = {
+                **base,
+                "status": "ok",
+                "epoch": epoch,
+                "batches": stats["batches"],
+                "samples": stats["samples"],
+                "avg_nll": stats["avg_nll"],
+            }
+            rows.append(row)
+            print(
+                f"ok mnist-training {variant:>10} "
+                f"epoch={epoch:>2}/{args.mnist_training_epochs} "
+                f"nll={float(stats['avg_nll']):.6f}",
+                flush=True,
+            )
+        # Commit a complete trajectory together. A failed or interrupted run
+        # cannot masquerade as a completed variant on resume.
+        append_mnist_training_rows(
+            args.mnist_training_output,
+            rows,
+        )
+    except Exception as error:
+        append_mnist_training_rows(
+            args.mnist_training_output,
+            [
+                {
+                    **base,
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "epoch": 0,
+                }
+            ],
+        )
+        print(
+            f"failed mnist-training {variant}: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+        if args.verbose_errors:
+            traceback.print_exc()
+    finally:
+        cleanup_device(device)
+
+
+def mnist_training_child_command(
+    args: argparse.Namespace,
+    *,
+    variant: str,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--suites",
+        "mnist-training",
+        "--device",
+        args.device,
+        "--data-dir",
+        args.data_dir,
+        "--mnist-training-output",
+        str(args.mnist_training_output),
+        "--mnist-training-seed",
+        str(args.mnist_training_seed),
+        "--mnist-training-epochs",
+        str(args.mnist_training_epochs),
+        "--mnist-training-units",
+        str(args.mnist_training_units),
+        "--mnist-training-batch-size",
+        str(args.mnist_training_batch_size),
+        "--mnist-training-region-graph",
+        args.mnist_training_region_graph,
+        "--mnist-training-lr",
+        str(args.mnist_training_lr),
+        "--_mnist-training-single",
+        variant,
+    ]
+    if args.mnist_training_max_batches is not None:
+        command.extend(
+            (
+                "--mnist-training-max-batches",
+                str(args.mnist_training_max_batches),
+            )
+        )
+    if args.download:
+        command.append("--download")
+    if args.verbose_errors:
+        command.append("--verbose-errors")
+    return command
+
+
+def run_mnist_training(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    completed = completed_mnist_training_variants(
+        args.mnist_training_output,
+        seed=args.mnist_training_seed,
+        region_graph=args.mnist_training_region_graph,
+        units=args.mnist_training_units,
+        batch_size=args.mnist_training_batch_size,
+        epochs=args.mnist_training_epochs,
+        max_batches=args.mnist_training_max_batches,
+        lr=args.mnist_training_lr,
+        device=device,
+    )
+    remaining = [
+        variant
+        for variant in args.mnist_training_variants
+        if variant not in completed
+    ]
+    print(
+        f"MNIST training: {len(remaining)} remaining / "
+        f"{len(args.mnist_training_variants)} requested; "
+        f"output={args.mnist_training_output}",
+        flush=True,
+    )
+    for index, variant in enumerate(remaining, start=1):
+        print(
+            f"[{index}/{len(remaining)}] mnist-training {variant}",
+            flush=True,
+        )
+        subprocess.run(
+            mnist_training_child_command(args, variant=variant),
+            check=False,
+        )
+
+
 def main() -> None:
     args = parse_args()
     device = get_device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
+    if args._mnist_training_single:
+        print(
+            f"device={device} ({device_name(device)}); "
+            f"output={args.mnist_training_output}",
+            flush=True,
+        )
+        run_mnist_training_variant(
+            args,
+            device,
+            variant=args._mnist_training_single,
+        )
+        return
     print(
         f"device={device} ({device_name(device)}); output={args.output}",
         flush=True,
@@ -1070,6 +1470,8 @@ def main() -> None:
         run_stress(args, device)
     if "mnist" in args.suites:
         run_mnist(args, device)
+    if "mnist-training" in args.suites:
+        run_mnist_training(args, device)
 
 
 if __name__ == "__main__":

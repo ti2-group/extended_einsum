@@ -86,24 +86,30 @@ Successful configurations are resumed only when both the summary row and all
 90 raw batch rows are present. Restrict a smoke run with `--seeds`, `--graphs`,
 `--parameterizations`, or a deterministic `--sample-limit`.
 
-## Compiler-phase diagnosis
+## Compiler breakdown
 
-`diagnose_compile.py` times symbolic construction, canonical initialization,
-XE expression construction, program extraction, input-depth group discovery,
-input-access ordering, topological scheduling, exact group-member ordering,
-fold rewriting, and contraction-path optimization without invoking
-`torch.compile` or using a GPU. Every phase has an independent timeout and a
-hard watchdog, and records a stack trace if interrupted.
+The repository-level `experiments/diagnose_compile.py` publication experiment
+spans both the complete
+CP/Tucker ablation grid and all four dense/Monarch full-image configurations
+above. Its default protocol runs each configuration five times, with every run
+in a fresh process and private Inductor/Triton cache directories. XE expression
+extraction, input-depth folding (including
+consumer ordering), contraction-path optimization, backend/FX lowering, and
+the lazy `torch.compile` first forward/backward are recorded separately.
+Cirkit native lowering and its lazy `torch.compile` first forward/backward are
+measured on the matching configuration.
 
 ```bash
-uv run --group demo python experiments/monarch/diagnose_compile.py \
-  --region-graph quad-graph \
-  --parameterization monarch \
-  --units 256 \
-  --monarch-factors 16,16 \
-  --timeout-seconds 180
+CUDA_VISIBLE_DEVICES=0 uv run --group demo \
+  python experiments/diagnose_compile.py
+uv run --group demo python experiments/compile_table.py
 ```
 
-The benchmark path always keeps group-member ordering enabled.
-`--no-optimize-group-order` exists only to isolate base input-depth folding in
-this diagnostic; it is not an optimization mode used by the experiments.
+Raw results are resumed from `experiments/results/compile_breakdown.csv`.
+`experiments/tables/compile_breakdown.tex` contains the supplementary ablation
+and Monarch
+tables, with median and `[minimum, maximum]` seconds across the five
+process-isolated runs. Because PyTorch compilation is lazy, its column includes
+one synchronized execution while materializing the compiled forward and
+backward graphs. The detailed schema also retains total setup time, runtime
+instruction count, peak resident memory, device, and PyTorch/CUDA versions.

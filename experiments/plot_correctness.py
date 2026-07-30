@@ -17,7 +17,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from experiments.correctness import CSV_FIELDS, RESULTS
+from experiments.correctness import (
+    CSV_FIELDS,
+    MNIST_TRAINING_CSV_FIELDS,
+    MNIST_TRAINING_RESULTS,
+    RESULTS,
+)
 from experiments.plot_common import GRAPH_LABELS, configure_style, save_pdf
 
 NUMERIC_COLUMNS = (
@@ -54,11 +59,26 @@ VARIANT_STYLES = {
     "logspace-max-fp32": ("#D55E00", "^"),
 }
 LAYER_LABELS = {"cp": "CP", "tucker": "Tucker"}
+TRAINING_VARIANT_LABELS = {
+    "cirkit": "Cirkit",
+    "logspace": "XE log-space",
+    "scaled-max": "XE scaled-max",
+}
+TRAINING_VARIANT_STYLES = {
+    "cirkit": ("#666666", "s"),
+    "logspace": ("#D55E00", "^"),
+    "scaled-max": ("#0072B2", "o"),
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=("Render the correctness CSV as supplementary LaTeX tables and an underflow plot."))
     parser.add_argument("--input", type=Path, default=RESULTS)
+    parser.add_argument(
+        "--mnist-training-input",
+        type=Path,
+        default=MNIST_TRAINING_RESULTS,
+    )
     parser.add_argument("--plot-dir", type=Path, default=_HERE / "plots")
     parser.add_argument("--table-dir", type=Path, default=_HERE / "tables")
     return parser.parse_args()
@@ -111,6 +131,174 @@ def percent(value: float) -> str:
     if math.isnan(value):
         return "--"
     return f"{100.0 * value:.1f}\\%"
+
+
+def read_mnist_training_results(
+    path: Path,
+) -> pd.DataFrame:
+    if not path.exists():
+        print(f"no MNIST training results at {path}; skipping trajectory outputs")
+        return pd.DataFrame()
+    results = pd.read_csv(path)
+    missing = set(MNIST_TRAINING_CSV_FIELDS) - set(results)
+    if missing:
+        raise ValueError(
+            f"{path} is missing columns: {', '.join(sorted(missing))}"
+        )
+    failed = results.loc[results["status"].ne("ok")]
+    if not failed.empty:
+        print(
+            f"ignoring {len(failed)} failed MNIST training attempt(s) "
+            f"recorded in {path}"
+        )
+    results = results.loc[results["status"].eq("ok")].copy()
+    for column in (
+        "seed",
+        "units",
+        "batch_size",
+        "epoch",
+        "epochs",
+        "batches",
+        "samples",
+        "avg_nll",
+        "lr",
+    ):
+        results[column] = pd.to_numeric(results[column], errors="raise")
+    if results.empty:
+        return results
+    configuration_columns = [
+        "seed",
+        "region_graph",
+        "layer",
+        "units",
+        "batch_size",
+        "epochs",
+        "max_batches",
+        "lr",
+        "device_name",
+    ]
+    latest_configuration = tuple(
+        results.iloc[-1][column]
+        for column in configuration_columns
+    )
+    selected = results
+    for column, value in zip(
+        configuration_columns,
+        latest_configuration,
+        strict=True,
+    ):
+        if pd.isna(value):
+            selected = selected.loc[selected[column].isna()]
+        else:
+            selected = selected.loc[selected[column].eq(value)]
+    key = [*configuration_columns, "variant", "epoch"]
+    selected = selected.drop_duplicates(key, keep="last")
+    expected_epochs = set(
+        range(1, int(selected["epochs"].iloc[0]) + 1)
+    )
+    incomplete = {
+        variant: sorted(
+            expected_epochs
+            - set(group["epoch"].astype(int))
+        )
+        for variant, group in selected.groupby("variant")
+        if set(group["epoch"].astype(int)) != expected_epochs
+    }
+    if incomplete:
+        raise ValueError(
+            f"{path} has incomplete MNIST trajectories: {incomplete}"
+        )
+    return selected
+
+
+def plot_mnist_training(
+    results: pd.DataFrame,
+    output: Path,
+) -> None:
+    if results.empty:
+        return
+    fig, axis = plt.subplots(
+        figsize=(6.8, 3.8),
+        layout="constrained",
+    )
+    for variant in TRAINING_VARIANT_LABELS:
+        selected = results.loc[
+            results["variant"].eq(variant)
+        ].sort_values("epoch")
+        if selected.empty:
+            continue
+        color, marker = TRAINING_VARIANT_STYLES[variant]
+        axis.plot(
+            selected["epoch"],
+            selected["avg_nll"],
+            color=color,
+            marker=marker,
+            linewidth=2.0,
+            markersize=5,
+            label=TRAINING_VARIANT_LABELS[variant],
+        )
+    epochs = int(results["epochs"].iloc[0])
+    axis.set_xlim((1, epochs) if epochs > 1 else (0.5, 1.5))
+    axis.set_xticks(
+        np.unique(
+            np.linspace(1, epochs, min(6, epochs), dtype=int)
+        )
+    )
+    axis.set_xlabel("Training epoch")
+    axis.set_ylabel("Average training NLL")
+    axis.legend(ncol=3, loc="best")
+    save_pdf(fig, output)
+    print(f"wrote {output}")
+
+
+def write_mnist_training_table(
+    results: pd.DataFrame,
+    output: Path,
+) -> None:
+    if results.empty:
+        return
+    final_nlls = {
+        variant: float(
+            group.sort_values("epoch")["avg_nll"].iloc[-1]
+        )
+        for variant, group in results.groupby("variant")
+    }
+    cirkit_final = final_nlls.get("cirkit", math.nan)
+    lines = [
+        r"\begin{tabular}{lrrrr}",
+        r"\toprule",
+        (
+            r"Implementation & Epoch 1 NLL & Final NLL & "
+            r"Best NLL & Final $\Delta$ vs. Cirkit \\"
+        ),
+        r"\midrule",
+    ]
+    for variant in TRAINING_VARIANT_LABELS:
+        selected = results.loc[
+            results["variant"].eq(variant)
+        ].sort_values("epoch")
+        if selected.empty:
+            continue
+        first = float(selected["avg_nll"].iloc[0])
+        final = float(selected["avg_nll"].iloc[-1])
+        best = float(selected["avg_nll"].min())
+        delta = final - cirkit_final
+        lines.append(
+            " & ".join(
+                (
+                    TRAINING_VARIANT_LABELS[variant],
+                    f"{first:.4f}",
+                    f"{final:.4f}",
+                    f"{best:.4f}",
+                    "--" if variant == "cirkit" else f"{delta:+.4f}",
+                )
+            )
+            + r" \\"
+        )
+    lines.extend((r"\bottomrule", r"\end{tabular}", ""))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines))
+    print(f"wrote {output}")
 
 
 def write_agreement_table(results: pd.DataFrame, output: Path) -> None:
@@ -386,6 +574,9 @@ def main() -> None:
     args = parse_args()
     configure_style()
     results = read_results(args.input)
+    mnist_training_results = read_mnist_training_results(
+        args.mnist_training_input
+    )
     write_agreement_table(
         results,
         args.table_dir / "correctness_agreement.tex",
@@ -397,6 +588,14 @@ def main() -> None:
     plot_underflow(
         results,
         args.plot_dir / "correctness_underflow.pdf",
+    )
+    plot_mnist_training(
+        mnist_training_results,
+        args.plot_dir / "correctness_mnist_training.pdf",
+    )
+    write_mnist_training_table(
+        mnist_training_results,
+        args.table_dir / "correctness_mnist_training.tex",
     )
 
 

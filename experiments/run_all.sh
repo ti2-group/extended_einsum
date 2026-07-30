@@ -11,9 +11,11 @@ export MPLCONFIGDIR="$PUBLICATION_MPL_CACHE"
 
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/speedup.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/ablation.py
+"$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/diagnose_compile.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo --with pyjuice==2.6.1 python experiments/pyjuice_cp_t/benchmark.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/monarch/benchmark.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/plot_speedup.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/plot_ablation.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/pyjuice_cp_t/plot.py
 "$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/monarch/table.py
+"$UV_EXECUTABLE" --cache-dir "$PUBLICATION_UV_CACHE" run --group demo python experiments/compile_table.py

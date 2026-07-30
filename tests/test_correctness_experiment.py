@@ -3,14 +3,21 @@ import math
 import torch
 
 from experiments.correctness import (
+    append_mnist_training_rows,
     compare,
+    completed_mnist_training_variants,
     evaluate,
     make_circuit_inputs,
     make_circuit_program,
     make_depth_inputs,
     make_depth_program,
 )
-from experiments.plot_correctness import scientific
+from experiments.plot_correctness import (
+    plot_mnist_training,
+    read_mnist_training_results,
+    scientific,
+    write_mnist_training_table,
+)
 
 
 def test_optimized_stability_modes_match_unstable_float64_reference() -> None:
@@ -164,3 +171,76 @@ def test_scientific_formats_finite_and_nonfinite_values() -> None:
     assert scientific(0.0) == "0"
     assert "10^{-7}" in scientific(2.5e-7)
     assert scientific(math.inf) == r"$\infty$"
+
+
+def test_mnist_training_trajectory_is_resumable_and_plottable(
+    tmp_path,
+) -> None:
+    output = tmp_path / "mnist-training.csv"
+    rows = [
+        {
+            "status": "ok",
+            "variant": variant,
+            "backend": (
+                "cirkit"
+                if variant == "cirkit"
+                else "extended-einsum"
+            ),
+            "seed": 0,
+            "region_graph": "quad-tree-2",
+            "layer": "cp",
+            "units": 512,
+            "batch_size": 512,
+            "epoch": epoch,
+            "epochs": 2,
+            "batches": 2,
+            "samples": 1024,
+            "avg_nll": 100.0 - epoch - offset,
+            "lr": 0.01,
+            "dataset": "mnist-train",
+            "pixel_values": 256,
+            "device": "cpu",
+            "device_name": "cpu",
+        }
+        for offset, variant in enumerate(
+            ("cirkit", "logspace", "scaled-max")
+        )
+        for epoch in (1, 2)
+    ]
+    append_mnist_training_rows(output, rows[:-1])
+
+    completed = completed_mnist_training_variants(
+        output,
+        seed=0,
+        region_graph="quad-tree-2",
+        units=512,
+        batch_size=512,
+        epochs=2,
+        max_batches=None,
+        lr=0.01,
+        device=torch.device("cpu"),
+    )
+    assert completed == {"cirkit", "logspace"}
+
+    append_mnist_training_rows(output, rows[-1:])
+    completed = completed_mnist_training_variants(
+        output,
+        seed=0,
+        region_graph="quad-tree-2",
+        units=512,
+        batch_size=512,
+        epochs=2,
+        max_batches=None,
+        lr=0.01,
+        device=torch.device("cpu"),
+    )
+    assert completed == {"cirkit", "logspace", "scaled-max"}
+
+    results = read_mnist_training_results(output)
+    plot = tmp_path / "trajectory.pdf"
+    table = tmp_path / "comparison.tex"
+    plot_mnist_training(results, plot)
+    write_mnist_training_table(results, table)
+
+    assert plot.stat().st_size > 0
+    assert "XE scaled-max" in table.read_text()

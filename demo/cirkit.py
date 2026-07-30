@@ -430,6 +430,7 @@ def load_train_images(
     num_samples: int,
     num_variables: int,
     pixel_values: int,
+    download: bool = True,
 ) -> torch.Tensor:
     if dataset == "synthetic":
         return torch.randint(pixel_values, size=(num_samples, num_variables), device=device)
@@ -441,7 +442,7 @@ def load_train_images(
 
     from torchvision import datasets
 
-    mnist_train = datasets.MNIST(data_dir, train=True, download=True)
+    mnist_train = datasets.MNIST(data_dir, train=True, download=download)
     train_images = mnist_train.data.reshape(-1, num_variables).long()
     if num_samples:
         train_images = train_images[:num_samples]
@@ -509,6 +510,7 @@ def setup_xe_training(
     preorder_inputs: bool = True,
     shift_mode: str = "xe",
     optimize_contraction_paths: bool = True,
+    download: bool = True,
 ):
     symbolic_circuit = make_symbolic_circuit(
         width=width,
@@ -562,6 +564,7 @@ def setup_xe_training(
         num_samples=num_samples,
         num_variables=num_variables,
         pixel_values=pixel_values,
+        download=download,
     )
     if preorder_inputs:
         train_images = train_images.index_select(1, data_axis_order_tensor)
@@ -649,6 +652,7 @@ def setup_cirkit_training(
     pixel_values: int,
     lr: float,
     semiring: str = "lse-sum",
+    download: bool = True,
 ):
     symbolic_circuit = make_symbolic_circuit(
         width=width,
@@ -672,6 +676,7 @@ def setup_cirkit_training(
         num_samples=num_samples,
         num_variables=width * height,
         pixel_values=pixel_values,
+        download=download,
     )
     optimizer = make_optimizer(circuit.parameters(), device, lr)
 
