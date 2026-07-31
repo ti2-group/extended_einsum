@@ -1,8 +1,7 @@
 # Matched Cirkit/XE Monarch experiment
 
 This experiment compares native Cirkit folding with Extended Einsum's current
-input-depth folding for full `64 x 64` grayscale ImageNet64 CP circuits. It is
-a runtime and peak-memory experiment, not a likelihood-quality experiment.
+input-depth folding for full `64 x 64` grayscale ImageNet64 CP circuits.
 Images are read lazily from the official downsampled ImageNet NPZ shards and
 converted to deterministic 8-bit integer luminance.
 

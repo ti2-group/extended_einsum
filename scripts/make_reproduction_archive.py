@@ -301,12 +301,7 @@ def reproduction_notes(dataset_files: list[PurePosixPath]) -> bytes:
             "documented in `experiments/monarch/README.md`."
         )
     )
-    text = f"""# Paper reproduction package
-
-This package contains the implementation, dependency lock file, experiment
-runners, tests, current publication CSVs, and generated figures and tables.
-
-
+    text = f"""
 ## Reproducing the results
 
 1. Install `uv`.

@@ -1,8 +1,6 @@
 # Publication experiments
 
 This directory is the self-contained entry point for the paper measurements.
-It intentionally contains only the current publication protocol: there are no
-versioned result files, legacy backends, or compatibility columns.
 
 ## Layout
 
@@ -44,8 +42,7 @@ measurement, move or remove the corresponding CSV before starting the runner.
 
 Each successful CSV row is one seed/configuration summary. The compact schema
 contains identifiers, the five per-batch timing fields, and the two CUDA
-high-water marks; setup times, duplicated compile flags, epoch rows, NLLs, and
-current allocator state are deliberately omitted.
+high-water marks.
 
 ## Numerical correctness and underflow
 
@@ -83,8 +80,7 @@ uv run --group demo python experiments/correctness.py \
   --device cpu --seeds 0 --output /tmp/correctness-smoke.csv
 ```
 
-For the complete publication run, select an idle GPU explicitly. The agreement
-suite uses the same FX/`torch.compile` path as the performance experiment. The
+The agreement suite uses the same FX/`torch.compile` path as the performance experiment. The
 synthetic stress suite deliberately leaves contraction-path fusion and
 `torch.compile` disabled so it isolates stability lowering across hundreds of
 dependent layers rather than attempting to fuse the artificial chain. The
@@ -156,7 +152,7 @@ fractions, compilation state, and parameter counts.
 
 ## Speedup experiment
 
-The only systems are untouched Cirkit and the current Extended Einsum
+The only systems are Cirkit and the current Extended Einsum
 implementation: scaled-max stability, detached shifts, input-depth folding,
 contraction-path optimization, and consumer ordering. Cirkit remains its native
 log-space baseline. Both CP and Tucker are evaluated on quad trees and quad
@@ -267,7 +263,7 @@ that estimate as an independently measured backward phase.
 The Monarch experiment uses full `64 x 64` grayscale ImageNet64 images and CP
 quad-tree/quad-graph circuits. Within each scale point, Cirkit and XE use
 identical canonical logits, trainable tensors, and deterministic image orders.
-Cirkit performs its native folding; XE uses only the current input-depth
+Cirkit performs its native folding and XE uses only the current input-depth
 folding implementation. Dense and Monarch parameterizations are both included,
 with larger hidden widths for the structured Monarch sums. In addition to the
 compact summary CSV, the runner records one raw timing row per measured batch.
