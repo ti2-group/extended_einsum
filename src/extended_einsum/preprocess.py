@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, override
@@ -133,6 +133,16 @@ class _OutputDepthOpSignature:
 @dataclass(frozen=True)
 class OutputDepthOpGroup(_OutputDepthOpSignature):
     members: tuple[OutputDepthOpGroupMember, ...]
+
+
+@dataclass(frozen=True)
+class _GroupOrderBeamState:
+    events: tuple[_ScheduledOutputDepthEvent, ...]
+    key: tuple[tuple[int, ...], ...]
+    position_by_result_id: dict[int, tuple[int, int]]
+    input_axis0_position_by_index: dict[int, dict[int, int]]
+    event_cost_by_index: dict[int, int]
+    total_cost: int
 
 
 def group_identical_ops_by_output_depth(
@@ -767,7 +777,8 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                     boundary_shapes,
                     result_depths,
                     program.n_inputs,
-                    prioritize_output_labels=program.stability_mode in {"scaled_min", "scaled_sum"},
+                    prioritize_output_labels=program.stability_mode
+                    in {"scaled_min", "scaled_max", "scaled_sum"},
                 )
                 if planned_instructions is None:
                     continue
@@ -980,7 +991,6 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         ordered_events = _order_group_members_for_future_consumers(events, program)
         return _rewrite_output_depth_group_events(program, ordered_events)
 
-
 def _topologically_order_output_depth_events(
     program: RichProgram,
     groups: Sequence[OutputDepthOpGroup],
@@ -1077,14 +1087,27 @@ def _order_group_members_for_future_consumers(
         if isinstance(event, int):
             continue
 
-        candidates = _group_member_order_candidates(
-            event,
-            program,
+        future_order_keys = _group_member_future_order_keys(
+            event.members,
             events,
             consumers,
             event_index_by_op_index,
-            group_position_by_result_id,
             ordered_groups,
+        )
+        future_consumer_argument_sequences = (
+            _future_consumer_argument_sequences(
+                event,
+                events,
+                consumers,
+                event_index_by_op_index,
+                ordered_groups,
+            )
+        )
+        candidates = _group_member_order_candidates(
+            event,
+            program,
+            group_position_by_result_id,
+            future_order_keys,
         )
         ordered_members = min(
             candidates,
@@ -1097,6 +1120,8 @@ def _order_group_members_for_future_consumers(
                 event_index_by_op_index,
                 group_position_by_result_id,
                 ordered_groups,
+                future_order_keys,
+                future_consumer_argument_sequences,
             ),
         )
         ordered_groups[event_index] = replace(event, members=ordered_members)
@@ -1108,11 +1133,8 @@ def _order_group_members_for_future_consumers(
 def _group_member_order_candidates(
     group: OutputDepthOpGroup,
     program: RichProgram,
-    events: tuple[_ScheduledOutputDepthEvent, ...],
-    consumers: dict[int, list[tuple[int, int]]],
-    event_index_by_op_index: dict[int, int],
     group_position_by_result_id: dict[int, tuple[int, int]],
-    ordered_groups: dict[int, OutputDepthOpGroup],
+    future_order_keys: dict[int, tuple[int, ...]],
 ) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
     candidates: list[tuple[OutputDepthOpGroupMember, ...]] = []
 
@@ -1125,35 +1147,30 @@ def _group_member_order_candidates(
     add_candidate(
         sorted(
             group.members,
-            key=lambda member: _group_member_future_order_key(
-                member,
-                events,
-                consumers,
-                event_index_by_op_index,
-                ordered_groups,
-            ),
+            key=lambda member: future_order_keys[member.result_id],
         )
     )
 
     operand_count = len(group.members[0].canonical_argument_order)
+    materialization_order_keys = {
+        member.result_id: tuple(
+            _member_materialization_order_key(
+                program,
+                member,
+                canonical_position,
+                group_position_by_result_id,
+            )
+            for canonical_position in range(operand_count)
+        )
+        for member in group.members
+    }
     for canonical_position in range(operand_count):
         add_candidate(
             sorted(
                 group.members,
                 key=lambda member, position=canonical_position: (
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
-                    _group_member_future_order_key(
-                        member,
-                        events,
-                        consumers,
-                        event_index_by_op_index,
-                        ordered_groups,
-                    ),
+                    materialization_order_keys[member.result_id][position],
+                    future_order_keys[member.result_id],
                 ),
             )
         )
@@ -1161,25 +1178,9 @@ def _group_member_order_candidates(
             sorted(
                 group.members,
                 key=lambda member, position=canonical_position: (
-                    _member_materialization_source_key(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
-                    _group_member_future_order_key(
-                        member,
-                        events,
-                        consumers,
-                        event_index_by_op_index,
-                        ordered_groups,
-                    ),
-                    _member_materialization_index(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
+                    materialization_order_keys[member.result_id][position][0],
+                    future_order_keys[member.result_id],
+                    materialization_order_keys[member.result_id][position][1],
                 ),
             )
         )
@@ -1188,15 +1189,7 @@ def _group_member_order_candidates(
         sorted(
             group.members,
             key=lambda member: (
-                tuple(
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        canonical_position,
-                        group_position_by_result_id,
-                    )
-                    for canonical_position in range(operand_count)
-                ),
+                materialization_order_keys[member.result_id],
                 member.op_index,
             ),
         )
@@ -1205,15 +1198,7 @@ def _group_member_order_candidates(
         sorted(
             group.members,
             key=lambda member: (
-                tuple(
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        canonical_position,
-                        group_position_by_result_id,
-                    )
-                    for canonical_position in reversed(range(operand_count))
-                ),
+                tuple(reversed(materialization_order_keys[member.result_id])),
                 member.op_index,
             ),
         )
@@ -1231,14 +1216,23 @@ def _group_member_order_score(
     event_index_by_op_index: dict[int, int],
     group_position_by_result_id: dict[int, tuple[int, int]],
     ordered_groups: dict[int, OutputDepthOpGroup],
+    future_order_keys: dict[int, tuple[int, ...]],
+    future_consumer_argument_sequences: tuple[tuple[int | None, ...], ...],
 ) -> tuple[Any, ...]:
-    future_segment_count = _future_consumer_segment_count(
-        group,
-        members,
-        events,
-        consumers,
-        event_index_by_op_index,
-        ordered_groups,
+    position_by_result_id = {
+        member.result_id: position
+        for position, member in enumerate(members)
+    }
+    future_segment_count = sum(
+        _position_segment_count(
+            tuple(
+                position_by_result_id.get(argument)
+                if argument is not None
+                else None
+                for argument in arguments
+            )
+        )
+        for arguments in future_consumer_argument_sequences
     )
     source_run_count = _materialization_source_run_count(
         group,
@@ -1246,22 +1240,71 @@ def _group_member_order_score(
         program,
         group_position_by_result_id,
     )
-    future_order_keys = tuple(
-        _group_member_future_order_key(
-            member,
-            events,
-            consumers,
-            event_index_by_op_index,
-            ordered_groups,
-        )
-        for member in members
+    ordered_future_keys = tuple(
+        future_order_keys[member.result_id] for member in members
     )
     return (
         future_segment_count,
         source_run_count,
-        future_order_keys,
+        ordered_future_keys,
         tuple(member.op_index for member in members),
     )
+
+
+def _future_consumer_argument_sequences(
+    group: OutputDepthOpGroup,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    consumers: dict[int, list[tuple[int, int]]],
+    event_index_by_op_index: dict[int, int],
+    ordered_groups: dict[int, OutputDepthOpGroup],
+) -> tuple[tuple[int | None, ...], ...]:
+    """Collect each future consumer operand once for repeated order scoring."""
+
+    result_ids = frozenset(member.result_id for member in group.members)
+    consumer_event_indices = {
+        event_index_by_op_index[consumer_op_index]
+        for result_id in result_ids
+        for consumer_op_index, _argument_position in consumers.get(
+            result_id,
+            (),
+        )
+        if not isinstance(
+            events[event_index_by_op_index[consumer_op_index]],
+            int,
+        )
+    }
+    argument_sequences: list[tuple[int | None, ...]] = []
+    for consumer_event_index in sorted(consumer_event_indices):
+        consumer_event = events[consumer_event_index]
+        if isinstance(consumer_event, int):
+            continue
+        ordered_consumer = ordered_groups.get(
+            consumer_event_index,
+            consumer_event,
+        )
+        operand_count = len(
+            ordered_consumer.members[0].canonical_argument_order
+        )
+        for canonical_position in range(operand_count):
+            arguments = tuple(
+                (
+                    argument
+                    if argument in result_ids
+                    else None
+                )
+                for consumer_member in ordered_consumer.members
+                for original_position in (
+                    consumer_member.canonical_argument_order[
+                        canonical_position
+                    ],
+                )
+                for argument in (
+                    consumer_member.arguments[original_position],
+                )
+            )
+            if any(argument is not None for argument in arguments):
+                argument_sequences.append(arguments)
+    return tuple(argument_sequences)
 
 
 def _optimize_group_member_orders_by_materialization_cost(
@@ -1269,96 +1312,371 @@ def _optimize_group_member_orders_by_materialization_cost(
     program: RichProgram,
 ) -> tuple[_ScheduledOutputDepthEvent, ...]:
     group_event_indices = tuple(event_index for event_index, event in enumerate(events) if not isinstance(event, int))
-    states = (events,)
+    consumers = _result_consumers_with_positions(program)
+    event_index_by_op_index = {
+        op_index: event_index
+        for event_index, event in enumerate(events)
+        for op_index in (
+            (event,)
+            if isinstance(event, int)
+            else (member.op_index for member in event.members)
+        )
+    }
+    direct_axis0_select_keys = {
+        argument: _direct_axis0_select_key(program, argument)
+        for event in events
+        if not isinstance(event, int)
+        for member in event.members
+        for argument in member.arguments
+    }
+    states = (
+        _make_group_order_beam_state(
+            program,
+            events,
+            _group_order_beam_state_key(events, group_event_indices),
+            direct_axis0_select_keys,
+        ),
+    )
+    consumer_event_indices = _group_consumer_event_indices(events)
+    candidate_dependency_group_positions = (
+        _group_candidate_dependency_group_positions(
+            events,
+            group_event_indices,
+            consumer_event_indices,
+        )
+    )
+    candidate_cache: dict[
+        tuple[int, tuple[tuple[int, ...], ...]],
+        tuple[tuple[OutputDepthOpGroupMember, ...], ...],
+    ] = {}
     # Some useful reorderings require several dependent groups to move together;
     # a narrow beam keeps those temporary regressions available until they pay off.
-    for event_index in group_event_indices:
-        candidate_states: list[tuple[_ScheduledOutputDepthEvent, ...]] = []
+    for group_position, event_index in enumerate(group_event_indices):
+        candidate_states: list[_GroupOrderBeamState] = []
         for state in states:
-            event = state[event_index]
+            event = state.events[event_index]
             if isinstance(event, int):
                 continue
 
-            for candidate_members in _group_order_candidates_for_state(
-                program,
-                state,
-                event_index,
-            ):
-                state_events = list(state)
+            dependency_key = tuple(
+                state.key[dependency_group_position]
+                for dependency_group_position in (
+                    candidate_dependency_group_positions[event_index]
+                )
+            )
+            cache_key = (event_index, dependency_key)
+            candidates = candidate_cache.get(cache_key)
+            if candidates is None:
+                candidates = _group_order_candidates_for_state(
+                    program,
+                    state.events,
+                    event_index,
+                    consumers=consumers,
+                    event_index_by_op_index=event_index_by_op_index,
+                    group_position_by_result_id=(
+                        state.position_by_result_id
+                    ),
+                )
+                candidate_cache[cache_key] = candidates
+
+            for candidate_members in candidates:
+                state_events = list(state.events)
                 state_events[event_index] = replace(event, members=candidate_members)
-                candidate_states.append(tuple(state_events))
+                candidate_key = (
+                    *state.key[:group_position],
+                    tuple(member.op_index for member in candidate_members),
+                    *state.key[group_position + 1 :],
+                )
+                candidate_states.append(
+                    _updated_group_order_beam_state(
+                        program,
+                        state,
+                        events=tuple(state_events),
+                        key=candidate_key,
+                        changed_event_index=event_index,
+                        consumer_event_indices=consumer_event_indices,
+                        direct_axis0_select_keys=(
+                            direct_axis0_select_keys
+                        ),
+                    )
+                )
 
         states = _best_unique_order_states(program, candidate_states)
 
-    return min(states, key=lambda state: _order_state_score(program, state))
+    return min(
+        states,
+        key=lambda state: (state.total_cost, state.key),
+    ).events
+
+
+def _group_candidate_dependency_group_positions(
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    group_event_indices: tuple[int, ...],
+    consumer_event_indices: dict[int, frozenset[int]],
+) -> dict[int, tuple[int, ...]]:
+    group_position_by_event_index = {
+        event_index: group_position
+        for group_position, event_index in enumerate(group_event_indices)
+    }
+    producer_event_index_by_result_id = {
+        member.result_id: event_index
+        for event_index in group_event_indices
+        if not isinstance(event := events[event_index], int)
+        for member in event.members
+    }
+    dependencies: dict[int, tuple[int, ...]] = {}
+    for event_index in group_event_indices:
+        event = events[event_index]
+        if isinstance(event, int):
+            continue
+        dependency_event_indices = {
+            event_index,
+            *consumer_event_indices.get(event_index, ()),
+            *(
+                producer_event_index
+                for member in event.members
+                for argument in member.arguments
+                if (
+                    producer_event_index
+                    := producer_event_index_by_result_id.get(argument)
+                )
+                is not None
+            ),
+        }
+        dependencies[event_index] = tuple(
+            sorted(
+                group_position_by_event_index[
+                    dependency_event_index
+                ]
+                for dependency_event_index in dependency_event_indices
+            )
+        )
+    return dependencies
 
 
 def _group_order_candidates_for_state(
     program: RichProgram,
     events: tuple[_ScheduledOutputDepthEvent, ...],
     event_index: int,
+    *,
+    consumers: dict[int, list[tuple[int, int]]] | None = None,
+    event_index_by_op_index: dict[int, int] | None = None,
+    group_position_by_result_id: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
     event = events[event_index]
     if isinstance(event, int):
         return ()
 
-    consumers = _result_consumers_with_positions(program)
-    event_index_by_op_index: dict[int, int] = {}
-    group_position_by_result_id: dict[int, tuple[int, int]] = {}
-    ordered_groups: dict[int, OutputDepthOpGroup] = {}
-    for candidate_event_index, candidate_event in enumerate(events):
-        if isinstance(candidate_event, int):
-            event_index_by_op_index[candidate_event] = candidate_event_index
-            continue
-        ordered_groups[candidate_event_index] = candidate_event
-        for position, member in enumerate(candidate_event.members):
-            event_index_by_op_index[member.op_index] = candidate_event_index
-            group_position_by_result_id[member.result_id] = (
-                candidate_event_index,
-                position,
+    if consumers is None:
+        consumers = _result_consumers_with_positions(program)
+    if event_index_by_op_index is None:
+        event_index_by_op_index = {
+            op_index: candidate_event_index
+            for candidate_event_index, candidate_event in enumerate(events)
+            for op_index in (
+                (candidate_event,)
+                if isinstance(candidate_event, int)
+                else (
+                    member.op_index
+                    for member in candidate_event.members
+                )
             )
+        }
+    if group_position_by_result_id is None:
+        group_position_by_result_id = _group_member_position_by_result_id(
+            events
+        )
+    ordered_groups = {
+        candidate_event_index: candidate_event
+        for candidate_event_index, candidate_event in enumerate(events)
+        if not isinstance(candidate_event, int)
+    }
 
-    return _group_member_order_candidates(
-        event,
-        program,
+    future_order_keys = _group_member_future_order_keys(
+        event.members,
         events,
         consumers,
         event_index_by_op_index,
-        group_position_by_result_id,
         ordered_groups,
+    )
+    return _group_member_order_candidates(
+        event,
+        program,
+        group_position_by_result_id,
+        future_order_keys,
     )
 
 
 def _best_unique_order_states(
     program: RichProgram,
-    states: Sequence[tuple[_ScheduledOutputDepthEvent, ...]],
-) -> tuple[tuple[_ScheduledOutputDepthEvent, ...], ...]:
-    unique_states = {_order_state_key(state): state for state in states}
+    states: Sequence[_GroupOrderBeamState],
+) -> tuple[_GroupOrderBeamState, ...]:
+    unique_states = {state.key: state for state in states}
     return tuple(
         sorted(
             unique_states.values(),
-            key=lambda state: _order_state_score(program, state),
+            key=lambda state: (state.total_cost, state.key),
         )[:_GROUP_ORDER_BEAM_WIDTH]
     )
 
 
-def _order_state_score(
-    program: RichProgram,
+def _group_order_beam_state_key(
     events: tuple[_ScheduledOutputDepthEvent, ...],
-) -> tuple[Any, ...]:
-    return (
-        _estimated_total_materialization_instruction_count(program, events),
-        _order_state_key(events),
-    )
-
-
-def _order_state_key(
-    events: tuple[_ScheduledOutputDepthEvent, ...],
+    group_event_indices: tuple[int, ...],
 ) -> tuple[tuple[int, ...], ...]:
     return tuple(
-        (event,) if isinstance(event, int) else tuple(member.op_index for member in event.members)
-        for event in events
+        tuple(member.op_index for member in event.members)
+        for event_index in group_event_indices
+        if not isinstance(event := events[event_index], int)
     )
+
+
+def _make_group_order_beam_state(
+    program: RichProgram,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    key: tuple[tuple[int, ...], ...],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None],
+) -> _GroupOrderBeamState:
+    position_by_result_id = _group_member_position_by_result_id(events)
+    input_axis0_position_by_index = _input_axis0_position_by_index(
+        program,
+        events,
+    )
+    event_cost_by_index = {
+        event_index: _estimated_event_materialization_instruction_count(
+            program,
+            events,
+            event_index,
+            position_by_result_id,
+            input_axis0_position_by_index,
+            direct_axis0_select_keys,
+        )
+        for event_index, event in enumerate(events)
+        if not isinstance(event, int)
+    }
+    return _GroupOrderBeamState(
+        events=events,
+        key=key,
+        position_by_result_id=position_by_result_id,
+        input_axis0_position_by_index=input_axis0_position_by_index,
+        event_cost_by_index=event_cost_by_index,
+        total_cost=sum(event_cost_by_index.values()),
+    )
+
+
+def _updated_group_order_beam_state(
+    program: RichProgram,
+    state: _GroupOrderBeamState,
+    *,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    key: tuple[tuple[int, ...], ...],
+    changed_event_index: int,
+    consumer_event_indices: dict[int, frozenset[int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None],
+) -> _GroupOrderBeamState:
+    changed_event = events[changed_event_index]
+    if isinstance(changed_event, int):
+        raise ValueError("a beam candidate must change a grouped event")
+
+    position_by_result_id = state.position_by_result_id.copy()
+    for position, member in enumerate(changed_event.members):
+        position_by_result_id[member.result_id] = (
+            changed_event_index,
+            position,
+        )
+
+    input_axis0_position_by_index = state.input_axis0_position_by_index
+    input_order_may_change = any(
+        _direct_input_axis0_select_batch(
+            program,
+            changed_event,
+            canonical_position,
+        )
+        is not None
+        for canonical_position in range(
+            len(changed_event.members[0].canonical_argument_order)
+        )
+    )
+    if input_order_may_change:
+        input_axis0_position_by_index = _input_axis0_position_by_index(
+            program,
+            events,
+        )
+
+    event_cost_by_index = state.event_cost_by_index.copy()
+    if input_axis0_position_by_index != state.input_axis0_position_by_index:
+        affected_event_indices = event_cost_by_index.keys()
+    else:
+        affected_event_indices = (
+            changed_event_index,
+            *consumer_event_indices.get(changed_event_index, ()),
+        )
+    total_cost = state.total_cost
+    for event_index in affected_event_indices:
+        previous_cost = event_cost_by_index[event_index]
+        cost = _estimated_event_materialization_instruction_count(
+            program,
+            events,
+            event_index,
+            position_by_result_id,
+            input_axis0_position_by_index,
+            direct_axis0_select_keys,
+        )
+        event_cost_by_index[event_index] = cost
+        total_cost += cost - previous_cost
+
+    return _GroupOrderBeamState(
+        events=events,
+        key=key,
+        position_by_result_id=position_by_result_id,
+        input_axis0_position_by_index=input_axis0_position_by_index,
+        event_cost_by_index=event_cost_by_index,
+        total_cost=total_cost,
+    )
+
+
+def _group_consumer_event_indices(
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+) -> dict[int, frozenset[int]]:
+    producer_event_index_by_result_id = {
+        member.result_id: event_index
+        for event_index, event in enumerate(events)
+        if not isinstance(event, int)
+        for member in event.members
+    }
+    consumer_event_indices: dict[int, set[int]] = defaultdict(set)
+    for consumer_event_index, event in enumerate(events):
+        if isinstance(event, int):
+            continue
+        for member in event.members:
+            for argument in member.arguments:
+                producer_event_index = producer_event_index_by_result_id.get(
+                    argument
+                )
+                if producer_event_index is not None:
+                    consumer_event_indices[producer_event_index].add(
+                        consumer_event_index
+                    )
+    return {
+        event_index: frozenset(indices)
+        for event_index, indices in consumer_event_indices.items()
+    }
+
+
+def _input_axis0_position_by_index(
+    program: RichProgram,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+) -> dict[int, dict[int, int]]:
+    return {
+        input_id: {
+            original_index: position
+            for position, original_index in enumerate(input_order)
+        }
+        for input_id, input_order in _input_axis0_orders_for_events(
+            program,
+            events,
+        ).items()
+    }
 
 
 def _estimated_total_materialization_instruction_count(
@@ -1366,10 +1684,10 @@ def _estimated_total_materialization_instruction_count(
     events: tuple[_ScheduledOutputDepthEvent, ...],
 ) -> int:
     position_by_result_id = _group_member_position_by_result_id(events)
-    input_axis0_position_by_index = {
-        input_id: {original_index: position for position, original_index in enumerate(input_order)}
-        for input_id, input_order in _input_axis0_orders_for_events(program, events).items()
-    }
+    input_axis0_position_by_index = _input_axis0_position_by_index(
+        program,
+        events,
+    )
     return sum(
         _estimated_event_materialization_instruction_count(
             program,
@@ -1389,6 +1707,7 @@ def _estimated_event_materialization_instruction_count(
     event_index: int,
     position_by_result_id: dict[int, tuple[int, int]],
     input_axis0_position_by_index: dict[int, dict[int, int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None] | None = None,
 ) -> int:
     event = events[event_index]
     if isinstance(event, int):
@@ -1397,19 +1716,51 @@ def _estimated_event_materialization_instruction_count(
     instruction_count = 0
     operand_count = len(event.members[0].canonical_argument_order)
     for canonical_position in range(operand_count):
-        refs = tuple(
-            _estimated_materialization_ref(
+        segment_count = 0
+        segment_instruction_count = 0
+        segment_source: tuple[Any, ...] | None = None
+        segment_start = 0
+        segment_stop = 0
+        for member in event.members:
+            source, index = _estimated_materialization_ref(
                 program,
-                member.arguments[member.canonical_argument_order[canonical_position]],
+                member.arguments[
+                    member.canonical_argument_order[canonical_position]
+                ],
                 position_by_result_id,
                 input_axis0_position_by_index,
+                direct_axis0_select_keys,
             )
-            for member in event.members
-        )
-        instruction_count += _estimated_ref_materialization_instruction_count(
-            program,
-            events,
-            refs,
+            if source == segment_source and index == segment_stop:
+                segment_stop += 1
+                continue
+            if segment_source is not None:
+                segment_instruction_count += int(
+                    not _estimated_segment_is_full_source(
+                        program,
+                        events,
+                        segment_source,
+                        segment_start,
+                        segment_stop,
+                    )
+                )
+            segment_count += 1
+            segment_source = source
+            segment_start = index
+            segment_stop = index + 1
+
+        if segment_source is not None:
+            segment_instruction_count += int(
+                not _estimated_segment_is_full_source(
+                    program,
+                    events,
+                    segment_source,
+                    segment_start,
+                    segment_stop,
+                )
+            )
+        instruction_count += (
+            segment_instruction_count + int(segment_count > 1)
         )
     return instruction_count
 
@@ -1431,8 +1782,13 @@ def _estimated_materialization_ref(
     argument: int,
     position_by_result_id: dict[int, tuple[int, int]],
     input_axis0_position_by_index: dict[int, dict[int, int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None] | None = None,
 ) -> tuple[tuple[Any, ...], int]:
-    select_key = _direct_axis0_select_key(program, argument)
+    select_key = (
+        _direct_axis0_select_key(program, argument)
+        if direct_axis0_select_keys is None
+        else direct_axis0_select_keys.get(argument)
+    )
     if select_key is not None and select_key[0] < program.n_inputs:
         input_id, index = select_key
         mapped_index = input_axis0_position_by_index.get(input_id, {}).get(index, index)
@@ -1595,19 +1951,21 @@ def _member_materialization_order_key(
     canonical_position: int,
     group_position_by_result_id: dict[int, tuple[int, int]],
 ) -> tuple[Any, ...]:
+    source_kind, source_id, index = _member_materialization_source(
+        program,
+        member,
+        canonical_position,
+        group_position_by_result_id,
+    )
+    source_kind_order = {
+        "producer-group": 0,
+        "input-select": 1,
+        "input": 2,
+        "ssa": 3,
+    }[source_kind]
     return (
-        _member_materialization_source_key(
-            program,
-            member,
-            canonical_position,
-            group_position_by_result_id,
-        ),
-        _member_materialization_index(
-            program,
-            member,
-            canonical_position,
-            group_position_by_result_id,
-        ),
+        (source_kind_order, source_id),
+        index,
         member.op_index,
     )
 
@@ -1631,21 +1989,6 @@ def _member_materialization_source_key(
         "ssa": 3,
     }[source_kind]
     return (source_kind_order, source_id)
-
-
-def _member_materialization_index(
-    program: RichProgram,
-    member: OutputDepthOpGroupMember,
-    canonical_position: int,
-    group_position_by_result_id: dict[int, tuple[int, int]],
-) -> int:
-    _source_kind, _source_id, index = _member_materialization_source(
-        program,
-        member,
-        canonical_position,
-        group_position_by_result_id,
-    )
-    return index
 
 
 def _member_materialization_source(
@@ -1683,12 +2026,37 @@ def _result_consumers_with_positions(
     return consumers
 
 
+def _group_member_future_order_keys(
+    members: Sequence[OutputDepthOpGroupMember],
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    consumers: dict[int, list[tuple[int, int]]],
+    event_index_by_op_index: dict[int, int],
+    ordered_groups: dict[int, OutputDepthOpGroup],
+) -> dict[int, tuple[int, ...]]:
+    """Compute invariant future-order keys once for all candidate orderings."""
+
+    consumer_positions_by_event_index: dict[int, dict[int, int]] = {}
+    return {
+        member.result_id: _group_member_future_order_key(
+            member,
+            events,
+            consumers,
+            event_index_by_op_index,
+            ordered_groups,
+            consumer_positions_by_event_index=consumer_positions_by_event_index,
+        )
+        for member in members
+    }
+
+
 def _group_member_future_order_key(
     member: OutputDepthOpGroupMember,
     events: tuple[_ScheduledOutputDepthEvent, ...],
     consumers: dict[int, list[tuple[int, int]]],
     event_index_by_op_index: dict[int, int],
     ordered_groups: dict[int, OutputDepthOpGroup],
+    *,
+    consumer_positions_by_event_index: dict[int, dict[int, int]] | None = None,
 ) -> tuple[int, ...]:
     order_keys: list[tuple[int, ...]] = []
     for consumer_op_index, argument_position in consumers.get(member.result_id, []):
@@ -1706,7 +2074,20 @@ def _group_member_future_order_key(
             continue
 
         ordered_group = ordered_groups.get(consumer_event_index, consumer_event)
-        consumer_position_by_op_index = {consumer_member.op_index: position for position, consumer_member in enumerate(ordered_group.members)}
+        consumer_position_by_op_index = None
+        if consumer_positions_by_event_index is not None:
+            consumer_position_by_op_index = consumer_positions_by_event_index.get(
+                consumer_event_index
+            )
+        if consumer_position_by_op_index is None:
+            consumer_position_by_op_index = {
+                consumer_member.op_index: position
+                for position, consumer_member in enumerate(ordered_group.members)
+            }
+            if consumer_positions_by_event_index is not None:
+                consumer_positions_by_event_index[consumer_event_index] = (
+                    consumer_position_by_op_index
+                )
         consumer_member = ordered_group.members[consumer_position_by_op_index[consumer_op_index]]
         canonical_position = _canonical_operand_position(
             consumer_member,
@@ -1779,8 +2160,15 @@ def _rewrite_output_depth_group_events(
     ) -> int:
         result_id = input_plan.n_inputs + len(instructions)
         instructions.append(instruction)
-        argument_shapes = [shapes[argument] for argument in instruction.argument_ssa_ids]
-        shapes.append(instruction.operator.propagate_shapes(argument_shapes) if output_shape is None else output_shape)
+        if output_shape is None:
+            argument_shapes = [
+                shapes[argument]
+                for argument in instruction.argument_ssa_ids
+            ]
+            output_shape = instruction.operator.propagate_shapes(
+                argument_shapes
+            )
+        shapes.append(output_shape)
         if output_format is None:
             output_format = _infer_generated_tensor_format(
                 instruction.operator,
@@ -1898,7 +2286,10 @@ def _rewrite_output_depth_group_events(
     for event in events:
         if not isinstance(event, int):
             grouped_refs = _group_refs_by_canonical_operand(event, tensor_map)
-            batched_arguments = tuple(materialize_batch(refs) for refs in grouped_refs)
+            batched_arguments = tuple(
+                materialize_batch(refs)
+                for refs in grouped_refs
+            )
             batched_operator = _make_batched_operator(event.operator)
             batched_result_id = append_instruction(
                 RichInstruction(

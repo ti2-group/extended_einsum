@@ -33,7 +33,7 @@ def translate_to_backend_program(rich_program: RichProgram, backend_functions: B
     match rich_program.stability_mode:
         case "unstable":
             return _translate_unstable(rich_program, backend_functions)
-        case "scaled_min" | "scaled_sum":
+        case "scaled_min" | "scaled_max" | "scaled_sum":
             return _translate_scaled(rich_program, backend_functions, rich_program.stability_mode)
         case "logspace_min" | "logspace_max":
             return _translate_logspace(rich_program, backend_functions, rich_program.stability_mode)
@@ -128,11 +128,15 @@ _ScaledPositions = dict[tuple[int, _ScaledPart], int]
 _ScaledShapes = dict[int, Shape]
 
 
-def _translate_scaled(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray], stability_mode: Literal["scaled_min", "scaled_sum"]) -> BackendProgram[TBackendArray]:
+def _translate_scaled(
+    rich_program: RichProgram,
+    backend_functions: BackendFunctions[TBackendArray],
+    stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
+) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are scaled pairs of a normalized tensor and a broadcastable log scale.
 
     Scaling is lazy: a value stays a raw tensor until an operator consumes it as a scaled pair, then each last-axis fiber is normalized by its sum
-    (scaled_sum) or minimum (scaled_min), which assumes strictly positive values. The log and softmax operators eliminate the scale again,
+    (scaled_sum), maximum (scaled_max), or minimum (scaled_min), which assumes strictly positive values. The log and softmax operators eliminate the scale again,
     so their results are stored as raw tensors. Parameter-derived values stay linear in einsums.
     """
 
@@ -174,7 +178,7 @@ def _scaled_positions(
     scale_shapes: _ScaledShapes,
     value_shapes: list[Shape],
     ssa_id: int,
-    stability_mode: Literal["scaled_min", "scaled_sum"],
+    stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
 ) -> tuple[int, int]:
     """Positions of the value as a scaled pair, converting it from its raw tensor at most once by normalizing each last-axis fiber."""
 
@@ -183,6 +187,8 @@ def _scaled_positions(
         match stability_mode:
             case "scaled_min":
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_position,))
+            case "scaled_max":
+                total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_position,))
             case "scaled_sum":
                 total_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_position,))
         # The norm only chooses a representation: its derivative cancels
@@ -293,7 +299,7 @@ def _append_scaled_einsum(
     format_string: str,
     argument_ssa_ids: tuple[int, ...],
     result_ssa_id: int,
-    stability_mode: Literal["scaled_min", "scaled_sum"],
+    stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
     """Einsum on fiber-scaled data operands and linear parameter-derived operands."""
@@ -362,6 +368,8 @@ def _append_scaled_einsum(
     match stability_mode:
         case "scaled_min":
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_einsum_position,))
+        case "scaled_max":
+            raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_einsum_position,))
         case "scaled_sum":
             raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
     # As above, this normalization is a gauge transformation, so propagating
@@ -394,7 +402,7 @@ def _append_scaled_instruction(
     value_shapes: list[Shape],
     instruction: RichInstruction,
     result_ssa_id: int,
-    stability_mode: Literal["scaled_min", "scaled_sum"],
+    stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
 ) -> None:
     argument_ssa_ids = instruction.argument_ssa_ids
@@ -476,13 +484,55 @@ def _append_scaled_instruction(
                 # scale exactly. Reducing these to one scalar can underflow
                 # complete fibers before their next normalization.
                 normalized_positions = tuple(normalized_position for normalized_position, _ in scaled_pairs)
+                normalized_positions = list(normalized_positions)
                 expanded_scale_positions: list[int] = []
-                for argument_ssa_id, (_, log_scale_position) in zip(argument_ssa_ids, scaled_pairs, strict=True):
+                for pair_index, (
+                    argument_ssa_id,
+                    (_, log_scale_position),
+                ) in enumerate(
+                    zip(argument_ssa_ids, scaled_pairs, strict=True)
+                ):
                     target_scale_shape = _fiber_scale_shape(value_shapes[argument_ssa_id])
-                    if scale_shapes[argument_ssa_id] != target_scale_shape:
+                    scale_shape = scale_shapes[argument_ssa_id]
+                    if scale_shape and scale_shape[-1] != 1:
+                        common_scale_position = builder.wrap_and_append(
+                            partial(
+                                backend_functions.max,
+                                axis=-1,
+                                keepdims=True,
+                            ),
+                            (log_scale_position,),
+                        )
+                        common_scale_position = builder.wrap_and_append(
+                            backend_functions.stop_gradient,
+                            (common_scale_position,),
+                        )
+                        scale_delta_position = builder.wrap_and_append(
+                            backend_functions.subtract,
+                            (
+                                log_scale_position,
+                                common_scale_position,
+                            ),
+                        )
+                        scale_factor_position = builder.wrap_and_append(
+                            backend_functions.exp,
+                            (scale_delta_position,),
+                        )
+                        normalized_positions[pair_index] = (
+                            builder.wrap_and_append(
+                                backend_functions.multiply,
+                                (
+                                    normalized_positions[pair_index],
+                                    scale_factor_position,
+                                ),
+                            )
+                        )
+                        log_scale_position = common_scale_position
+                        scale_shape = (*scale_shape[:-1], 1)
+                    if scale_shape != target_scale_shape:
                         log_scale_position = builder.wrap_and_append(partial(backend_functions.broadcast_to, shape=target_scale_shape), (log_scale_position,))
                     expanded_scale_positions.append(log_scale_position)
-                positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), normalized_positions)
+                positions[result_ssa_id, "normalized"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(normalized_positions))
                 positions[result_ssa_id, "log_scale"] = builder.append(partial(backend_functions.concat, axis=axis), tuple(expanded_scale_positions))
                 scale_shapes[result_ssa_id] = _fiber_scale_shape(value_shapes[result_ssa_id])
         case OperatorTake(_):

@@ -936,7 +936,13 @@ class EinsumLabelAllocationTests(unittest.TestCase):
 
 class OptimizeContractionPathsTests(unittest.TestCase):
     def test_fuses_stable_outer_product_with_reduction(self) -> None:
-        for stability_mode in ("scaled_min", "scaled_sum", "logspace_min", "logspace_max"):
+        for stability_mode in (
+            "scaled_min",
+            "scaled_max",
+            "scaled_sum",
+            "logspace_min",
+            "logspace_max",
+        ):
             with self.subTest(stability_mode=stability_mode):
                 program = RichProgram(
                     instructions=[
