@@ -68,6 +68,8 @@ The public interface currently includes:
 
 Supported execution backends are PyTorch, NumPy, and optional JAX. Rich programs can be evaluated in `unstable`, `scaled_min`, `scaled_sum`, `logspace_min`, or `logspace_max` mode. Support is operator-dependent; unsupported combinations raise `NotImplementedError` instead of silently changing semantics.
 
+Custom execution backends plug in through `extended_einsum.register_backend`: subclass `extended_einsum.BackendFunctions` (only a small set of primitives is abstract; derived operations such as `softmax`, `select`, and the arithmetic operators have defaults composed from them), then register it under a name, optionally with a compiler and an `is_array` predicate for automatic backend detection in `xe.array`. Without a compiler, programs are interpreted call by call; without a predicate, wrap arrays with `xe.array(data, backend="yourname")`. Validate an implementation with `extended_einsum.testing.check_backend`, which runs every operator through every stability mode against the NumPy reference backend.
+
 The preprocessing API also provides expression folding and contraction-path optimization. DAG plotting is available from `extended_einsum.visualization` when the visualization extra is installed.
 
 ## Examples

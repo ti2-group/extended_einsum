@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar, override
 
 from extended_einsum.backend_translation import BackendArray
-from extended_einsum.backend_translation.backend import get_backend_of_array
+from extended_einsum.backends.registry import get_backend_of_array
 from extended_einsum.interface.tensor_expression import (
     Parameter,
     TensorExpression,
@@ -31,6 +31,7 @@ TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 @dataclass(frozen=True)
 class BackendArrayWrapper(Array, Generic[TBackendArray]):
     backend_array: TBackendArray
+    _backend: Backend
     _format: TensorFormat
 
     @property
@@ -41,7 +42,7 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
     @property
     @override
     def backend(self) -> Backend:
-        return get_backend_of_array(self.backend_array)
+        return self._backend
 
     @property
     @override
@@ -49,8 +50,16 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
         return self._format
 
 
-def array(backend_array: TBackendArray, format: TensorFormat = "dense") -> BackendArrayWrapper[TBackendArray]:
-    return BackendArrayWrapper(backend_array, format)
+def array(backend_array: TBackendArray, format: TensorFormat = "dense", *, backend: Backend | None = None) -> BackendArrayWrapper[TBackendArray]:
+    """Wraps a backend array for use in tensor expressions.
+
+    The backend is detected from the array type; for backends registered
+    without an ``is_array`` predicate, pass the backend name explicitly.
+    """
+
+    if backend is None:
+        backend = get_backend_of_array(backend_array)
+    return BackendArrayWrapper(backend_array, backend, format)
 
 
 def exp(

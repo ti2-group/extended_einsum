@@ -6,7 +6,7 @@ from typing import Callable, Generic, cast, override
 
 from extended_einsum.backend_translation import BackendCompiler, BackendProgram, translate_to_backend_program
 from extended_einsum.backends.registry import get_backend_compiler, get_backend_functions
-from extended_einsum.language.rich_instruction import map_instruction_arguments
+from extended_einsum.language.rich_instruction import RichInstruction, map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
     OperatorConcat,
@@ -28,7 +28,7 @@ from extended_einsum.language.rich_operators import (
     OperatorTan,
     RichOperator,
 )
-from extended_einsum.language.rich_program import RichInstruction, RichProgram
+from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import (
     Backend,
     HasBackend,
@@ -114,7 +114,7 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         # public interface-function modules.
         from extended_einsum.interface.functions import BackendArrayWrapper
 
-        return cast(TArray, BackendArrayWrapper(backend_array, self.format))
+        return cast(TArray, BackendArrayWrapper(backend_array, self.backend, self.format))
 
     def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorAdd(), [self, other])

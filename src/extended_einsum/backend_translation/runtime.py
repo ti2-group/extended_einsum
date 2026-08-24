@@ -1,7 +1,8 @@
-from collections.abc import Sequence
-from typing import TypeVar
+from collections.abc import Callable, Sequence
+from functools import partial
+from typing import Generic, TypeVar
 
-from extended_einsum.backend_translation.backend import BackendArray, BackendProgram
+from extended_einsum.backend_translation.backend import BackendArray, BackendCompiler, BackendProgram
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
@@ -19,3 +20,20 @@ def run_program(
         result = backend_call(argument_tensors)
         tensors.append(result)
     return tensors[-1]
+
+
+class DefaultCompiler(BackendCompiler[TBackendArray], Generic[TBackendArray]):
+    """Fallback compiler that interprets the program call by call.
+
+    Used for backends without JIT compilation and as the default when a custom
+    backend registers no compiler of its own.
+    """
+
+    def compile(
+        self,
+        program: BackendProgram[TBackendArray],
+        inputs: Sequence[TBackendArray],
+    ) -> Callable[[Sequence[TBackendArray]], TBackendArray]:
+        if len(inputs) != program.n_inputs:
+            raise ValueError(f"The number of inputs ({len(inputs)}) does not match the number of inputs ({program.n_inputs}) in the program.")
+        return partial(run_program, program)
