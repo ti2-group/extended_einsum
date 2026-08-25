@@ -8,6 +8,13 @@ from extended_einsum.language.types import Shape, StabilityMode, TensorFormat
 
 @dataclass(frozen=True)
 class RichProgram:
+    """Backend-independent extended-einsum DAG from the paper's "Frontend".
+
+    SSA IDs make intermediate values first-class, and the derived consumer map
+    exposes reuse for the consumer-aware layout pass in "Memory Layout
+    Optimizations" (sec:memory-layout).
+    """
+
     instructions: list[RichInstruction]
     n_inputs: int
     stability_mode: StabilityMode

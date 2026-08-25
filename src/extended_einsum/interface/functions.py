@@ -27,6 +27,12 @@ from extended_einsum.utils import normalize_axis, parse_format_string
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
+# Paper "Beyond Standard Einsum": these constructors deliberately expose
+# einsum together with first-class intermediates, stack/take/select/slice,
+# nonlinearities, softmax, and elementwise arithmetic. Keeping these as a
+# restricted tensor language preserves the contraction and dataflow structure
+# used by the compiler passes in sec:compiler-optimizations.
+
 
 @dataclass(frozen=True)
 class BackendArrayWrapper(Array, Generic[TBackendArray]):

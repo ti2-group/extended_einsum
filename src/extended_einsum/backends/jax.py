@@ -14,6 +14,8 @@ class JaxBackendFunctions(BackendFunctions[jax.Array]):
     @override
     @staticmethod
     def stop_gradient(array: jax.Array) -> jax.Array:
+        # Paper "Detached reference shifts" (sec:numerical-stability):
+        # remove the backward path through max-based reference shifts.
         return jax.lax.stop_gradient(array)
 
     @override

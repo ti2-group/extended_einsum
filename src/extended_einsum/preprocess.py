@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, override
@@ -13,6 +13,7 @@ from extended_einsum.language.rich_operators import (
     OperatorSlice,
     OperatorSoftmax,
     OperatorStack,
+    OperatorTake,
     RichOperator,
 )
 from extended_einsum.language.rich_program import RichProgram
@@ -62,6 +63,14 @@ _BATCHABLE_OPERATOR_NAMES = frozenset(
 )
 _CONTRACTION_PATH_ATTEMPTS = 8
 _GROUP_ORDER_BEAM_WIDTH = 16
+
+# Paper implementation map ("Compiler Optimizations",
+# sec:compiler-optimizations):
+# - extract_connected_einsum_components and OptimizeContractionPaths implement
+#   "Contraction Path" (sec:contraction-path).
+# - grouping and FoldSameShapedOperations implement "IR-Level Folding".
+# - the group-order search, materialization cost, and rewrite helpers implement
+#   "Memory Layout Optimizations" (sec:memory-layout).
 
 
 class _EinsumLabelAllocator:
@@ -135,12 +144,27 @@ class OutputDepthOpGroup(_OutputDepthOpSignature):
     members: tuple[OutputDepthOpGroupMember, ...]
 
 
+@dataclass(frozen=True)
+class _GroupOrderBeamState:
+    events: tuple[_ScheduledOutputDepthEvent, ...]
+    key: tuple[tuple[int, ...], ...]
+    position_by_result_id: dict[int, tuple[int, int]]
+    input_axis0_position_by_index: dict[int, dict[int, int]]
+    event_cost_by_index: dict[int, int]
+    total_cost: int
+
+
 def group_identical_ops_by_output_depth(
     program: RichProgram,
     *,
     min_group_size: int = 2,
 ) -> tuple[OutputDepthOpGroup, ...]:
-    """Group live, batchable, canonically identical ops by nearest output depth."""
+    """Find the shape-compatible parallel operations folded by one batched op.
+
+    Paper reference: "IR-Level Folding". Grouping uses operator semantics,
+    operand shapes/formats, and compatible graph depth; canonical operand order
+    lets equivalent commutative/einsum operations share the added fold axis.
+    """
     if min_group_size < 1:
         raise ValueError("min_group_size must be at least 1")
 
@@ -194,6 +218,326 @@ def group_identical_ops_by_output_depth(
         tuple(groups),
         min_group_size=min_group_size,
     )
+
+
+def group_identical_ops_by_input_depth(
+    program: RichProgram,
+    *,
+    min_group_size: int = 2,
+    split_by_routing: bool = False,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Group live, batchable, canonically identical ops by input frontier.
+
+    This is the input-oriented implementation of paper "IR-Level Folding" used
+    by the publication's metadata-free Cirkit/Monarch integration. It retains
+    the paper's matching-shape batching rule while choosing compatible groups
+    from their nearest input frontier rather than nearest output depth.
+
+    Ordinary SSA values use their longest-path depth from the program inputs.
+    Parameter-only preprocessing is different: independent weight transforms
+    would otherwise all sit at depth one even though they belong to different
+    circuit layers. Such values inherit the earliest live frontier at which
+    they are consumed.
+
+    Unlike output-directed grouping, operations at a true input depth cannot
+    depend on one another. Reusing one operand in several group members is
+    allowed: the materialization rewrite can route or repeat that operand. This
+    is what permits the input-directed schedule to form the larger native XE
+    folds.
+    """
+    if min_group_size < 1:
+        raise ValueError("min_group_size must be at least 1")
+
+    live_ssa_ids = frozenset(_nearest_output_depths(program))
+    input_depths = _input_frontier_depths(program, live_ssa_ids)
+    result_dependencies = _instruction_result_dependencies(program)
+    groups: list[OutputDepthOpGroup] = []
+
+    grouped_input_pointwise_ops = _append_input_pointwise_groups(
+        program,
+        input_depths,
+        result_dependencies,
+        groups,
+        min_group_size,
+    )
+    buckets: dict[_OutputDepthOpSignature, list[OutputDepthOpGroupMember]] = {}
+    for op_index, instruction in enumerate(program.instructions):
+        if op_index in grouped_input_pointwise_ops:
+            continue
+        if instruction.operator.name not in _BATCHABLE_OPERATOR_NAMES:
+            continue
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+
+        signature, member = _canonicalize_output_depth_op(
+            program,
+            op_index,
+            input_depths[result_id],
+        )
+        buckets.setdefault(signature, []).append(member)
+
+    for signature, members in buckets.items():
+        for dependency_safe_group in _split_dependency_only_op_groups(
+            members,
+            result_dependencies,
+        ):
+            if len(dependency_safe_group) < min_group_size:
+                continue
+            groups.append(
+                OutputDepthOpGroup(
+                    depth=signature.depth,
+                    operator=signature.operator,
+                    operand_shapes=signature.operand_shapes,
+                    operand_tensor_formats=signature.operand_tensor_formats,
+                    members=dependency_safe_group,
+                )
+            )
+
+    result = tuple(groups)
+    if split_by_routing:
+        result = _split_input_depth_groups_by_routing(
+            program,
+            result,
+            live_ssa_ids=live_ssa_ids,
+            min_group_size=min_group_size,
+        )
+    return result
+
+
+def _split_input_depth_groups_by_routing(
+    program: RichProgram,
+    groups: tuple[OutputDepthOpGroup, ...],
+    *,
+    live_ssa_ids: frozenset[int],
+    min_group_size: int,
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Keep differently routed branches independently schedulable.
+
+    Input-depth equality alone can merge operations whose operands have
+    different fan-out or whose results feed different operator kinds. Those
+    members cannot necessarily share a good future-consumer order. Splitting
+    them uses only the flattened SSA graph and preserves all groups that still
+    meet ``min_group_size``.
+    """
+
+    consumers: dict[int, list[int]] = defaultdict(list)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+        for argument in instruction.argument_ssa_ids:
+            consumers[argument].append(result_id)
+
+    split_groups: list[OutputDepthOpGroup] = []
+    for group in groups:
+        buckets: dict[
+            tuple[tuple[int, ...], tuple[str, ...]],
+            list[OutputDepthOpGroupMember],
+        ] = {}
+        for member in group.members:
+            ordered_arguments = tuple(
+                member.arguments[position]
+                for position in member.canonical_argument_order
+            )
+            argument_fanouts = tuple(
+                len(consumers[argument])
+                for argument in ordered_arguments
+            )
+            consumer_operators = tuple(
+                sorted(
+                    program.instructions[consumer - program.n_inputs].operator.name
+                    for consumer in consumers[member.result_id]
+                    if consumer >= program.n_inputs
+                )
+            )
+            buckets.setdefault(
+                (argument_fanouts, consumer_operators),
+                [],
+            ).append(member)
+
+        split_groups.extend(
+            replace(group, members=tuple(members))
+            for members in buckets.values()
+            if len(members) >= min_group_size
+        )
+    return tuple(split_groups)
+
+
+_InputAccessToken = tuple[int, int]
+
+
+def _order_input_depth_groups_by_input_access(
+    program: RichProgram,
+    groups: tuple[OutputDepthOpGroup, ...],
+) -> tuple[OutputDepthOpGroup, ...]:
+    """Use the input traversal as the canonical order within native folds.
+
+    The flattened instruction list is commonly depth-first, so preserving its
+    order interleaves spatially distant branches.  Input-frontier folding is
+    instead given a stable, metadata-free order by the axis-0 input elements
+    that can reach each result. Parameter-only transforms inherit the access
+    scope of their consumers so weights remain aligned with the data branch
+    that uses them.
+    """
+
+    scopes = _input_access_scopes(program)
+
+    def member_key(
+        member: OutputDepthOpGroupMember,
+    ) -> tuple[tuple[_InputAccessToken, ...], int, int]:
+        scope = scopes.get(member.result_id, frozenset())
+        ordered_scope = tuple(sorted(scope))
+        return ordered_scope, len(scope), member.op_index
+
+    return tuple(
+        replace(
+            group,
+            members=tuple(sorted(group.members, key=member_key)),
+        )
+        for group in groups
+    )
+
+
+def _has_same_index_product_contraction(program: RichProgram) -> bool:
+    """Detect CP's elementwise product contraction from the tensor program."""
+
+    for instruction in program.instructions:
+        if _is_same_index_product_operator(instruction.operator):
+            return True
+    return False
+
+
+def _is_same_index_product_operator(operator: RichOperator) -> bool:
+    if not isinstance(operator, OperatorEinsum):
+        return False
+    input_strings, output_string = parse_format_string(
+        operator.format_string
+    )
+    return (
+        len(input_strings) == 2
+        and input_strings[0] == input_strings[1]
+        and input_strings[0] == output_string
+    )
+
+
+def _input_access_scopes(
+    program: RichProgram,
+) -> dict[int, frozenset[_InputAccessToken]]:
+    """Return the non-parameter axis-0 input elements reaching each SSA value."""
+
+    live_ssa_ids = frozenset(_nearest_output_depths(program))
+    scopes: dict[int, frozenset[_InputAccessToken]] = {}
+    for input_id in range(program.n_inputs):
+        if input_id in program.parameter_indices or not program.shapes[input_id]:
+            scopes[input_id] = frozenset()
+            continue
+        scopes[input_id] = frozenset(
+            (input_id, index)
+            for index in range(program.shapes[input_id][0])
+        )
+
+    parameter_derived_ssa_ids = set(program.parameter_indices)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if instruction.argument_ssa_ids and all(
+            argument in parameter_derived_ssa_ids
+            for argument in instruction.argument_ssa_ids
+        ):
+            parameter_derived_ssa_ids.add(result_id)
+
+        direct_scope = _direct_non_parameter_input_access_scope(
+            program,
+            instruction,
+        )
+        if direct_scope is not None:
+            scopes[result_id] = direct_scope
+        else:
+            scopes[result_id] = frozenset().union(
+                *(scopes[argument] for argument in instruction.argument_ssa_ids)
+            )
+
+    for ssa_id in sorted(
+        parameter_derived_ssa_ids.intersection(live_ssa_ids),
+        reverse=True,
+    ):
+        consumer_scopes = [
+            scopes[consumer]
+            for consumer in program.consumers_of_ssa_id[ssa_id]
+            if consumer in live_ssa_ids
+        ]
+        if consumer_scopes:
+            scopes[ssa_id] = frozenset().union(*consumer_scopes)
+
+    return scopes
+
+
+def _direct_non_parameter_input_access_scope(
+    program: RichProgram,
+    instruction: RichInstruction,
+) -> frozenset[_InputAccessToken] | None:
+    if len(instruction.argument_ssa_ids) != 1:
+        return None
+    input_id = instruction.argument_ssa_ids[0]
+    if input_id >= program.n_inputs or input_id in program.parameter_indices:
+        return None
+
+    operator = instruction.operator
+    if isinstance(operator, OperatorSelect) and operator.axis == 0:
+        return frozenset({(input_id, operator.index)})
+    if isinstance(operator, OperatorSlice) and operator.axis == 0:
+        return frozenset(
+            (input_id, index)
+            for index in range(operator.start, operator.stop)
+        )
+    return None
+
+
+def _input_frontier_depths(
+    program: RichProgram,
+    live_ssa_ids: frozenset[int],
+) -> dict[int, int]:
+    depths = _ssa_depths_from_inputs(program)
+    parameter_derived_ssa_ids = set(program.parameter_indices)
+    for op_index, instruction in enumerate(program.instructions):
+        if instruction.argument_ssa_ids and all(
+            argument in parameter_derived_ssa_ids
+            for argument in instruction.argument_ssa_ids
+        ):
+            parameter_derived_ssa_ids.add(program.n_inputs + op_index)
+
+    consumers: dict[int, list[int]] = defaultdict(list)
+    for op_index, instruction in enumerate(program.instructions):
+        result_id = program.n_inputs + op_index
+        if result_id not in live_ssa_ids:
+            continue
+        for argument in instruction.argument_ssa_ids:
+            consumers[argument].append(result_id)
+
+    inherited_depths: dict[int, int] = {}
+    for ssa_id in sorted(
+        parameter_derived_ssa_ids.intersection(live_ssa_ids),
+        reverse=True,
+    ):
+        consumer_depths = [
+            (
+                inherited_depths[consumer]
+                if consumer in parameter_derived_ssa_ids
+                else depths[consumer]
+            )
+            for consumer in consumers[ssa_id]
+            if consumer not in parameter_derived_ssa_ids
+            or consumer in inherited_depths
+        ]
+        if consumer_depths:
+            inherited_depths[ssa_id] = min(consumer_depths)
+
+    depths.update(inherited_depths)
+    return {
+        ssa_id: depth
+        for ssa_id, depth in depths.items()
+        if ssa_id in live_ssa_ids
+    }
 
 
 def _append_input_pointwise_groups(
@@ -422,6 +766,30 @@ def _split_dependency_safe_op_groups(
     return [tuple(group) for group in groups]
 
 
+def _split_dependency_only_op_groups(
+    members: list[OutputDepthOpGroupMember],
+    result_dependencies: dict[int, frozenset[int]],
+) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
+    groups: list[
+        tuple[list[OutputDepthOpGroupMember], set[int]]
+    ] = []
+    for member in sorted(members, key=lambda item: item.op_index):
+        member_dependencies = result_dependencies[member.result_id]
+        for group, group_result_ids in groups:
+            # Members are visited in topological order, so only the new
+            # member can depend on a member already present in the group.
+            # Set intersection performs the same all-pairs test in C and,
+            # crucially, scales with the usually small ancestor set rather
+            # than the potentially huge fold width.
+            if member_dependencies.isdisjoint(group_result_ids):
+                group.append(member)
+                group_result_ids.add(member.result_id)
+                break
+        else:
+            groups.append(([member], {member.result_id}))
+    return tuple(tuple(group) for group, _result_ids in groups)
+
+
 def _split_operand_source_safe_op_groups(
     program: RichProgram,
     members: tuple[OutputDepthOpGroupMember, ...],
@@ -631,7 +999,13 @@ def _is_outer_product_einsum(format_string: str) -> bool:
 def extract_connected_einsum_components(
     program: RichProgram,
 ) -> tuple[_ConnectedEinsumComponent, ...]:
-    """Find einsum components by walking from the program output to its inputs."""
+    """Merge nested einsums into candidate n-ary contraction components.
+
+    This is the format-string substitution in paper "Contraction Path"
+    (sec:contraction-path): for example, the producer ``kij,ljk->klij`` is
+    substituted into its consumer ``ij,klij->kl`` to obtain
+    ``ij,kij,ljk->kl``. Consistent component-wide labels prevent collisions.
+    """
     components: list[_ConnectedEinsumComponent] = []
     visited: set[int] = set()
     pending_ssa_ids = [program.output_ssa]
@@ -730,10 +1104,18 @@ def extract_connected_einsum_components(
 
 
 class OptimizeContractionPaths(PreprocessingRoutine):
+    """Apply the paper's contraction merging and pairwise path optimization.
+
+    See "Contraction Path" (sec:contraction-path). The output replaces a fused
+    n-ary component by pairwise einsums such as ``ij,kij->kj`` followed by
+    ``kj,ljk->kl``, avoiding materialization of the full weight tensor.
+    """
+
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
-        # Compute a replacement contraction path for each extracted component.
+        # Paper "Contraction Path", step 1: merge every eligible, uniquely
+        # consumed einsum tree by substituting producer index strings.
         result_depths = _ssa_depths_from_inputs(program)
         blocks: dict[
             int,
@@ -762,12 +1144,15 @@ class OptimizeContractionPaths(PreprocessingRoutine):
                 continue
             else:
                 boundary_shapes = tuple(program.shapes[argument] for argument in component.boundary_arguments)
+                # Paper "Contraction Path", step 2: pass the merged n-ary
+                # expression to the contraction-path optimizer.
                 planned_instructions = _compute_depth_preserving_contraction_plan(
                     component,
                     boundary_shapes,
                     result_depths,
                     program.n_inputs,
-                    prioritize_output_labels=program.stability_mode in {"scaled_min", "scaled_sum"},
+                    prioritize_output_labels=program.stability_mode
+                    in {"scaled_min", "scaled_max", "scaled_sum"},
                 )
                 if planned_instructions is None:
                     continue
@@ -781,8 +1166,9 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         if not blocks:
             return program
 
-        # Operations in a planned component are omitted from the old program and
-        # replaced by the new pairwise contractions when its sink is reached.
+        # Paper "Contraction Path", step 3: replace the component with the
+        # optimizer's pairwise schedule so large intermediates such as W in the
+        # Monarch example are never materialized.
         block_ops = {op_index for component, _arguments, _instructions in blocks.values() for op_index in component}
         tensor_map = {input_id: input_id for input_id in range(program.n_inputs)}
         instructions: list[RichInstruction] = []
@@ -860,9 +1246,18 @@ def _compute_depth_preserving_contraction_plan(
     *,
     prioritize_output_labels: bool = False,
 ) -> tuple[RichInstruction, ...] | None:
+    """Choose the paper's pairwise schedule with the sesum/cgreedy optimizer.
+
+    The depth guard is an implementation constraint: it keeps the rewritten
+    graph no deeper than the original component while minimizing intermediate
+    size, matching the paper's goal of avoiding materialized weight tensors.
+    """
+
     from sesum import sr
 
     original_sink_depth = result_depths[n_inputs + component.sink_op_index]
+    # Multiple deterministic seeds are tried because the paper permits a
+    # heuristic contraction-path optimizer rather than prescribing one path.
     for seed in range(_CONTRACTION_PATH_ATTEMPTS):
         try:
             path, _flops, _size = sr.compute_path(
@@ -950,6 +1345,7 @@ class FoldSameShapedOperationsResult:
     parameter_stack_orders: tuple[tuple[int, ...], ...]
     input_axis0_orders: dict[int, tuple[int, ...]]
     concatenated_batch_orders: tuple[tuple[int, ...], ...]
+    gather_index_orders: tuple[tuple[int, ...], ...]
 
 
 _TensorValueRef = _TensorRef | _InputRef | _BatchElementRef
@@ -957,6 +1353,14 @@ _ScheduledOutputDepthEvent = int | OutputDepthOpGroup
 
 
 class FoldSameShapedOperations(PreprocessingRoutine):
+    """Batch shape-compatible IR operations and optimize their fold-axis layout.
+
+    Paper references: "IR-Level Folding" for adding the fold axis and evaluating
+    a group with one batched operator; "Memory Layout Optimizations"
+    (sec:memory-layout) for permuting group members to reduce downstream
+    slices/concatenations without changing the computed function.
+    """
+
     @override
     @staticmethod
     def apply(program: RichProgram) -> RichProgram:
@@ -964,7 +1368,20 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         return result.program
 
     @staticmethod
-    def apply_with_metadata(program: RichProgram) -> FoldSameShapedOperationsResult:
+    def apply_with_metadata(
+        program: RichProgram,
+        *,
+        optimize_group_order: bool = True,
+    ) -> FoldSameShapedOperationsResult:
+        """Fold output-depth groups and expose all required input permutations.
+
+        ``optimize_group_order`` enables the consumer-aware ordering described
+        in paper sec:memory-layout. Metadata lets callers pack parameters and
+        permute input features once, as specified in that section's example.
+        """
+
+        # Paper "IR-Level Folding": detect operations with matching semantics,
+        # operand shapes, tensor formats, and compatible graph depth.
         groups = group_identical_ops_by_output_depth(program)
         if not groups:
             return FoldSameShapedOperationsResult(
@@ -974,12 +1391,78 @@ class FoldSameShapedOperations(PreprocessingRoutine):
                 parameter_stack_orders=(),
                 input_axis0_orders={},
                 concatenated_batch_orders=(),
+                gather_index_orders=(),
+            )
+
+        # Keep the original DAG dependencies while replacing every group by one
+        # batched event with a leading fold axis.
+        events = _topologically_order_output_depth_events(program, groups)
+        # Paper sec:memory-layout: the members are semantically permutable, so
+        # choose a physical order informed by downstream operand sequences.
+        ordered_events = _order_group_members_for_future_consumers(events, program) if optimize_group_order else events
+        return _rewrite_output_depth_group_events(program, ordered_events)
+
+    @staticmethod
+    def apply_with_input_depth_metadata(
+        program: RichProgram,
+        *,
+        optimize_group_order: bool = True,
+        order_by_input_access: bool | None = None,
+        split_by_routing: bool | None = None,
+    ) -> FoldSameShapedOperationsResult:
+        """Fold using XE-native input frontiers without source metadata.
+
+        This is the publication experiment path for paper "IR-Level Folding"
+        and "Memory Layout Optimizations" (sec:memory-layout). It applies the
+        same fold-axis batching, consumer ordering, and input-permutation
+        metadata as :meth:`apply_with_metadata`, but discovers layers from
+        input frontiers when no symbolic-circuit layer metadata is available.
+
+        By default, programs containing CP's same-index product contraction use
+        input-access order within each fold. This prevents a depth-first
+        instruction traversal from interleaving distant CP branches. Other
+        contraction structures retain their original order; callers can force
+        either behavior with ``order_by_input_access``.
+        """
+
+        is_same_index_product_program = _has_same_index_product_contraction(
+            program
+        )
+        if split_by_routing is None:
+            split_by_routing = is_same_index_product_program
+        groups = group_identical_ops_by_input_depth(
+            program,
+            split_by_routing=split_by_routing,
+        )
+        if order_by_input_access is None:
+            order_by_input_access = is_same_index_product_program
+        if order_by_input_access:
+            groups = _order_input_depth_groups_by_input_access(
+                program,
+                groups,
+            )
+        if not groups:
+            return FoldSameShapedOperationsResult(
+                program=program,
+                batched_result_orders=(),
+                non_parameter_stack_orders=(),
+                parameter_stack_orders=(),
+                input_axis0_orders={},
+                concatenated_batch_orders=(),
+                gather_index_orders=(),
             )
 
         events = _topologically_order_output_depth_events(program, groups)
-        ordered_events = _order_group_members_for_future_consumers(events, program)
-        return _rewrite_output_depth_group_events(program, ordered_events)
-
+        ordered_events = (
+            _order_group_members_for_future_consumers(events, program)
+            if optimize_group_order
+            else events
+        )
+        return _rewrite_output_depth_group_events(
+            program,
+            ordered_events,
+            emit_fragmented_batch_gathers=True,
+        )
 
 def _topologically_order_output_depth_events(
     program: RichProgram,
@@ -1057,7 +1540,13 @@ def _order_group_members_for_future_consumers(
     events: tuple[_ScheduledOutputDepthEvent, ...],
     program: RichProgram,
 ) -> tuple[_ScheduledOutputDepthEvent, ...]:
-    """Sort members inside each group to align batch axes with future consumers."""
+    """Order fold axes using the paper's consumer-aware layout optimization.
+
+    Paper reference: "Memory Layout Optimizations" (sec:memory-layout),
+    especially "Layout objective". Groups are first visited in reverse
+    topological order so consumer preferences are known, then a bounded global
+    search allows dependent producers and consumers to move together.
+    """
     consumers = _result_consumers_with_positions(program)
     event_index_by_op_index: dict[int, int] = {}
     group_position_by_result_id: dict[int, tuple[int, int]] = {}
@@ -1077,14 +1566,27 @@ def _order_group_members_for_future_consumers(
         if isinstance(event, int):
             continue
 
-        candidates = _group_member_order_candidates(
-            event,
-            program,
+        future_order_keys = _group_member_future_order_keys(
+            event.members,
             events,
             consumers,
             event_index_by_op_index,
-            group_position_by_result_id,
             ordered_groups,
+        )
+        future_consumer_argument_sequences = (
+            _future_consumer_argument_sequences(
+                event,
+                events,
+                consumers,
+                event_index_by_op_index,
+                ordered_groups,
+            )
+        )
+        candidates = _group_member_order_candidates(
+            event,
+            program,
+            group_position_by_result_id,
+            future_order_keys,
         )
         ordered_members = min(
             candidates,
@@ -1097,6 +1599,8 @@ def _order_group_members_for_future_consumers(
                 event_index_by_op_index,
                 group_position_by_result_id,
                 ordered_groups,
+                future_order_keys,
+                future_consumer_argument_sequences,
             ),
         )
         ordered_groups[event_index] = replace(event, members=ordered_members)
@@ -1108,12 +1612,16 @@ def _order_group_members_for_future_consumers(
 def _group_member_order_candidates(
     group: OutputDepthOpGroup,
     program: RichProgram,
-    events: tuple[_ScheduledOutputDepthEvent, ...],
-    consumers: dict[int, list[tuple[int, int]]],
-    event_index_by_op_index: dict[int, int],
     group_position_by_result_id: dict[int, tuple[int, int]],
-    ordered_groups: dict[int, OutputDepthOpGroup],
+    future_order_keys: dict[int, tuple[int, ...]],
 ) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
+    """Build the bounded candidate set from paper "Layout objective".
+
+    Candidates include the original order, consumer-induced orders, and orders
+    grouped by each operand's source tensor/source position. Operation indices
+    provide deterministic tie-breaking.
+    """
+
     candidates: list[tuple[OutputDepthOpGroupMember, ...]] = []
 
     def add_candidate(members: Sequence[OutputDepthOpGroupMember]) -> None:
@@ -1125,35 +1633,30 @@ def _group_member_order_candidates(
     add_candidate(
         sorted(
             group.members,
-            key=lambda member: _group_member_future_order_key(
-                member,
-                events,
-                consumers,
-                event_index_by_op_index,
-                ordered_groups,
-            ),
+            key=lambda member: future_order_keys[member.result_id],
         )
     )
 
     operand_count = len(group.members[0].canonical_argument_order)
+    materialization_order_keys = {
+        member.result_id: tuple(
+            _member_materialization_order_key(
+                program,
+                member,
+                canonical_position,
+                group_position_by_result_id,
+            )
+            for canonical_position in range(operand_count)
+        )
+        for member in group.members
+    }
     for canonical_position in range(operand_count):
         add_candidate(
             sorted(
                 group.members,
                 key=lambda member, position=canonical_position: (
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
-                    _group_member_future_order_key(
-                        member,
-                        events,
-                        consumers,
-                        event_index_by_op_index,
-                        ordered_groups,
-                    ),
+                    materialization_order_keys[member.result_id][position],
+                    future_order_keys[member.result_id],
                 ),
             )
         )
@@ -1161,25 +1664,9 @@ def _group_member_order_candidates(
             sorted(
                 group.members,
                 key=lambda member, position=canonical_position: (
-                    _member_materialization_source_key(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
-                    _group_member_future_order_key(
-                        member,
-                        events,
-                        consumers,
-                        event_index_by_op_index,
-                        ordered_groups,
-                    ),
-                    _member_materialization_index(
-                        program,
-                        member,
-                        position,
-                        group_position_by_result_id,
-                    ),
+                    materialization_order_keys[member.result_id][position][0],
+                    future_order_keys[member.result_id],
+                    materialization_order_keys[member.result_id][position][1],
                 ),
             )
         )
@@ -1188,15 +1675,7 @@ def _group_member_order_candidates(
         sorted(
             group.members,
             key=lambda member: (
-                tuple(
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        canonical_position,
-                        group_position_by_result_id,
-                    )
-                    for canonical_position in range(operand_count)
-                ),
+                materialization_order_keys[member.result_id],
                 member.op_index,
             ),
         )
@@ -1205,15 +1684,7 @@ def _group_member_order_candidates(
         sorted(
             group.members,
             key=lambda member: (
-                tuple(
-                    _member_materialization_order_key(
-                        program,
-                        member,
-                        canonical_position,
-                        group_position_by_result_id,
-                    )
-                    for canonical_position in reversed(range(operand_count))
-                ),
+                tuple(reversed(materialization_order_keys[member.result_id])),
                 member.op_index,
             ),
         )
@@ -1231,14 +1702,23 @@ def _group_member_order_score(
     event_index_by_op_index: dict[int, int],
     group_position_by_result_id: dict[int, tuple[int, int]],
     ordered_groups: dict[int, OutputDepthOpGroup],
+    future_order_keys: dict[int, tuple[int, ...]],
+    future_consumer_argument_sequences: tuple[tuple[int | None, ...], ...],
 ) -> tuple[Any, ...]:
-    future_segment_count = _future_consumer_segment_count(
-        group,
-        members,
-        events,
-        consumers,
-        event_index_by_op_index,
-        ordered_groups,
+    position_by_result_id = {
+        member.result_id: position
+        for position, member in enumerate(members)
+    }
+    future_segment_count = sum(
+        _position_segment_count(
+            tuple(
+                position_by_result_id.get(argument)
+                if argument is not None
+                else None
+                for argument in arguments
+            )
+        )
+        for arguments in future_consumer_argument_sequences
     )
     source_run_count = _materialization_source_run_count(
         group,
@@ -1246,119 +1726,452 @@ def _group_member_order_score(
         program,
         group_position_by_result_id,
     )
-    future_order_keys = tuple(
-        _group_member_future_order_key(
-            member,
-            events,
-            consumers,
-            event_index_by_op_index,
-            ordered_groups,
-        )
-        for member in members
+    ordered_future_keys = tuple(
+        future_order_keys[member.result_id] for member in members
     )
     return (
         future_segment_count,
         source_run_count,
-        future_order_keys,
+        ordered_future_keys,
         tuple(member.op_index for member in members),
     )
+
+
+def _future_consumer_argument_sequences(
+    group: OutputDepthOpGroup,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    consumers: dict[int, list[tuple[int, int]]],
+    event_index_by_op_index: dict[int, int],
+    ordered_groups: dict[int, OutputDepthOpGroup],
+) -> tuple[tuple[int | None, ...], ...]:
+    """Collect each future consumer operand once for repeated order scoring."""
+
+    result_ids = frozenset(member.result_id for member in group.members)
+    consumer_event_indices = {
+        event_index_by_op_index[consumer_op_index]
+        for result_id in result_ids
+        for consumer_op_index, _argument_position in consumers.get(
+            result_id,
+            (),
+        )
+        if not isinstance(
+            events[event_index_by_op_index[consumer_op_index]],
+            int,
+        )
+    }
+    argument_sequences: list[tuple[int | None, ...]] = []
+    for consumer_event_index in sorted(consumer_event_indices):
+        consumer_event = events[consumer_event_index]
+        if isinstance(consumer_event, int):
+            continue
+        ordered_consumer = ordered_groups.get(
+            consumer_event_index,
+            consumer_event,
+        )
+        operand_count = len(
+            ordered_consumer.members[0].canonical_argument_order
+        )
+        for canonical_position in range(operand_count):
+            arguments = tuple(
+                (
+                    argument
+                    if argument in result_ids
+                    else None
+                )
+                for consumer_member in ordered_consumer.members
+                for original_position in (
+                    consumer_member.canonical_argument_order[
+                        canonical_position
+                    ],
+                )
+                for argument in (
+                    consumer_member.arguments[original_position],
+                )
+            )
+            if any(argument is not None for argument in arguments):
+                argument_sequences.append(arguments)
+    return tuple(argument_sequences)
 
 
 def _optimize_group_member_orders_by_materialization_cost(
     events: tuple[_ScheduledOutputDepthEvent, ...],
     program: RichProgram,
 ) -> tuple[_ScheduledOutputDepthEvent, ...]:
+    """Run the narrow beam search specified in paper sec:memory-layout.
+
+    States are complete fold-axis layouts scored by the estimated number of
+    emitted layout instructions. The fixed width bounds the search instead of
+    enumerating all p! permutations of every p-member group.
+    """
+
     group_event_indices = tuple(event_index for event_index, event in enumerate(events) if not isinstance(event, int))
-    states = (events,)
-    # Some useful reorderings require several dependent groups to move together;
-    # a narrow beam keeps those temporary regressions available until they pay off.
-    for event_index in group_event_indices:
-        candidate_states: list[tuple[_ScheduledOutputDepthEvent, ...]] = []
+    consumers = _result_consumers_with_positions(program)
+    event_index_by_op_index = {
+        op_index: event_index
+        for event_index, event in enumerate(events)
+        for op_index in (
+            (event,)
+            if isinstance(event, int)
+            else (member.op_index for member in event.members)
+        )
+    }
+    direct_axis0_select_keys = {
+        argument: _direct_axis0_select_key(program, argument)
+        for event in events
+        if not isinstance(event, int)
+        for member in event.members
+        for argument in member.arguments
+    }
+    states = (
+        _make_group_order_beam_state(
+            program,
+            events,
+            _group_order_beam_state_key(events, group_event_indices),
+            direct_axis0_select_keys,
+        ),
+    )
+    consumer_event_indices = _group_consumer_event_indices(events)
+    candidate_dependency_group_positions = (
+        _group_candidate_dependency_group_positions(
+            events,
+            group_event_indices,
+            consumer_event_indices,
+        )
+    )
+    candidate_cache: dict[
+        tuple[int, tuple[tuple[int, ...], ...]],
+        tuple[tuple[OutputDepthOpGroupMember, ...], ...],
+    ] = {}
+    # Paper "Layout objective": retain several partial layouts because a
+    # producer reorder can look locally worse until its consumer is also moved.
+    for group_position, event_index in enumerate(group_event_indices):
+        candidate_states: list[_GroupOrderBeamState] = []
         for state in states:
-            event = state[event_index]
+            event = state.events[event_index]
             if isinstance(event, int):
                 continue
 
-            for candidate_members in _group_order_candidates_for_state(
-                program,
-                state,
-                event_index,
-            ):
-                state_events = list(state)
+            dependency_key = tuple(
+                state.key[dependency_group_position]
+                for dependency_group_position in (
+                    candidate_dependency_group_positions[event_index]
+                )
+            )
+            cache_key = (event_index, dependency_key)
+            candidates = candidate_cache.get(cache_key)
+            if candidates is None:
+                candidates = _group_order_candidates_for_state(
+                    program,
+                    state.events,
+                    event_index,
+                    consumers=consumers,
+                    event_index_by_op_index=event_index_by_op_index,
+                    group_position_by_result_id=(
+                        state.position_by_result_id
+                    ),
+                )
+                candidate_cache[cache_key] = candidates
+
+            for candidate_members in candidates:
+                state_events = list(state.events)
                 state_events[event_index] = replace(event, members=candidate_members)
-                candidate_states.append(tuple(state_events))
+                candidate_key = (
+                    *state.key[:group_position],
+                    tuple(member.op_index for member in candidate_members),
+                    *state.key[group_position + 1 :],
+                )
+                candidate_states.append(
+                    _updated_group_order_beam_state(
+                        program,
+                        state,
+                        events=tuple(state_events),
+                        key=candidate_key,
+                        changed_event_index=event_index,
+                        consumer_event_indices=consumer_event_indices,
+                        direct_axis0_select_keys=(
+                            direct_axis0_select_keys
+                        ),
+                    )
+                )
 
         states = _best_unique_order_states(program, candidate_states)
 
-    return min(states, key=lambda state: _order_state_score(program, state))
+    return min(
+        states,
+        key=lambda state: (state.total_cost, state.key),
+    ).events
+
+
+def _group_candidate_dependency_group_positions(
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    group_event_indices: tuple[int, ...],
+    consumer_event_indices: dict[int, frozenset[int]],
+) -> dict[int, tuple[int, ...]]:
+    group_position_by_event_index = {
+        event_index: group_position
+        for group_position, event_index in enumerate(group_event_indices)
+    }
+    producer_event_index_by_result_id = {
+        member.result_id: event_index
+        for event_index in group_event_indices
+        if not isinstance(event := events[event_index], int)
+        for member in event.members
+    }
+    dependencies: dict[int, tuple[int, ...]] = {}
+    for event_index in group_event_indices:
+        event = events[event_index]
+        if isinstance(event, int):
+            continue
+        dependency_event_indices = {
+            event_index,
+            *consumer_event_indices.get(event_index, ()),
+            *(
+                producer_event_index
+                for member in event.members
+                for argument in member.arguments
+                if (
+                    producer_event_index
+                    := producer_event_index_by_result_id.get(argument)
+                )
+                is not None
+            ),
+        }
+        dependencies[event_index] = tuple(
+            sorted(
+                group_position_by_event_index[
+                    dependency_event_index
+                ]
+                for dependency_event_index in dependency_event_indices
+            )
+        )
+    return dependencies
 
 
 def _group_order_candidates_for_state(
     program: RichProgram,
     events: tuple[_ScheduledOutputDepthEvent, ...],
     event_index: int,
+    *,
+    consumers: dict[int, list[tuple[int, int]]] | None = None,
+    event_index_by_op_index: dict[int, int] | None = None,
+    group_position_by_result_id: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[tuple[OutputDepthOpGroupMember, ...], ...]:
     event = events[event_index]
     if isinstance(event, int):
         return ()
 
-    consumers = _result_consumers_with_positions(program)
-    event_index_by_op_index: dict[int, int] = {}
-    group_position_by_result_id: dict[int, tuple[int, int]] = {}
-    ordered_groups: dict[int, OutputDepthOpGroup] = {}
-    for candidate_event_index, candidate_event in enumerate(events):
-        if isinstance(candidate_event, int):
-            event_index_by_op_index[candidate_event] = candidate_event_index
-            continue
-        ordered_groups[candidate_event_index] = candidate_event
-        for position, member in enumerate(candidate_event.members):
-            event_index_by_op_index[member.op_index] = candidate_event_index
-            group_position_by_result_id[member.result_id] = (
-                candidate_event_index,
-                position,
+    if consumers is None:
+        consumers = _result_consumers_with_positions(program)
+    if event_index_by_op_index is None:
+        event_index_by_op_index = {
+            op_index: candidate_event_index
+            for candidate_event_index, candidate_event in enumerate(events)
+            for op_index in (
+                (candidate_event,)
+                if isinstance(candidate_event, int)
+                else (
+                    member.op_index
+                    for member in candidate_event.members
+                )
             )
+        }
+    if group_position_by_result_id is None:
+        group_position_by_result_id = _group_member_position_by_result_id(
+            events
+        )
+    ordered_groups = {
+        candidate_event_index: candidate_event
+        for candidate_event_index, candidate_event in enumerate(events)
+        if not isinstance(candidate_event, int)
+    }
 
-    return _group_member_order_candidates(
-        event,
-        program,
+    future_order_keys = _group_member_future_order_keys(
+        event.members,
         events,
         consumers,
         event_index_by_op_index,
-        group_position_by_result_id,
         ordered_groups,
+    )
+    return _group_member_order_candidates(
+        event,
+        program,
+        group_position_by_result_id,
+        future_order_keys,
     )
 
 
 def _best_unique_order_states(
     program: RichProgram,
-    states: Sequence[tuple[_ScheduledOutputDepthEvent, ...]],
-) -> tuple[tuple[_ScheduledOutputDepthEvent, ...], ...]:
-    unique_states = {_order_state_key(state): state for state in states}
+    states: Sequence[_GroupOrderBeamState],
+) -> tuple[_GroupOrderBeamState, ...]:
+    # Paper "Layout objective": lowest estimated total materialization cost
+    # wins; the original operation-index key resolves ties deterministically.
+    unique_states = {state.key: state for state in states}
     return tuple(
         sorted(
             unique_states.values(),
-            key=lambda state: _order_state_score(program, state),
+            key=lambda state: (state.total_cost, state.key),
         )[:_GROUP_ORDER_BEAM_WIDTH]
     )
 
 
-def _order_state_score(
-    program: RichProgram,
+def _group_order_beam_state_key(
     events: tuple[_ScheduledOutputDepthEvent, ...],
-) -> tuple[Any, ...]:
-    return (
-        _estimated_total_materialization_instruction_count(program, events),
-        _order_state_key(events),
-    )
-
-
-def _order_state_key(
-    events: tuple[_ScheduledOutputDepthEvent, ...],
+    group_event_indices: tuple[int, ...],
 ) -> tuple[tuple[int, ...], ...]:
     return tuple(
-        (event,) if isinstance(event, int) else tuple(member.op_index for member in event.members)
-        for event in events
+        tuple(member.op_index for member in event.members)
+        for event_index in group_event_indices
+        if not isinstance(event := events[event_index], int)
     )
+
+
+def _make_group_order_beam_state(
+    program: RichProgram,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    key: tuple[tuple[int, ...], ...],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None],
+) -> _GroupOrderBeamState:
+    position_by_result_id = _group_member_position_by_result_id(events)
+    input_axis0_position_by_index = _input_axis0_position_by_index(
+        program,
+        events,
+    )
+    event_cost_by_index = {
+        event_index: _estimated_event_materialization_instruction_count(
+            program,
+            events,
+            event_index,
+            position_by_result_id,
+            input_axis0_position_by_index,
+            direct_axis0_select_keys,
+        )
+        for event_index, event in enumerate(events)
+        if not isinstance(event, int)
+    }
+    return _GroupOrderBeamState(
+        events=events,
+        key=key,
+        position_by_result_id=position_by_result_id,
+        input_axis0_position_by_index=input_axis0_position_by_index,
+        event_cost_by_index=event_cost_by_index,
+        total_cost=sum(event_cost_by_index.values()),
+    )
+
+
+def _updated_group_order_beam_state(
+    program: RichProgram,
+    state: _GroupOrderBeamState,
+    *,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    key: tuple[tuple[int, ...], ...],
+    changed_event_index: int,
+    consumer_event_indices: dict[int, frozenset[int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None],
+) -> _GroupOrderBeamState:
+    changed_event = events[changed_event_index]
+    if isinstance(changed_event, int):
+        raise ValueError("a beam candidate must change a grouped event")
+
+    position_by_result_id = state.position_by_result_id.copy()
+    for position, member in enumerate(changed_event.members):
+        position_by_result_id[member.result_id] = (
+            changed_event_index,
+            position,
+        )
+
+    input_axis0_position_by_index = state.input_axis0_position_by_index
+    input_order_may_change = any(
+        _direct_input_axis0_select_batch(
+            program,
+            changed_event,
+            canonical_position,
+        )
+        is not None
+        for canonical_position in range(
+            len(changed_event.members[0].canonical_argument_order)
+        )
+    )
+    if input_order_may_change:
+        input_axis0_position_by_index = _input_axis0_position_by_index(
+            program,
+            events,
+        )
+
+    event_cost_by_index = state.event_cost_by_index.copy()
+    if input_axis0_position_by_index != state.input_axis0_position_by_index:
+        affected_event_indices = event_cost_by_index.keys()
+    else:
+        affected_event_indices = (
+            changed_event_index,
+            *consumer_event_indices.get(changed_event_index, ()),
+        )
+    total_cost = state.total_cost
+    for event_index in affected_event_indices:
+        previous_cost = event_cost_by_index[event_index]
+        cost = _estimated_event_materialization_instruction_count(
+            program,
+            events,
+            event_index,
+            position_by_result_id,
+            input_axis0_position_by_index,
+            direct_axis0_select_keys,
+        )
+        event_cost_by_index[event_index] = cost
+        total_cost += cost - previous_cost
+
+    return _GroupOrderBeamState(
+        events=events,
+        key=key,
+        position_by_result_id=position_by_result_id,
+        input_axis0_position_by_index=input_axis0_position_by_index,
+        event_cost_by_index=event_cost_by_index,
+        total_cost=total_cost,
+    )
+
+
+def _group_consumer_event_indices(
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+) -> dict[int, frozenset[int]]:
+    producer_event_index_by_result_id = {
+        member.result_id: event_index
+        for event_index, event in enumerate(events)
+        if not isinstance(event, int)
+        for member in event.members
+    }
+    consumer_event_indices: dict[int, set[int]] = defaultdict(set)
+    for consumer_event_index, event in enumerate(events):
+        if isinstance(event, int):
+            continue
+        for member in event.members:
+            for argument in member.arguments:
+                producer_event_index = producer_event_index_by_result_id.get(
+                    argument
+                )
+                if producer_event_index is not None:
+                    consumer_event_indices[producer_event_index].add(
+                        consumer_event_index
+                    )
+    return {
+        event_index: frozenset(indices)
+        for event_index, indices in consumer_event_indices.items()
+    }
+
+
+def _input_axis0_position_by_index(
+    program: RichProgram,
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+) -> dict[int, dict[int, int]]:
+    return {
+        input_id: {
+            original_index: position
+            for position, original_index in enumerate(input_order)
+        }
+        for input_id, input_order in _input_axis0_orders_for_events(
+            program,
+            events,
+        ).items()
+    }
 
 
 def _estimated_total_materialization_instruction_count(
@@ -1366,10 +2179,10 @@ def _estimated_total_materialization_instruction_count(
     events: tuple[_ScheduledOutputDepthEvent, ...],
 ) -> int:
     position_by_result_id = _group_member_position_by_result_id(events)
-    input_axis0_position_by_index = {
-        input_id: {original_index: position for position, original_index in enumerate(input_order)}
-        for input_id, input_order in _input_axis0_orders_for_events(program, events).items()
-    }
+    input_axis0_position_by_index = _input_axis0_position_by_index(
+        program,
+        events,
+    )
     return sum(
         _estimated_event_materialization_instruction_count(
             program,
@@ -1389,7 +2202,15 @@ def _estimated_event_materialization_instruction_count(
     event_index: int,
     position_by_result_id: dict[int, tuple[int, int]],
     input_axis0_position_by_index: dict[int, dict[int, int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None] | None = None,
 ) -> int:
+    """Evaluate C(S_1, ..., S_k) from paper "Layout objective".
+
+    Every strict slice contributes one and combining multiple maximal
+    contiguous source runs contributes one more for concatenation. A run that
+    covers its complete source tensor contributes zero.
+    """
+
     event = events[event_index]
     if isinstance(event, int):
         return 0
@@ -1397,19 +2218,51 @@ def _estimated_event_materialization_instruction_count(
     instruction_count = 0
     operand_count = len(event.members[0].canonical_argument_order)
     for canonical_position in range(operand_count):
-        refs = tuple(
-            _estimated_materialization_ref(
+        segment_count = 0
+        segment_instruction_count = 0
+        segment_source: tuple[Any, ...] | None = None
+        segment_start = 0
+        segment_stop = 0
+        for member in event.members:
+            source, index = _estimated_materialization_ref(
                 program,
-                member.arguments[member.canonical_argument_order[canonical_position]],
+                member.arguments[
+                    member.canonical_argument_order[canonical_position]
+                ],
                 position_by_result_id,
                 input_axis0_position_by_index,
+                direct_axis0_select_keys,
             )
-            for member in event.members
-        )
-        instruction_count += _estimated_ref_materialization_instruction_count(
-            program,
-            events,
-            refs,
+            if source == segment_source and index == segment_stop:
+                segment_stop += 1
+                continue
+            if segment_source is not None:
+                segment_instruction_count += int(
+                    not _estimated_segment_is_full_source(
+                        program,
+                        events,
+                        segment_source,
+                        segment_start,
+                        segment_stop,
+                    )
+                )
+            segment_count += 1
+            segment_source = source
+            segment_start = index
+            segment_stop = index + 1
+
+        if segment_source is not None:
+            segment_instruction_count += int(
+                not _estimated_segment_is_full_source(
+                    program,
+                    events,
+                    segment_source,
+                    segment_start,
+                    segment_stop,
+                )
+            )
+        instruction_count += (
+            segment_instruction_count + int(segment_count > 1)
         )
     return instruction_count
 
@@ -1431,8 +2284,13 @@ def _estimated_materialization_ref(
     argument: int,
     position_by_result_id: dict[int, tuple[int, int]],
     input_axis0_position_by_index: dict[int, dict[int, int]],
+    direct_axis0_select_keys: dict[int, tuple[int, int] | None] | None = None,
 ) -> tuple[tuple[Any, ...], int]:
-    select_key = _direct_axis0_select_key(program, argument)
+    select_key = (
+        _direct_axis0_select_key(program, argument)
+        if direct_axis0_select_keys is None
+        else direct_axis0_select_keys.get(argument)
+    )
     if select_key is not None and select_key[0] < program.n_inputs:
         input_id, index = select_key
         mapped_index = input_axis0_position_by_index.get(input_id, {}).get(index, index)
@@ -1469,6 +2327,8 @@ def _estimated_ref_materialization_instruction_count(
 def _estimated_ref_segments(
     refs: tuple[tuple[tuple[Any, ...], int], ...],
 ) -> tuple[tuple[tuple[Any, ...], int, int], ...]:
+    # Paper sec:memory-layout: decompose a requested operand sequence into
+    # maximal contiguous runs from the same source tensor.
     if not refs:
         return ()
 
@@ -1595,19 +2455,21 @@ def _member_materialization_order_key(
     canonical_position: int,
     group_position_by_result_id: dict[int, tuple[int, int]],
 ) -> tuple[Any, ...]:
+    source_kind, source_id, index = _member_materialization_source(
+        program,
+        member,
+        canonical_position,
+        group_position_by_result_id,
+    )
+    source_kind_order = {
+        "producer-group": 0,
+        "input-select": 1,
+        "input": 2,
+        "ssa": 3,
+    }[source_kind]
     return (
-        _member_materialization_source_key(
-            program,
-            member,
-            canonical_position,
-            group_position_by_result_id,
-        ),
-        _member_materialization_index(
-            program,
-            member,
-            canonical_position,
-            group_position_by_result_id,
-        ),
+        (source_kind_order, source_id),
+        index,
         member.op_index,
     )
 
@@ -1631,21 +2493,6 @@ def _member_materialization_source_key(
         "ssa": 3,
     }[source_kind]
     return (source_kind_order, source_id)
-
-
-def _member_materialization_index(
-    program: RichProgram,
-    member: OutputDepthOpGroupMember,
-    canonical_position: int,
-    group_position_by_result_id: dict[int, tuple[int, int]],
-) -> int:
-    _source_kind, _source_id, index = _member_materialization_source(
-        program,
-        member,
-        canonical_position,
-        group_position_by_result_id,
-    )
-    return index
 
 
 def _member_materialization_source(
@@ -1683,12 +2530,37 @@ def _result_consumers_with_positions(
     return consumers
 
 
+def _group_member_future_order_keys(
+    members: Sequence[OutputDepthOpGroupMember],
+    events: tuple[_ScheduledOutputDepthEvent, ...],
+    consumers: dict[int, list[tuple[int, int]]],
+    event_index_by_op_index: dict[int, int],
+    ordered_groups: dict[int, OutputDepthOpGroup],
+) -> dict[int, tuple[int, ...]]:
+    """Compute invariant future-order keys once for all candidate orderings."""
+
+    consumer_positions_by_event_index: dict[int, dict[int, int]] = {}
+    return {
+        member.result_id: _group_member_future_order_key(
+            member,
+            events,
+            consumers,
+            event_index_by_op_index,
+            ordered_groups,
+            consumer_positions_by_event_index=consumer_positions_by_event_index,
+        )
+        for member in members
+    }
+
+
 def _group_member_future_order_key(
     member: OutputDepthOpGroupMember,
     events: tuple[_ScheduledOutputDepthEvent, ...],
     consumers: dict[int, list[tuple[int, int]]],
     event_index_by_op_index: dict[int, int],
     ordered_groups: dict[int, OutputDepthOpGroup],
+    *,
+    consumer_positions_by_event_index: dict[int, dict[int, int]] | None = None,
 ) -> tuple[int, ...]:
     order_keys: list[tuple[int, ...]] = []
     for consumer_op_index, argument_position in consumers.get(member.result_id, []):
@@ -1706,7 +2578,20 @@ def _group_member_future_order_key(
             continue
 
         ordered_group = ordered_groups.get(consumer_event_index, consumer_event)
-        consumer_position_by_op_index = {consumer_member.op_index: position for position, consumer_member in enumerate(ordered_group.members)}
+        consumer_position_by_op_index = None
+        if consumer_positions_by_event_index is not None:
+            consumer_position_by_op_index = consumer_positions_by_event_index.get(
+                consumer_event_index
+            )
+        if consumer_position_by_op_index is None:
+            consumer_position_by_op_index = {
+                consumer_member.op_index: position
+                for position, consumer_member in enumerate(ordered_group.members)
+            }
+            if consumer_positions_by_event_index is not None:
+                consumer_positions_by_event_index[consumer_event_index] = (
+                    consumer_position_by_op_index
+                )
         consumer_member = ordered_group.members[consumer_position_by_op_index[consumer_op_index]]
         canonical_position = _canonical_operand_position(
             consumer_member,
@@ -1755,7 +2640,20 @@ def _canonical_operand_position(
 def _rewrite_output_depth_group_events(
     program: RichProgram,
     events: tuple[_ScheduledOutputDepthEvent, ...],
+    *,
+    emit_fragmented_batch_gathers: bool = False,
 ) -> FoldSameShapedOperationsResult:
+    """Emit folded operations and their optimized physical layouts.
+
+    Implements the rewrite in paper "IR-Level Folding" and
+    sec:memory-layout: stack each canonical operand position, add a leading
+    batch label to the operator, remap every logical result to its new physical
+    position, and materialize downstream operands as full tensors, slices, or
+    concatenations/gathers.
+    """
+
+    # Paper sec:memory-layout: pack parameters and permute feature inputs once
+    # in the chosen member order instead of indexing them every training step.
     parameter_stack_orders = _parameter_input_stack_orders_for_events(program, events)
     input_axis0_orders = _input_axis0_orders_for_events(program, events)
     input_plan = _make_rewrite_input_plan(program, parameter_stack_orders, input_axis0_orders)
@@ -1770,6 +2668,7 @@ def _rewrite_output_depth_group_events(
     batched_result_orders: list[tuple[int, ...]] = []
     non_parameter_stack_orders: list[tuple[int, ...]] = []
     concatenated_batch_orders: list[tuple[int, ...]] = []
+    gather_index_orders: list[tuple[int, ...]] = []
 
     def append_instruction(
         instruction: RichInstruction,
@@ -1779,8 +2678,15 @@ def _rewrite_output_depth_group_events(
     ) -> int:
         result_id = input_plan.n_inputs + len(instructions)
         instructions.append(instruction)
-        argument_shapes = [shapes[argument] for argument in instruction.argument_ssa_ids]
-        shapes.append(instruction.operator.propagate_shapes(argument_shapes) if output_shape is None else output_shape)
+        if output_shape is None:
+            argument_shapes = [
+                shapes[argument]
+                for argument in instruction.argument_ssa_ids
+            ]
+            output_shape = instruction.operator.propagate_shapes(
+                argument_shapes
+            )
+        shapes.append(output_shape)
         if output_format is None:
             output_format = _infer_generated_tensor_format(
                 instruction.operator,
@@ -1823,6 +2729,8 @@ def _rewrite_output_depth_group_events(
         return result_id
 
     def materialize_batch_segment(ref: _BatchElementRef, start: int, stop: int) -> int:
+        # Paper layout cost: a complete source is free and a strict contiguous
+        # run becomes one slice view.
         if start == 0 and shapes[ref.source_ssa_id][0] == stop:
             return ref.source_ssa_id
         segment_key = (ref.source_ssa_id, start, stop)
@@ -1855,6 +2763,58 @@ def _rewrite_output_depth_group_events(
             ref, start, stop = segments[0]
             return materialize_batch_segment(ref, start, stop)
 
+        if emit_fragmented_batch_gathers:
+            sources = tuple(
+                dict.fromkeys(
+                    ref.source_ssa_id
+                    for ref, _start, _stop in segments
+                )
+            )
+            if len(sources) == 1:
+                gathered_source = sources[0]
+            else:
+                gathered_source = append_instruction(
+                    RichInstruction(
+                        operator=OperatorConcat(axis=0),
+                        argument_ssa_ids=sources,
+                    ),
+                    output_format=ref_format(batch_refs[0]),
+                )
+
+            offsets: dict[int, int] = {}
+            offset = 0
+            for source in sources:
+                offsets[source] = offset
+                offset += shapes[source][0]
+            indices = tuple(
+                offsets[ref.source_ssa_id] + index
+                for ref, start, stop in segments
+                for index in range(start, stop)
+            )
+            gather_input_id = -len(gather_index_orders) - 1
+            gather_index_orders.append(indices)
+            result_id = append_instruction(
+                RichInstruction(
+                    operator=OperatorTake(axis=0),
+                    argument_ssa_ids=(
+                        gathered_source,
+                        gather_input_id,
+                    ),
+                ),
+                output_shape=(
+                    len(batch_refs),
+                    *ref_shape(batch_refs[0]),
+                ),
+                output_format=ref_format(batch_refs[0]),
+            )
+            concatenated_batches[batch_key] = result_id
+            original_order = _original_ssa_order(batch_refs)
+            if original_order is not None:
+                concatenated_batch_orders.append(original_order)
+            return result_id
+
+        # Paper layout cost C(S_1, ..., S_k): slice each non-complete run, then
+        # concatenate the k > 1 runs into the requested folded operand.
         segment_ids = tuple(materialize_batch_segment(ref, start, stop) for ref, start, stop in segments)
         result_id = append_instruction(
             RichInstruction(
@@ -1897,8 +2857,13 @@ def _rewrite_output_depth_group_events(
 
     for event in events:
         if not isinstance(event, int):
+            # Paper "IR-Level Folding": operands at the same canonical position
+            # are stacked, and one batched operator evaluates all group members.
             grouped_refs = _group_refs_by_canonical_operand(event, tensor_map)
-            batched_arguments = tuple(materialize_batch(refs) for refs in grouped_refs)
+            batched_arguments = tuple(
+                materialize_batch(refs)
+                for refs in grouped_refs
+            )
             batched_operator = _make_batched_operator(event.operator)
             batched_result_id = append_instruction(
                 RichInstruction(
@@ -1909,6 +2874,8 @@ def _rewrite_output_depth_group_events(
             )
             batched_result_orders.append(tuple(member.result_id for member in event.members))
             for index, member in enumerate(event.members):
+                # Paper sec:memory-layout: propagate pi^{-1} consistently by
+                # remapping each logical result to its new fold-axis position.
                 tensor_map[member.result_id] = _BatchElementRef(
                     source_ssa_id=batched_result_id,
                     index=index,
@@ -1959,9 +2926,37 @@ def _rewrite_output_depth_group_events(
     if not _is_last_result(output_id, input_plan.n_inputs, instructions):
         raise RuntimeError("rewritten program output was not materialized as the last result")
 
+    gather_count = len(gather_index_orders)
+    if gather_count:
+
+        def remap_gather_argument(argument: int) -> int:
+            if argument < 0:
+                return input_plan.n_inputs + (-argument - 1)
+            if argument >= input_plan.n_inputs:
+                return argument + gather_count
+            return argument
+
+        instructions = [
+            map_instruction_arguments(
+                instruction,
+                remap_gather_argument,
+            )
+            for instruction in instructions
+        ]
+        shapes = [
+            *shapes[: input_plan.n_inputs],
+            *((len(indices),) for indices in gather_index_orders),
+            *shapes[input_plan.n_inputs :],
+        ]
+        tensor_formats = [
+            *tensor_formats[: input_plan.n_inputs],
+            *("dense" for _ in gather_index_orders),
+            *tensor_formats[input_plan.n_inputs :],
+        ]
+
     rewritten_program = RichProgram(
         instructions=instructions,
-        n_inputs=input_plan.n_inputs,
+        n_inputs=input_plan.n_inputs + gather_count,
         stability_mode=program.stability_mode,
         shapes=shapes,
         tensor_formats=tensor_formats,
@@ -1974,6 +2969,7 @@ def _rewrite_output_depth_group_events(
         parameter_stack_orders=parameter_stack_orders,
         input_axis0_orders=input_plan.input_axis0_orders,
         concatenated_batch_orders=tuple(concatenated_batch_orders),
+        gather_index_orders=tuple(gather_index_orders),
     )
 
 
@@ -2234,6 +3230,8 @@ def _original_input_order(
 
 
 def _make_batched_operator(operator: RichOperator) -> RichOperator:
+    """Add the fold axis from paper "IR-Level Folding" to an operator."""
+
     match operator:
         case OperatorEinsum(format_string):
             input_strings, output_string = parse_format_string(format_string)
@@ -2255,6 +3253,8 @@ def _make_batched_operator(operator: RichOperator) -> RichOperator:
 
 
 def _batched_einsum_format(input_strings: Sequence[str], output_string: str) -> str:
+    # Implements the paper's A^(i), B^(i) -> X, Y rewrite: introduce one fresh
+    # leading label on every operand and on the result.
     batch_label = _new_unused_einsum_label(f"{''.join(input_strings)}{output_string}")
     batched_inputs = ",".join(f"{batch_label}{input_string}" for input_string in input_strings)
     return f"{batched_inputs}->{batch_label}{output_string}"
