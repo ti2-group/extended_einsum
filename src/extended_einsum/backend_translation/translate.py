@@ -38,20 +38,34 @@ TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 # the extended language described in "Beyond Standard Einsum".
 
 
-def translate_to_backend_program(rich_program: RichProgram, backend_functions: BackendFunctions[TBackendArray]) -> BackendProgram[TBackendArray]:
+def translate_to_backend_program(
+    rich_program: RichProgram,
+    backend_functions: BackendFunctions[TBackendArray],
+    *,
+    scale_interval: int = 3,
+) -> BackendProgram[TBackendArray]:
     """Insert the paper's stability transformation while lowering the IR.
 
     This is the final backend-independent compiler stage in Figure
     ``fig:pipeline`` and sec:compiler-optimizations. The selected stability mode
     chooses direct evaluation, conventional log-space evaluation, or the
-    paper's scaled representation before backend compilation.
+    paper's scaled representation before backend compilation. Scaled modes
+    always normalize raw inputs before their first contraction, then normalize
+    contraction outputs every ``scale_interval`` dependency depths.
     """
 
+    if scale_interval <= 0:
+        raise ValueError("The scale interval must be positive.")
     match rich_program.stability_mode:
         case "unstable":
             return _translate_unstable(rich_program, backend_functions)
         case "scaled_min" | "scaled_max" | "scaled_sum":
-            return _translate_scaled(rich_program, backend_functions, rich_program.stability_mode)
+            return _translate_scaled(
+                rich_program,
+                backend_functions,
+                rich_program.stability_mode,
+                scale_interval=scale_interval,
+            )
         case "logspace_min" | "logspace_max":
             return _translate_logspace(rich_program, backend_functions, rich_program.stability_mode)
         case _:
@@ -148,6 +162,8 @@ def _translate_scaled(
     rich_program: RichProgram,
     backend_functions: BackendFunctions[TBackendArray],
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
+    *,
+    scale_interval: int,
 ) -> BackendProgram[TBackendArray]:
     """Translates a rich program into a backend program whose intermediate values are scaled pairs of a normalized tensor and a broadcastable log scale.
 
@@ -161,7 +177,27 @@ def _translate_scaled(
     positions: _ScaledPositions = {(ssa_id, "raw"): ssa_id for ssa_id in range(rich_program.n_inputs)}
     scale_shapes: _ScaledShapes = {}
     parameter_derived_ssa_ids = _parameter_derived_ssa_ids(rich_program)
+    contraction_ages = {ssa_id: 0 for ssa_id in range(rich_program.n_inputs)}
     for instruction_index, instruction in enumerate(rich_program.instructions):
+        result_ssa_id = rich_program.n_inputs + instruction_index
+        source_contraction_age = max(
+            (
+                contraction_ages[argument_ssa_id]
+                for argument_ssa_id in instruction.argument_ssa_ids
+                if argument_ssa_id not in parameter_derived_ssa_ids
+            ),
+            default=0,
+        )
+        is_data_contraction = (
+            isinstance(instruction.operator, OperatorEinsum)
+            and result_ssa_id not in parameter_derived_ssa_ids
+            and not is_contraction_free_einsum(instruction.operator.format_string)
+        )
+        result_contraction_age = source_contraction_age + int(is_data_contraction)
+        normalize_einsum_output = (
+            is_data_contraction
+            and result_contraction_age >= scale_interval
+        )
         _append_scaled_instruction(
             builder,
             backend_functions,
@@ -169,10 +205,17 @@ def _translate_scaled(
             scale_shapes,
             rich_program.shapes,
             instruction,
-            rich_program.n_inputs + instruction_index,
+            result_ssa_id,
             stability_mode,
             parameter_derived_ssa_ids,
+            normalize_einsum_output=normalize_einsum_output,
         )
+        if normalize_einsum_output or isinstance(
+            instruction.operator,
+            (OperatorExp, OperatorSoftmax),
+        ):
+            result_contraction_age = 0
+        contraction_ages[result_ssa_id] = result_contraction_age
     output_position = _raw_position(builder, backend_functions, positions, rich_program.output_ssa)
     if output_position != builder.last_position:
         raise ValueError("The raw value of the program's output must be the last computed tensor, because the runtime returns the last tensor.")
@@ -329,6 +372,8 @@ def _append_scaled_einsum(
     result_ssa_id: int,
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
+    *,
+    normalize_output: bool,
 ) -> None:
     """Implement an einsum on the paper's ``(X_hat, s)`` representation.
 
@@ -404,24 +449,33 @@ def _append_scaled_einsum(
     # Paper "Scaled evaluation": contract normalized data with the unchanged
     # linear weights using an ordinary dense backend einsum.
     raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
-    match stability_mode:
-        case "scaled_min":
-            raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_einsum_position,))
-        case "scaled_max":
-            raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_einsum_position,))
-        case "scaled_sum":
-            raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
-    # Paper "Detached reference shifts": output normalization changes only the
-    # (X_hat, s) representation, so stop-gradient preserves the derivative.
-    raw_norm_position = builder.wrap_and_append(backend_functions.stop_gradient, (raw_norm_position,))
-    positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
-    log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
-    result_scale_shape = _fiber_scale_shape(value_shapes[result_ssa_id])
+    log_scale_position: int | None
+    if normalize_output:
+        match stability_mode:
+            case "scaled_min":
+                raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.min), (raw_einsum_position,))
+            case "scaled_max":
+                raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.max), (raw_einsum_position,))
+            case "scaled_sum":
+                raw_norm_position = builder.wrap_and_append(partial(_fiber_norm, backend_functions, backend_functions.sum), (raw_einsum_position,))
+        # Paper "Detached reference shifts": output normalization changes only
+        # the (X_hat, s) representation, so stop-gradient preserves the
+        # derivative.
+        raw_norm_position = builder.wrap_and_append(backend_functions.stop_gradient, (raw_norm_position,))
+        positions[result_ssa_id, "normalized"] = builder.wrap_and_append(backend_functions.divide, (raw_einsum_position, raw_norm_position))
+        log_scale_position = builder.wrap_and_append(backend_functions.log, (raw_norm_position,))
+        result_scale_shape = _fiber_scale_shape(value_shapes[result_ssa_id])
+    else:
+        positions[result_ssa_id, "normalized"] = raw_einsum_position
+        log_scale_position = None
+        result_scale_shape = ()
     # Restore every operand's retained scale on the corresponding output labels,
     # which is the "+ s" step of the paper's scaled sum-layer construction.
     for operand_scale_position, operand_scale_shape, scale_shape_is_known, input_string, retained_labels in shift_positions:
-        scale_already_broadcasts_to_output = scale_shape_is_known and len(operand_scale_shape) == len(output_string) and all(
-            dimension == 1 or input_label == output_label for dimension, input_label, output_label in zip(operand_scale_shape, input_string, output_string, strict=True)
+        scale_already_broadcasts_to_output = (
+            scale_shape_is_known
+            and len(operand_scale_shape) == len(output_string)
+            and all(dimension == 1 or input_label == output_label for dimension, input_label, output_label in zip(operand_scale_shape, input_string, output_string, strict=True))
         )
         if (not scale_shape_is_known or operand_scale_shape) and not scale_already_broadcasts_to_output:
             operand_scale_position = builder.wrap_and_append(partial(backend_functions.einsum, f"{input_string}->{retained_labels}"), (operand_scale_position,))
@@ -429,8 +483,14 @@ def _append_scaled_einsum(
             operand_scale_position = builder.wrap_and_append(partial(_reshape_einsum_shift, backend_functions, retained_labels, output_string), (operand_scale_position,))
         if operand_scale_shape and not scale_already_broadcasts_to_output:
             operand_scale_shape = tuple(operand_scale_shape[input_string.index(output_label)] if output_label in input_string else 1 for output_label in output_string) if retained_labels else ()
-        log_scale_position = builder.wrap_and_append(backend_functions.add, (log_scale_position, operand_scale_position))
-        result_scale_shape = infer_binary_shape(result_scale_shape, operand_scale_shape)
+        if log_scale_position is None:
+            log_scale_position = operand_scale_position
+            result_scale_shape = operand_scale_shape
+        else:
+            log_scale_position = builder.wrap_and_append(backend_functions.add, (log_scale_position, operand_scale_position))
+            result_scale_shape = infer_binary_shape(result_scale_shape, operand_scale_shape)
+    if log_scale_position is None:
+        raise ValueError("A scaled data einsum must have at least one non-parameter operand.")
     positions[result_ssa_id, "log_scale"] = log_scale_position
     scale_shapes[result_ssa_id] = result_scale_shape
 
@@ -445,6 +505,8 @@ def _append_scaled_instruction(
     result_ssa_id: int,
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
+    *,
+    normalize_einsum_output: bool,
 ) -> None:
     """Propagate the pair from paper "Scaled evaluation" through the IR.
 
@@ -544,9 +606,7 @@ def _append_scaled_instruction(
                 for pair_index, (
                     argument_ssa_id,
                     (_, log_scale_position),
-                ) in enumerate(
-                    zip(argument_ssa_ids, scaled_pairs, strict=True)
-                ):
+                ) in enumerate(zip(argument_ssa_ids, scaled_pairs, strict=True)):
                     target_scale_shape = _fiber_scale_shape(value_shapes[argument_ssa_id])
                     scale_shape = scale_shapes[argument_ssa_id]
                     if scale_shape and scale_shape[-1] != 1:
@@ -573,14 +633,12 @@ def _append_scaled_instruction(
                             backend_functions.exp,
                             (scale_delta_position,),
                         )
-                        normalized_positions[pair_index] = (
-                            builder.wrap_and_append(
-                                backend_functions.multiply,
-                                (
-                                    normalized_positions[pair_index],
-                                    scale_factor_position,
-                                ),
-                            )
+                        normalized_positions[pair_index] = builder.wrap_and_append(
+                            backend_functions.multiply,
+                            (
+                                normalized_positions[pair_index],
+                                scale_factor_position,
+                            ),
                         )
                         log_scale_position = common_scale_position
                         scale_shape = (*scale_shape[:-1], 1)
@@ -635,7 +693,19 @@ def _append_scaled_instruction(
                     value_axis = normalize_axis(axis, len(value_shapes[result_ssa_id]))
                     scale_shapes[result_ssa_id] = (*source_scale_shape[:scale_axis], value_shapes[result_ssa_id][value_axis], *source_scale_shape[scale_axis + 1 :])
         case OperatorEinsum(format_string):
-            _append_scaled_einsum(builder, backend_functions, positions, scale_shapes, value_shapes, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids)
+            _append_scaled_einsum(
+                builder,
+                backend_functions,
+                positions,
+                scale_shapes,
+                value_shapes,
+                format_string,
+                argument_ssa_ids,
+                result_ssa_id,
+                stability_mode,
+                parameter_derived_ssa_ids,
+                normalize_output=normalize_einsum_output,
+            )
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no scaled backend translation.")
 
@@ -678,6 +748,7 @@ def _translate_logspace(rich_program: RichProgram, backend_functions: BackendFun
             rich_program.n_inputs + instruction_index,
             stability_mode,
             parameter_derived_ssa_ids,
+            rich_program.shapes,
         )
     output_position = _as_raw_position(builder, backend_functions, positions, rich_program.output_ssa)
     if output_position != builder.last_position:
@@ -744,6 +815,63 @@ def _broadcast_einsum_operand(backend_functions: BackendFunctions[TBackendArray]
     return backend_functions.reshape(operand, output_shape)
 
 
+def _short_same_index_contraction_labels(
+    input_strings: list[str],
+    output_string: str,
+    input_shapes: tuple[Shape, ...],
+    parameter_derived: tuple[bool, ...],
+) -> tuple[str, ...] | None:
+    """Identify small weighted reductions that should not become dense GEMVs.
+
+    If one binary operand's labels are a subset of the other's, the operation
+    has no all-to-all output mixing: it is a broadcasted elementwise product
+    followed by a reduction. Decomposition does not enlarge the superset
+    operand. Limit it to one linear parameter operand and at most four elements
+    in the contracted fiber, where dense dispatch overhead dominates.
+    """
+
+    if (
+        len(input_strings) != 2
+        or len(input_shapes) != 2
+        or parameter_derived.count(True) != 1
+        or any(len(set(input_string)) != len(input_string) for input_string in input_strings)
+    ):
+        return None
+    input_label_sets = tuple(set(input_string) for input_string in input_strings)
+    if not (
+        input_label_sets[0] <= input_label_sets[1]
+        or input_label_sets[1] <= input_label_sets[0]
+    ):
+        return None
+    superset_index = (
+        0 if input_label_sets[1] <= input_label_sets[0] else 1
+    )
+    subset_index = 1 - superset_index
+    contracted_labels = tuple(
+        label
+        for label in input_strings[superset_index]
+        if label not in output_string
+    )
+    if not contracted_labels or any(
+        label not in input_label_sets[subset_index]
+        for label in contracted_labels
+    ):
+        return None
+    label_sizes: dict[str, int] = {}
+    for input_string, input_shape in zip(
+        input_strings,
+        input_shapes,
+        strict=True,
+    ):
+        label_sizes.update(zip(input_string, input_shape, strict=True))
+    contracted_size = 1
+    for label in contracted_labels:
+        contracted_size *= label_sizes[label]
+    if contracted_size > 4:
+        return None
+    return contracted_labels
+
+
 def _append_logspace_einsum(
     builder: _ProgramBuilder[TBackendArray],
     backend_functions: BackendFunctions[TBackendArray],
@@ -753,6 +881,7 @@ def _append_logspace_einsum(
     result_ssa_id: int,
     stability_mode: Literal["logspace_min", "logspace_max"],
     parameter_derived_ssa_ids: frozenset[int],
+    value_shapes: list[Shape],
 ) -> None:
     """Implement the paper's shifted log-space einsum formula.
 
@@ -816,9 +945,55 @@ def _append_logspace_einsum(
         raw_argument_positions.append(builder.wrap_and_append(backend_functions.exp, (log_shifted_position,)))
         shift_positions.append((shift_position, input_string, retained_labels))
 
-    # Central operation from paper "Log-space einsum": the shifted positive
-    # operands and unchanged linear weights use the ordinary dense kernel.
-    raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_argument_positions))
+    # Central operation from paper "Log-space einsum": contract the shifted
+    # positive operands with unchanged linear weights.
+    short_contraction_labels = _short_same_index_contraction_labels(
+        input_strings,
+        output_string,
+        tuple(value_shapes[argument] for argument in argument_ssa_ids),
+        tuple(
+            argument in parameter_derived_ssa_ids
+            for argument in argument_ssa_ids
+        ),
+    )
+    if short_contraction_labels is None:
+        raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_argument_positions))
+    else:
+        # This is an elementwise weighted reduction, not a dense contraction:
+        # one operand's labels are a subset of the other's and the contracted
+        # fiber is very short. Make that structure explicit in backend IR so
+        # tensor compilers can fuse the multiply and reduction instead of
+        # dispatching thousands of tiny strided GEMVs.
+        expanded_string = output_string + "".join(short_contraction_labels)
+        aligned_positions = tuple(
+            builder.wrap_and_append(
+                partial(
+                    _broadcast_einsum_operand,
+                    backend_functions,
+                    input_string,
+                    expanded_string,
+                ),
+                (raw_argument_position,),
+            )
+            for input_string, raw_argument_position in zip(
+                input_strings,
+                raw_argument_positions,
+                strict=True,
+            )
+        )
+        product_position = builder.wrap_and_append(
+            backend_functions.multiply,
+            aligned_positions,
+        )
+        raw_einsum_position = builder.wrap_and_append(
+            partial(
+                backend_functions.sum,
+                axis=tuple(
+                    range(len(output_string), len(expanded_string))
+                ),
+            ),
+            (product_position,),
+        )
     log_einsum_position = builder.wrap_and_append(backend_functions.log, (raw_einsum_position,))
     # Restore every operand shift on the retained output labels: the final
     # ``+ m`` in the paper's log Y formula.
@@ -838,6 +1013,7 @@ def _append_logspace_instruction(
     result_ssa_id: int,
     stability_mode: Literal["logspace_min", "logspace_max"],
     parameter_derived_ssa_ids: frozenset[int],
+    value_shapes: list[Shape],
 ) -> None:
     """Propagate the representation from paper "Log-space einsum" through IR.
 
@@ -891,6 +1067,6 @@ def _append_logspace_instruction(
             indices_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
             positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (log_argument_position, indices_position))
         case OperatorEinsum(format_string):
-            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids)
+            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids, value_shapes)
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no logspace backend translation.")

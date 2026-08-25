@@ -122,6 +122,62 @@ def test_unstable_translation_produces_one_call_per_instruction() -> None:
     assert backend_program.call_arguments == [(0, 1), (2, 0)]
 
 
+@pytest.mark.parametrize(
+    "format_string",
+    ["dacb,dbc->dab", "xyzw,xwz->xyw"],
+)
+def test_logspace_short_same_index_contraction_matches_general_einsum(
+    format_string: str,
+) -> None:
+    log_values = torch.randn(3, 5, 2, 7, requires_grad=True)
+    weights = (torch.rand(3, 7, 2) + 0.5).requires_grad_()
+    expected_log_values = log_values.detach().clone().requires_grad_()
+    expected_weights = weights.detach().clone().requires_grad_()
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorExp(), (0,)),
+            RichInstruction(OperatorEinsum(format_string), (2, 1)),
+            RichInstruction(OperatorLog(), (3,)),
+        ],
+        n_inputs=2,
+        stability_mode="logspace_max",
+        parameter_indices=frozenset({1}),
+        shapes=[
+            (3, 5, 2, 7),
+            (3, 7, 2),
+            (3, 5, 2, 7),
+            (3, 5, 7),
+            (3, 5, 7),
+        ],
+    )
+    result = run_program(
+        translate_to_backend_program(
+            rich_program,
+            TorchBackendFunctions(),
+        ),
+        (log_values, weights),
+    )
+    expected = torch.log(
+        torch.einsum(
+            format_string,
+            torch.exp(expected_log_values),
+            expected_weights,
+        )
+    )
+    torch.testing.assert_close(result, expected)
+    gradients = torch.autograd.grad(result.sum(), (log_values, weights))
+    expected_gradients = torch.autograd.grad(
+        expected.sum(),
+        (expected_log_values, expected_weights),
+    )
+    for gradient, expected_gradient in zip(
+        gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(gradient, expected_gradient)
+
+
 @pytest.mark.parametrize("stability_mode", ALL_MODES)
 def test_translation_rejects_operator_without_backend_function(stability_mode: StabilityMode) -> None:
     rich_program = _single_instruction_program(OperatorSin(), 1, stability_mode)
@@ -211,6 +267,60 @@ def test_scaled_translation_scales_each_value_at_most_once(stability_mode: Stabi
     np.testing.assert_allclose(result, POSITIVE_MATRIX * OTHER_POSITIVE_MATRIX * POSITIVE_MATRIX, rtol=1e-9)
 
 
+def test_scaled_translation_rejects_non_positive_scale_interval() -> None:
+    rich_program = _single_instruction_program(OperatorLog(), 1, "scaled_sum")
+
+    with pytest.raises(ValueError, match="scale interval"):
+        translate_to_backend_program(
+            rich_program,
+            BACKEND_FUNCTIONS,
+            scale_interval=0,
+        )
+
+
+def test_scaled_translation_defaults_to_three_contractions_between_output_normalizations() -> None:
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("bi,oi->bo"), (0, 1)),
+            RichInstruction(OperatorEinsum("bi,oi->bo"), (2, 1)),
+            RichInstruction(OperatorEinsum("bi,oi->bo"), (3, 1)),
+            RichInstruction(OperatorLog(), (4,)),
+        ],
+        n_inputs=2,
+        stability_mode="scaled_sum",
+        parameter_indices=frozenset({1}),
+        shapes=[(3, 4), (4, 4), (3, 4), (3, 4), (3, 4), (3, 4)],
+    )
+    inputs = [POSITIVE_MATRIX, np.full((4, 4), 0.125)]
+
+    default_interval = translate_to_backend_program(
+        rich_program,
+        BACKEND_FUNCTIONS,
+    )
+    explicit_interval = translate_to_backend_program(
+        rich_program,
+        BACKEND_FUNCTIONS,
+        scale_interval=3,
+    )
+    every_layer = translate_to_backend_program(
+        rich_program,
+        BACKEND_FUNCTIONS,
+        scale_interval=1,
+    )
+
+    np.testing.assert_allclose(
+        run_program(default_interval, inputs),
+        run_program(every_layer, inputs),
+        rtol=1e-9,
+        atol=1e-12,
+    )
+    assert len(default_interval.backend_calls) == len(
+        explicit_interval.backend_calls
+    )
+    assert default_interval.call_arguments == explicit_interval.call_arguments
+    assert len(default_interval.backend_calls) < len(every_layer.backend_calls)
+
+
 @pytest.mark.parametrize("stability_mode", SCALED_MODES)
 def test_scaled_translation_of_exp_and_log_survives_overflowing_exponentials(stability_mode: StabilityMode) -> None:
     # exp moves the maximum of its raw argument into the log scale and log adds it back, so the roundtrip survives exponentials that overflow raw tensors
@@ -247,7 +357,11 @@ def test_scaled_sum_einsum_keeps_parameter_weights_linear_and_scales_each_data_r
         shapes=[(2, 2)] * 5,
     )
 
-    backend_program = translate_to_backend_program(rich_program, BACKEND_FUNCTIONS)
+    backend_program = translate_to_backend_program(
+        rich_program,
+        BACKEND_FUNCTIONS,
+        scale_interval=1,
+    )
     result = run_program(backend_program, [log_values, weights])
 
     row_maxima = np.max(log_values, axis=1, keepdims=True)

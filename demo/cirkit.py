@@ -46,6 +46,7 @@ DEFAULT_EPOCHS = 1
 DEFAULT_NUM_SAMPLES = 0
 DEFAULT_PIXEL_VALUES = 256
 EINSUM_SYMBOLS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+CP_FLATTENED_LOOKUP_MIN_UNITS = 128
 CSV_FIELDS = (
     "timestamp",
     "backend",
@@ -107,6 +108,26 @@ CSV_FIELDS = (
     "reserved_memory_bytes",
     "allocated_memory_bytes",
 )
+
+
+def resolve_categorical_lookup(
+    categorical_lookup: str,
+    *,
+    sum_product_layer: str,
+    num_units: int,
+) -> str:
+    """Choose the compiler-friendly categorical lookup for a circuit shape."""
+
+    choices = {"advanced", "auto", "gather", "flattened"}
+    if categorical_lookup not in choices:
+        raise ValueError(f"Unknown categorical lookup: {categorical_lookup}")
+    if categorical_lookup != "auto":
+        return categorical_lookup
+    if sum_product_layer in {"cp-t", "tucker"}:
+        return "gather"
+    if sum_product_layer == "cp" and num_units >= CP_FLATTENED_LOOKUP_MIN_UNITS:
+        return "flattened"
+    return "advanced"
 
 
 def make_symbolic_circuit(
@@ -455,6 +476,7 @@ def torch_program_runner(
     device: torch.device,
     index_input_ids: frozenset[int] = frozenset(),
     shift_mode: str = "xe",
+    scale_interval: int = 3,
 ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
     class DifferentiableShiftTorchBackendFunctions(TorchBackendFunctions):
         @staticmethod
@@ -470,7 +492,11 @@ def torch_program_runner(
         "differentiable": DifferentiableShiftTorchBackendFunctions,
         "xe": TorchBackendFunctions,
     }[shift_mode]()
-    backend_program = translate_to_backend_program(program, backend_functions)
+    backend_program = translate_to_backend_program(
+        program,
+        backend_functions,
+        scale_interval=scale_interval,
+    )
 
     def run_flat(*inputs: torch.Tensor) -> torch.Tensor:
         return run_program(backend_program, inputs)
@@ -506,10 +532,16 @@ def setup_xe_training(
     pixel_values: int,
     semiring: str,
     lr: float,
+    folding_depth: str = "input",
+    folding_order_by_input_access: bool | None = None,
+    folding_split_by_routing: bool | None = None,
+    folding_gather_fragmented_batches: bool | None = None,
+    categorical_lookup: str = "auto",
     optimize_group_order: bool = True,
     preorder_inputs: bool = True,
     shift_mode: str = "xe",
     optimize_contraction_paths: bool = True,
+    scale_interval: int = 3,
     download: bool = True,
 ):
     symbolic_circuit = make_symbolic_circuit(
@@ -532,16 +564,30 @@ def setup_xe_training(
     # Publication implementation of paper "IR-Level Folding" and
     # sec:memory-layout. Metadata records one-time parameter/input packing and
     # any unavoidable gather indices used by the rewritten program.
-    folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
-        program,
-        optimize_group_order=optimize_group_order,
+    if folding_depth == "input":
+        folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
+            program,
+            optimize_group_order=optimize_group_order,
+            order_by_input_access=folding_order_by_input_access,
+            split_by_routing=folding_split_by_routing,
+            gather_fragmented_batches=folding_gather_fragmented_batches,
+        )
+    elif folding_depth == "output":
+        folded = FoldSameShapedOperations.apply_with_metadata(
+            program,
+            optimize_group_order=optimize_group_order,
+        )
+    else:
+        raise ValueError(f"Unknown folding depth: {folding_depth}")
+    resolved_categorical_lookup = resolve_categorical_lookup(
+        categorical_lookup,
+        sum_product_layer=sum_product_layer,
+        num_units=num_units,
     )
     runtime_program = (
         # Paper sec:contraction-path: merge nested einsums and lower them to the
         # optimizer-selected pairwise schedule.
-        OptimizeContractionPaths.apply(folded.program)
-        if optimize_contraction_paths
-        else folded.program
+        OptimizeContractionPaths.apply(folded.program) if optimize_contraction_paths else folded.program
     )
     gather_index_orders = folded.gather_index_orders
     index_input_ids = frozenset(range(runtime_program.n_inputs - len(gather_index_orders), runtime_program.n_inputs))
@@ -550,6 +596,7 @@ def setup_xe_training(
         device=device,
         index_input_ids=index_input_ids,
         shift_mode=shift_mode,
+        scale_interval=scale_interval,
     )
 
     num_variables = width * height
@@ -598,10 +645,21 @@ def setup_xe_training(
     gather_index_inputs = [torch.tensor(indices, dtype=torch.long, device=device) for indices in gather_index_orders]
     constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
     pixel_range = torch.arange(num_variables, device=device)[:, None]
+    flattened_pixel_offsets = pixel_values * pixel_range
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:
         probabilities = F.softmax(categorical_logits, dim=1)
-        data_input = probabilities[pixel_range, batch.T].contiguous()
+        transposed_batch = batch.T
+        if resolved_categorical_lookup == "advanced":
+            data_input = probabilities[pixel_range, transposed_batch].contiguous()
+        elif resolved_categorical_lookup == "gather":
+            indices = transposed_batch.unsqueeze(-1).expand(-1, -1, categorical_units)
+            data_input = torch.gather(probabilities, 1, indices)
+        else:
+            flattened_indices = (flattened_pixel_offsets + transposed_batch).reshape(-1)
+            flattened_probabilities = probabilities.reshape(num_variables * pixel_values, categorical_units)
+            selected = flattened_probabilities.index_select(0, flattened_indices)
+            data_input = selected.reshape(num_variables, batch.shape[0], categorical_units)
         if not preorder_inputs:
             data_input = data_input.index_select(0, data_axis_order_tensor)
         return data_input

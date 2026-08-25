@@ -1409,6 +1409,7 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         optimize_group_order: bool = True,
         order_by_input_access: bool | None = None,
         split_by_routing: bool | None = None,
+        gather_fragmented_batches: bool | None = None,
     ) -> FoldSameShapedOperationsResult:
         """Fold using XE-native input frontiers without source metadata.
 
@@ -1418,24 +1419,25 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         metadata as :meth:`apply_with_metadata`, but discovers layers from
         input frontiers when no symbolic-circuit layer metadata is available.
 
-        By default, programs containing CP's same-index product contraction use
-        input-access order within each fold. This prevents a depth-first
-        instruction traversal from interleaving distant CP branches. Other
-        contraction structures retain their original order; callers can force
-        either behavior with ``order_by_input_access``.
+        Same-index product programs skip the CP-specific input-access pre-sort
+        and routing split. Their fragmented batches use slice/concatenate when
+        that produces a compact routing graph, but automatically fall back to
+        gathers when shared subgraphs would otherwise generate substantially
+        more routing IR. Other contraction structures retain the gather route;
+        callers can force either behavior with the routing options.
         """
 
         is_same_index_product_program = _has_same_index_product_contraction(
             program
         )
         if split_by_routing is None:
-            split_by_routing = is_same_index_product_program
+            split_by_routing = False
         groups = group_identical_ops_by_input_depth(
             program,
             split_by_routing=split_by_routing,
         )
         if order_by_input_access is None:
-            order_by_input_access = is_same_index_product_program
+            order_by_input_access = False
         if order_by_input_access:
             groups = _order_input_depth_groups_by_input_access(
                 program,
@@ -1458,11 +1460,55 @@ class FoldSameShapedOperations(PreprocessingRoutine):
             if optimize_group_order
             else events
         )
-        return _rewrite_output_depth_group_events(
+        if gather_fragmented_batches is not None:
+            return _rewrite_output_depth_group_events(
+                program,
+                ordered_events,
+                emit_fragmented_batch_gathers=gather_fragmented_batches,
+            )
+        if not is_same_index_product_program:
+            return _rewrite_output_depth_group_events(
+                program,
+                ordered_events,
+                emit_fragmented_batch_gathers=True,
+            )
+
+        slice_concat_result = _rewrite_output_depth_group_events(
+            program,
+            ordered_events,
+            emit_fragmented_batch_gathers=False,
+        )
+        gather_result = _rewrite_output_depth_group_events(
             program,
             ordered_events,
             emit_fragmented_batch_gathers=True,
         )
+        # Slices are views and modest slice/concat routing lets Inductor fuse
+        # surrounding work without paying for a gather. Shared DAGs can turn
+        # the same policy into hundreds of routing nodes, however. A 2x static
+        # routing-IR guard cleanly separates the compact CP/CP-T trees from the
+        # CP quad graph. The graph path still concatenates batches with at most
+        # 16 contiguous runs, reserving gathers for the heavily fragmented
+        # batches that cause compile-time and runtime explosions.
+        slice_concat_routing = _routing_instruction_count(
+            slice_concat_result.program
+        )
+        gather_routing = _routing_instruction_count(gather_result.program)
+        if slice_concat_routing > 2 * gather_routing:
+            return _rewrite_output_depth_group_events(
+                program,
+                ordered_events,
+                fragmented_batch_gather_threshold=16,
+            )
+        return slice_concat_result
+
+
+def _routing_instruction_count(program: RichProgram) -> int:
+    return sum(
+        instruction.operator.name in {"concat", "slice", "take"}
+        for instruction in program.instructions
+    )
+
 
 def _topologically_order_output_depth_events(
     program: RichProgram,
@@ -2642,6 +2688,7 @@ def _rewrite_output_depth_group_events(
     events: tuple[_ScheduledOutputDepthEvent, ...],
     *,
     emit_fragmented_batch_gathers: bool = False,
+    fragmented_batch_gather_threshold: int | None = None,
 ) -> FoldSameShapedOperationsResult:
     """Emit folded operations and their optimized physical layouts.
 
@@ -2763,7 +2810,10 @@ def _rewrite_output_depth_group_events(
             ref, start, stop = segments[0]
             return materialize_batch_segment(ref, start, stop)
 
-        if emit_fragmented_batch_gathers:
+        if emit_fragmented_batch_gathers or (
+            fragmented_batch_gather_threshold is not None
+            and len(segments) > fragmented_batch_gather_threshold
+        ):
             sources = tuple(
                 dict.fromkeys(
                     ref.source_ssa_id
