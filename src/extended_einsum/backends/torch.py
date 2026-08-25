@@ -6,7 +6,6 @@ import torch
 
 from extended_einsum.backend_translation.backend import BackendCompiler, BackendFunctions, BackendProgram
 from extended_einsum.backend_translation.runtime import run_program
-from extended_einsum.utils import normalize_axis
 
 
 class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
@@ -18,18 +17,15 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
         return array.detach()
 
     @override
-    @staticmethod
-    def exp(array: torch.Tensor) -> torch.Tensor:
+    def exp(self, array: torch.Tensor) -> torch.Tensor:
         return torch.exp(array)
 
     @override
-    @staticmethod
-    def log(array: torch.Tensor) -> torch.Tensor:
+    def log(self, array: torch.Tensor) -> torch.Tensor:
         return torch.log(array)
 
     @override
-    @staticmethod
-    def sum(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
+    def sum(self, array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
             if keepdims:
                 return torch.sum(array, dim=tuple(range(array.ndim)), keepdim=True)
@@ -50,8 +46,7 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
         return torch.amax(array, dim=axis, keepdim=keepdims)
 
     @override
-    @staticmethod
-    def min(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
+    def min(self, array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
             if keepdims:
                 return torch.amin(array, dim=tuple(range(array.ndim)), keepdim=True)
@@ -59,51 +54,31 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
         return torch.amin(array, dim=axis, keepdim=keepdims)
 
     @override
-    @staticmethod
-    def maximum(array_1: torch.Tensor, array_2: torch.Tensor) -> torch.Tensor:
+    def maximum(self, array_1: torch.Tensor, array_2: torch.Tensor) -> torch.Tensor:
         return torch.maximum(array_1, array_2)
 
     @override
-    @staticmethod
-    def reshape(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    def reshape(self, array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
         return torch.reshape(array, shape)
 
     @override
-    @staticmethod
-    def broadcast_to(array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    def broadcast_to(self, array: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
         return torch.broadcast_to(array, shape)
 
     @override
-    @staticmethod
-    def stack(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+    def stack(self, arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
         return torch.stack(list(arrays), dim=axis)
 
     @override
-    @staticmethod
-    def concat(arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+    def concat(self, arrays: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
         return torch.cat(list(arrays), dim=axis)
 
     @override
-    @staticmethod
-    def take(array: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:
+    def take(self, array: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:
         return torch.index_select(array, dim=axis, index=indices)
 
     @override
-    @staticmethod
-    def select(array: torch.Tensor, axis: int, index: int) -> torch.Tensor:
-        return torch.select(array, dim=axis, index=index)
-
-    @override
-    @staticmethod
-    def slice(array: torch.Tensor, start: int, stop: int, axis: int) -> torch.Tensor:
-        normalized_axis = normalize_axis(axis, array.ndim)
-        slices = [slice(None)] * array.ndim
-        slices[normalized_axis] = slice(start, stop)
-        return array[tuple(slices)]
-
-    @override
-    @staticmethod
-    def softmax(array: torch.Tensor, axis: int | tuple[int, ...]) -> torch.Tensor:
+    def softmax(self, array: torch.Tensor, axis: int | tuple[int, ...]) -> torch.Tensor:
         if isinstance(axis, int):
             return torch.softmax(array, dim=axis)
         normalized_axes = tuple(item if item >= 0 else item + array.ndim for item in axis)
@@ -115,35 +90,13 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
         return exp_array / torch.sum(exp_array, dim=axis, keepdim=True)
 
     @override
-    @staticmethod
-    def einsum(format_string: str, *operands: torch.Tensor) -> torch.Tensor:
+    def einsum(self, format_string: str, *operands: torch.Tensor) -> torch.Tensor:
         return torch.einsum(format_string, *operands)
-
-    @override
-    @staticmethod
-    def add(summand_array_1: torch.Tensor, summand_array_2: torch.Tensor) -> torch.Tensor:
-        return summand_array_1 + summand_array_2
-
-    @override
-    @staticmethod
-    def subtract(minuend_array: torch.Tensor, subtrahend_array: torch.Tensor) -> torch.Tensor:
-        return minuend_array - subtrahend_array
-
-    @override
-    @staticmethod
-    def multiply(factor_array_1: torch.Tensor, factor_array_2: torch.Tensor) -> torch.Tensor:
-        return factor_array_1 * factor_array_2
-
-    @override
-    @staticmethod
-    def divide(dividend_array: torch.Tensor, divisor_array: torch.Tensor) -> torch.Tensor:
-        return dividend_array / divisor_array
 
 
 class TorchCompiler(BackendCompiler[torch.Tensor]):
-    @override
-    @staticmethod
     def compile(
+        self,
         program: BackendProgram[torch.Tensor],
         inputs: Sequence[torch.Tensor],
     ) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:

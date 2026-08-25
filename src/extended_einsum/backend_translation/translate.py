@@ -606,7 +606,9 @@ def _append_scaled_instruction(
                 for pair_index, (
                     argument_ssa_id,
                     (_, log_scale_position),
-                ) in enumerate(zip(argument_ssa_ids, scaled_pairs, strict=True)):
+                ) in enumerate(
+                    zip(argument_ssa_ids, scaled_pairs, strict=True)
+                ):
                     target_scale_shape = _fiber_scale_shape(value_shapes[argument_ssa_id])
                     scale_shape = scale_shapes[argument_ssa_id]
                     if scale_shape and scale_shape[-1] != 1:
@@ -633,12 +635,14 @@ def _append_scaled_instruction(
                             backend_functions.exp,
                             (scale_delta_position,),
                         )
-                        normalized_positions[pair_index] = builder.wrap_and_append(
-                            backend_functions.multiply,
-                            (
-                                normalized_positions[pair_index],
-                                scale_factor_position,
-                            ),
+                        normalized_positions[pair_index] = (
+                            builder.wrap_and_append(
+                                backend_functions.multiply,
+                                (
+                                    normalized_positions[pair_index],
+                                    scale_factor_position,
+                                ),
+                            )
                         )
                         log_scale_position = common_scale_position
                         scale_shape = (*scale_shape[:-1], 1)

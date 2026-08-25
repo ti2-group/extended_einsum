@@ -865,6 +865,47 @@ class OutputDepthOpGroupingTests(unittest.TestCase):
         self.assertEqual(folded.instructions[0].argument_ssa_ids, (0,))
         self.assertNotEqual(folded.instructions[0].operator.name, "stack")
 
+    def test_input_depth_can_use_spatial_input_order_without_future_consumers(
+        self,
+    ) -> None:
+        program = _program(
+            instructions=[
+                _select_instruction(0, 0),
+                _select_instruction(0, 2),
+                _select_instruction(0, 1),
+                _select_instruction(0, 3),
+                _log_instruction(1),
+                _log_instruction(2),
+                _log_instruction(3),
+                _log_instruction(4),
+                _stack_instruction(5, 6, 7, 8),
+            ],
+            n_inputs=1,
+            shapes=[
+                (4, 2),
+                *((2,) for _ in range(8)),
+                (4, 2),
+            ],
+        )
+
+        depth_first = FoldSameShapedOperations.apply_with_input_depth_metadata(
+            program,
+            optimize_group_order=False,
+            order_by_input_access=False,
+        )
+        input_ordered = (
+            FoldSameShapedOperations.apply_with_input_depth_metadata(
+                program,
+                optimize_group_order=False,
+                order_by_input_access=True,
+            )
+        )
+
+        self.assertEqual(depth_first.batched_result_orders, ((5, 6, 7, 8),))
+        self.assertEqual(input_ordered.batched_result_orders, ((5, 7, 6, 8),))
+        self.assertEqual(depth_first.input_axis0_orders, {0: (0, 2, 1, 3)})
+        self.assertEqual(input_ordered.input_axis0_orders, {})
+
 
 class EinsumLabelAllocationTests(unittest.TestCase):
     def test_extract_connected_einsum_components_prefers_ascii_before_extended(
@@ -936,7 +977,13 @@ class EinsumLabelAllocationTests(unittest.TestCase):
 
 class OptimizeContractionPathsTests(unittest.TestCase):
     def test_fuses_stable_outer_product_with_reduction(self) -> None:
-        for stability_mode in ("scaled_min", "scaled_sum", "logspace_min", "logspace_max"):
+        for stability_mode in (
+            "scaled_min",
+            "scaled_max",
+            "scaled_sum",
+            "logspace_min",
+            "logspace_max",
+        ):
             with self.subTest(stability_mode=stability_mode):
                 program = RichProgram(
                     instructions=[

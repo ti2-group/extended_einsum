@@ -1,83 +1,106 @@
+from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable, Generic, Protocol, TypeVar
+from typing import Any, Callable, Generic, Protocol, TypeVar, cast
 
-import numpy as np
-import torch
-
-from extended_einsum.language.types import Backend, HasShape
+from extended_einsum.utils import normalize_axis
 
 
 class BackendArray(Protocol):
     @property
-    def shape(self) -> tuple[int, ...] | torch.Size: ...
+    def shape(self) -> Sequence[int]: ...
 
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
 
 
-class BackendFunctions(Protocol[TBackendArray]):
-    @staticmethod
-    def stop_gradient(array: TBackendArray) -> TBackendArray: ...
-    # Paper "Detached reference shifts" (sec:numerical-stability): translations
-    # call this on every shift/normalizer whose derivative cancels exactly.
+class BackendFunctions(ABC, Generic[TBackendArray]):
+    """The array operations a backend must provide to execute programs.
 
-    @staticmethod
-    def exp(array: TBackendArray) -> TBackendArray: ...
+    The abstract methods are the primitives every backend has to implement.
+    The remaining methods have default implementations composed from the
+    primitives or from the standard Python operator and indexing protocols of
+    the array type; override them when the backend offers a faster or more
+    precise native version (e.g. a fused softmax), or when its arrays do not
+    support the standard operators.
 
-    @staticmethod
-    def log(array: TBackendArray) -> TBackendArray: ...
+    ``exp``, ``log``, ``einsum``, ``stack``, ``concat``, ``take``, ``select``,
+    ``slice``, ``softmax``, ``add``, ``subtract``, ``multiply``, and ``divide``
+    execute the corresponding user-facing operators. ``sum``, ``max``, ``min``,
+    ``maximum``, ``reshape``, ``broadcast_to``, and ``stop_gradient`` are
+    additionally required by the stable evaluation strategies (the scaled and
+    logspace stability modes).
+    """
 
-    @staticmethod
-    def sum(array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
+    @abstractmethod
+    def exp(self, array: TBackendArray) -> TBackendArray: ...
 
-    @staticmethod
-    def max(array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
+    @abstractmethod
+    def log(self, array: TBackendArray) -> TBackendArray: ...
 
-    @staticmethod
-    def min(array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
+    @abstractmethod
+    def sum(self, array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
 
-    @staticmethod
-    def maximum(array_1: TBackendArray, array_2: TBackendArray) -> TBackendArray: ...
+    @abstractmethod
+    def max(self, array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
 
-    @staticmethod
-    def reshape(array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
+    @abstractmethod
+    def min(self, array: TBackendArray, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> TBackendArray: ...
 
-    @staticmethod
-    def broadcast_to(array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
+    @abstractmethod
+    def maximum(self, array_1: TBackendArray, array_2: TBackendArray) -> TBackendArray: ...
 
-    @staticmethod
-    def stack(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
+    @abstractmethod
+    def reshape(self, array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
 
-    @staticmethod
-    def concat(arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
+    @abstractmethod
+    def broadcast_to(self, array: TBackendArray, shape: tuple[int, ...]) -> TBackendArray: ...
 
-    @staticmethod
-    def take(array: TBackendArray, indices: TBackendArray, axis: int) -> TBackendArray: ...
+    @abstractmethod
+    def stack(self, arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
 
-    @staticmethod
-    def select(array: TBackendArray, axis: int, index: int) -> TBackendArray: ...
+    @abstractmethod
+    def concat(self, arrays: Sequence[TBackendArray], axis: int) -> TBackendArray: ...
 
-    @staticmethod
-    def slice(array: TBackendArray, start: int, stop: int, axis: int) -> TBackendArray: ...
+    @abstractmethod
+    def take(self, array: TBackendArray, indices: TBackendArray, axis: int) -> TBackendArray: ...
 
-    @staticmethod
-    def softmax(array: TBackendArray, axis: int | tuple[int, ...]) -> TBackendArray: ...
+    @abstractmethod
+    def einsum(self, format_string: str, *operands: TBackendArray) -> TBackendArray: ...
 
-    @staticmethod
-    def einsum(format_string: str, *operands: TBackendArray) -> TBackendArray: ...
+    def stop_gradient(self, array: TBackendArray) -> TBackendArray:
+        """Detaches the array from gradient tracking; the identity for backends without automatic differentiation."""
 
-    @staticmethod
-    def add(summand_array_1: TBackendArray, summand_array_2: TBackendArray) -> TBackendArray: ...
+        return array
 
-    @staticmethod
-    def subtract(minuend_array: TBackendArray, subtrahend_array: TBackendArray) -> TBackendArray: ...
+    def select(self, array: TBackendArray, axis: int, index: int) -> TBackendArray:
+        normalized_axis = normalize_axis(axis, len(array.shape))
+        item: list[slice | int] = [slice(None)] * len(array.shape)
+        item[normalized_axis] = index
+        return cast(TBackendArray, cast(Any, array)[tuple(item)])
 
-    @staticmethod
-    def multiply(factor_array_1: TBackendArray, factor_array_2: TBackendArray) -> TBackendArray: ...
+    def slice(self, array: TBackendArray, start: int, stop: int, axis: int) -> TBackendArray:
+        normalized_axis = normalize_axis(axis, len(array.shape))
+        slices = [slice(None)] * len(array.shape)
+        slices[normalized_axis] = slice(start, stop)
+        return array[tuple(slices)]  # pyright: ignore[reportIndexIssue]
 
-    @staticmethod
-    def divide(dividend_array: TBackendArray, divisor_array: TBackendArray) -> TBackendArray: ...
+    def softmax(self, array: TBackendArray, axis: int | tuple[int, ...]) -> TBackendArray:
+        shifted = self.subtract(array, self.max(array, axis=axis, keepdims=True))
+        exp_array = self.exp(shifted)
+        return self.divide(exp_array, self.sum(exp_array, axis=axis, keepdims=True))
+
+    def add(self, summand_array_1: TBackendArray, summand_array_2: TBackendArray) -> TBackendArray:
+        return summand_array_1 + summand_array_2  # pyright: ignore[reportOperatorIssue]
+
+    def subtract(self, minuend_array: TBackendArray, subtrahend_array: TBackendArray) -> TBackendArray:
+        return minuend_array - subtrahend_array  # pyright: ignore[reportOperatorIssue]
+
+    def multiply(self, factor_array_1: TBackendArray, factor_array_2: TBackendArray) -> TBackendArray:
+        return factor_array_1 * factor_array_2  # pyright: ignore[reportOperatorIssue]
+
+    def divide(self, dividend_array: TBackendArray, divisor_array: TBackendArray) -> TBackendArray:
+        return dividend_array / divisor_array  # pyright: ignore[reportOperatorIssue]
 
 
 @dataclass(frozen=True)
@@ -88,25 +111,8 @@ class BackendProgram(Generic[TBackendArray]):
 
 
 class BackendCompiler(Protocol[TBackendArray]):
-    @staticmethod
     def compile(
+        self,
         program: BackendProgram[TBackendArray],
         inputs: Sequence[TBackendArray],
     ) -> Callable[[Sequence[TBackendArray]], TBackendArray]: ...
-
-
-def get_backend_of_array(array: HasShape) -> Backend:
-    if isinstance(array, torch.Tensor):
-        return "torch"
-    elif isinstance(array, np.ndarray):
-        return "numpy"
-
-    try:
-        import jax
-    except ModuleNotFoundError:
-        jax = None  # type: ignore[assignment]
-
-    if jax is not None and isinstance(array, jax.Array):
-        return "jax"
-
-    raise ValueError(f"Unsupported array type: {type(array)}")

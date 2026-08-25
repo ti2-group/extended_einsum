@@ -228,11 +228,6 @@ def group_identical_ops_by_input_depth(
 ) -> tuple[OutputDepthOpGroup, ...]:
     """Group live, batchable, canonically identical ops by input frontier.
 
-    This is the input-oriented implementation of paper "IR-Level Folding" used
-    by the publication's metadata-free Cirkit/Monarch integration. It retains
-    the paper's matching-shape batching rule while choosing compatible groups
-    from their nearest input frontier rather than nearest output depth.
-
     Ordinary SSA values use their longest-path depth from the program inputs.
     Parameter-only preprocessing is different: independent weight transforms
     would otherwise all sit at depth one even though they belong to different
@@ -242,8 +237,7 @@ def group_identical_ops_by_input_depth(
     Unlike output-directed grouping, operations at a true input depth cannot
     depend on one another. Reusing one operand in several group members is
     allowed: the materialization rewrite can route or repeat that operand. This
-    is what permits the input-directed schedule to form the larger native XE
-    folds.
+    is what permits the input-directed schedule to form larger folds.
     """
     if min_group_size < 1:
         raise ValueError("min_group_size must be at least 1")

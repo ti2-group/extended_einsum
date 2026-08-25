@@ -53,8 +53,8 @@ def _single_instruction_program(operator: RichOperator, n_arguments: int, stabil
     return _dense_program([RichInstruction(operator, tuple(range(n_arguments)))], n_inputs=n_arguments, stability_mode=stability_mode)
 
 
-# the scaled and logspace translations each come in two normalizing variants
-SCALED_MODES: list[StabilityMode] = ["scaled_min", "scaled_sum"]
+# Scaled translation supports three fiber normalizers; log space supports two shifts.
+SCALED_MODES: list[StabilityMode] = ["scaled_min", "scaled_max", "scaled_sum"]
 LOGSPACE_MODES: list[StabilityMode] = ["logspace_min", "logspace_max"]
 STABLE_MODES: list[StabilityMode] = [*SCALED_MODES, *LOGSPACE_MODES]
 ALL_MODES: list[StabilityMode] = ["unstable", *STABLE_MODES]
@@ -466,6 +466,44 @@ def test_scaled_concat_preserves_independent_fiber_scales(stability_mode: Stabil
 
     assert np.all(np.isfinite(result))
     np.testing.assert_allclose(result, np.log(np.concatenate((large, small), axis=0)), rtol=1e-9)
+
+
+@pytest.mark.parametrize("stability_mode", SCALED_MODES)
+def test_scaled_concat_canonicalizes_scales_that_vary_along_fibers(
+    stability_mode: StabilityMode,
+) -> None:
+    left = POSITIVE_MATRIX[:2, :3]
+    right = 1.0e3 * OTHER_POSITIVE_MATRIX[:2, :3]
+    rich_program = _dense_program(
+        instructions=[
+            RichInstruction(OperatorEinsum("ab->ba"), (0,)),
+            RichInstruction(OperatorEinsum("ab->ba"), (1,)),
+            RichInstruction(OperatorConcat(axis=0), (2, 3)),
+            RichInstruction(OperatorLog(), (4,)),
+        ],
+        n_inputs=2,
+        stability_mode=stability_mode,
+        shapes=[
+            left.shape,
+            right.shape,
+            (3, 2),
+            (3, 2),
+            (6, 2),
+            (6, 2),
+        ],
+    )
+
+    backend_program = translate_to_backend_program(
+        rich_program,
+        BACKEND_FUNCTIONS,
+    )
+    result = run_program(backend_program, [left, right])
+    expected = np.log(
+        np.concatenate((left.T, right.T), axis=0)
+    )
+
+    assert np.all(np.isfinite(result))
+    np.testing.assert_allclose(result, expected, rtol=1e-9)
 
 
 @pytest.mark.parametrize("stability_mode", SCALED_MODES)

@@ -13,7 +13,7 @@ StabilityMode = Literal[
     "logspace_max",
 ]
 
-Backend = Literal["torch", "numpy", "jax"]
+Backend = str
 
 
 class HasShape(Protocol):
