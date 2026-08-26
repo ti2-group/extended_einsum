@@ -9,7 +9,12 @@ from extended_einsum.backend_translation.runtime import DefaultCompiler
 
 
 class NumpyBackendFunctions(BackendFunctions[npt.NDArray]):
-    """Reference backend implementing only the required primitives; everything else uses the BackendFunctions defaults."""
+    @override
+    @staticmethod
+    def stop_gradient(array: npt.NDArray) -> npt.NDArray:
+        # NumPy has no autodiff graph; this is the identity implementation of
+        # paper "Detached reference shifts" (sec:numerical-stability).
+        return array
 
     @override
     def exp(self, array: npt.NDArray) -> npt.NDArray:

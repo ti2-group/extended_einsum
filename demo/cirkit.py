@@ -18,6 +18,9 @@ from pathlib import Path
 _THIS_DIR = str(Path(__file__).resolve().parent)
 if sys.path and Path(sys.path[0]).resolve() == Path(_THIS_DIR):
     sys.path.pop(0)
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPOSITORY_ROOT not in sys.path:
+    sys.path.insert(0, _REPOSITORY_ROOT)
 
 import torch
 import torch.nn.functional as F
@@ -33,7 +36,11 @@ from extended_einsum.backends.torch import TorchBackendFunctions
 from extended_einsum.interface.tensor_expression import Parameter
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import StabilityMode
-from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
+from extended_einsum.preprocess import (
+    AnnotateShortSameIndexContractions,
+    FoldSameShapedOperations,
+    OptimizeContractionPaths,
+)
 
 WIDTH = 4
 HEIGHT = 4
@@ -43,6 +50,7 @@ DEFAULT_EPOCHS = 1
 DEFAULT_NUM_SAMPLES = 0
 DEFAULT_PIXEL_VALUES = 256
 EINSUM_SYMBOLS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+CP_FLATTENED_LOOKUP_MIN_UNITS = 128
 CSV_FIELDS = (
     "timestamp",
     "backend",
@@ -66,6 +74,11 @@ CSV_FIELDS = (
     "semiring",
     "backend_type",
     "torch_compile",
+    "compile_scope",
+    "fold_strategy",
+    "gather_materialization",
+    "optimizer",
+    "optimizer_fused",
     "seed",
     "warmup_steps",
     "warmup_epochs",
@@ -85,6 +98,13 @@ CSV_FIELDS = (
     "batches_per_sec",
     "avg_batch_ms",
     "memory_backend",
+    "memory_scope",
+    "baseline_allocated_memory_bytes",
+    "baseline_reserved_memory_bytes",
+    "peak_allocated_memory_bytes",
+    "peak_allocated_memory_mib",
+    "peak_incremental_allocated_memory_bytes",
+    "peak_incremental_reserved_memory_bytes",
     "peak_memory_bytes",
     "peak_memory_mib",
     "peak_reserved_memory_bytes",
@@ -92,6 +112,26 @@ CSV_FIELDS = (
     "reserved_memory_bytes",
     "allocated_memory_bytes",
 )
+
+
+def resolve_categorical_lookup(
+    categorical_lookup: str,
+    *,
+    sum_product_layer: str,
+    num_units: int,
+) -> str:
+    """Choose the compiler-friendly categorical lookup for a circuit shape."""
+
+    choices = {"advanced", "auto", "gather", "flattened"}
+    if categorical_lookup not in choices:
+        raise ValueError(f"Unknown categorical lookup: {categorical_lookup}")
+    if categorical_lookup != "auto":
+        return categorical_lookup
+    if sum_product_layer in {"cp-t", "tucker"}:
+        return "gather"
+    if sum_product_layer == "cp" and num_units >= CP_FLATTENED_LOOKUP_MIN_UNITS:
+        return "flattened"
+    return "advanced"
 
 
 def make_symbolic_circuit(
@@ -218,8 +258,13 @@ def preprocess_xe_program(
     if not optimize_stacking:
         return program
 
+    # Paper compiler pipeline (sec:compiler-optimizations): first apply
+    # "IR-Level Folding" plus the consumer ordering of sec:memory-layout, then
+    # merge nested einsums, choose pairwise paths (sec:contraction-path), and
+    # mark short weighted reductions for backend fusion.
     folded = FoldSameShapedOperations.apply(program)
-    return OptimizeContractionPaths.apply(folded)
+    path_optimized = OptimizeContractionPaths.apply(folded)
+    return AnnotateShortSameIndexContractions.apply(path_optimized)
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -346,6 +391,8 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
         peak_reserved = torch.cuda.max_memory_reserved(device)
         return {
             "memory_backend": "cuda",
+            "peak_allocated_memory_bytes": peak_allocated,
+            "peak_allocated_memory_mib": peak_allocated / 1024**2,
             "peak_memory_bytes": peak_allocated,
             "peak_memory_mib": peak_allocated / 1024**2,
             "peak_reserved_memory_bytes": peak_reserved,
@@ -376,13 +423,16 @@ def memory_snapshot(device: torch.device) -> dict[str, int | float | str]:
 
 
 def cleanup_device(device: torch.device) -> None:
+    # Compiled graphs can own CUDA graph pools. Release those references before
+    # collecting Python objects and emptying the allocator cache so the next
+    # benchmark configuration starts from a clean, measurable baseline.
+    if hasattr(torch, "_dynamo"):
+        torch._dynamo.reset()
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     elif device.type == "mps" and hasattr(torch, "mps"):
         torch.mps.empty_cache()
-    if hasattr(torch, "_dynamo"):
-        torch._dynamo.reset()
 
 
 def set_seed(seed: int) -> None:
@@ -407,6 +457,7 @@ def load_train_images(
     num_samples: int,
     num_variables: int,
     pixel_values: int,
+    download: bool = True,
 ) -> torch.Tensor:
     if dataset == "synthetic":
         return torch.randint(pixel_values, size=(num_samples, num_variables), device=device)
@@ -418,26 +469,52 @@ def load_train_images(
 
     from torchvision import datasets
 
-    mnist_train = datasets.MNIST(data_dir, train=True, download=True)
+    mnist_train = datasets.MNIST(data_dir, train=True, download=download)
     train_images = mnist_train.data.reshape(-1, num_variables).long()
     if num_samples:
         train_images = train_images[:num_samples]
     return train_images.to(device)
 
 
-def torch_program_runner(program: RichProgram, *, use_make_fx: bool, device: torch.device) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
-    backend_program = translate_to_backend_program(program, TorchBackendFunctions())
+def torch_program_runner(
+    program: RichProgram,
+    *,
+    device: torch.device,
+    index_input_ids: frozenset[int] = frozenset(),
+    shift_mode: str = "xe",
+    scale_interval: int = 3,
+) -> Callable[[Sequence[torch.Tensor]], torch.Tensor]:
+    class DifferentiableShiftTorchBackendFunctions(TorchBackendFunctions):
+        @staticmethod
+        def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+            # Paper ablation "What drives the gains?": this deliberately
+            # disables "Detached reference shifts" while leaving the forward
+            # log-space/scaled formulas unchanged.
+            return array
 
-    def run(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
-        return run_program(backend_program, inputs)
-
-    if not use_make_fx:
-        return run
+    if shift_mode not in {"differentiable", "xe"}:
+        raise ValueError(f"Unknown log-space shift mode: {shift_mode}")
+    backend_functions = {
+        "differentiable": DifferentiableShiftTorchBackendFunctions,
+        "xe": TorchBackendFunctions,
+    }[shift_mode]()
+    backend_program = translate_to_backend_program(
+        program,
+        backend_functions,
+        scale_interval=scale_interval,
+    )
 
     def run_flat(*inputs: torch.Tensor) -> torch.Tensor:
         return run_program(backend_program, inputs)
 
-    example_inputs = [torch.empty(tuple(program.shapes[input_id]), dtype=torch.float32, device=device) for input_id in range(program.n_inputs)]
+    example_inputs = [
+        torch.empty(
+            tuple(program.shapes[input_id]),
+            dtype=torch.long if input_id in index_input_ids else torch.float32,
+            device=device,
+        )
+        for input_id in range(program.n_inputs)
+    ]
     graph_module = make_fx(run_flat, tracing_mode="fake")(*example_inputs)
 
     def run_graph(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -459,9 +536,19 @@ def setup_xe_training(
     data_dir: str,
     num_samples: int,
     pixel_values: int,
-    use_torch_compile: bool,
     semiring: str,
     lr: float,
+    folding_depth: str = "input",
+    folding_order_by_input_access: bool | None = None,
+    folding_split_by_routing: bool | None = None,
+    folding_gather_fragmented_batches: bool | None = None,
+    categorical_lookup: str = "auto",
+    optimize_group_order: bool = True,
+    preorder_inputs: bool = True,
+    shift_mode: str = "xe",
+    optimize_contraction_paths: bool = True,
+    scale_interval: int = 3,
+    download: bool = True,
 ):
     symbolic_circuit = make_symbolic_circuit(
         width=width,
@@ -473,11 +560,53 @@ def setup_xe_training(
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=batch_size,
-        stability="logspace_max" if semiring == "lse-sum" else "scaled_sum",
+        stability={
+            "lse-sum": "logspace_max",
+            "scaled-min": "scaled_min",
+            "scaled-max": "scaled_max",
+            "scaled-sum": "scaled_sum",
+        }[semiring],
     )
-    folded = FoldSameShapedOperations.apply_with_metadata(program)
-    runtime_program = OptimizeContractionPaths.apply(folded.program)
-    run = torch_program_runner(runtime_program, use_make_fx=use_torch_compile, device=device)
+    # Publication implementation of paper "IR-Level Folding" and
+    # sec:memory-layout. Metadata records one-time parameter/input packing and
+    # any unavoidable gather indices used by the rewritten program.
+    if folding_depth == "input":
+        folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
+            program,
+            optimize_group_order=optimize_group_order,
+            order_by_input_access=folding_order_by_input_access,
+            split_by_routing=folding_split_by_routing,
+            gather_fragmented_batches=folding_gather_fragmented_batches,
+        )
+    elif folding_depth == "output":
+        folded = FoldSameShapedOperations.apply_with_metadata(
+            program,
+            optimize_group_order=optimize_group_order,
+        )
+    else:
+        raise ValueError(f"Unknown folding depth: {folding_depth}")
+    resolved_categorical_lookup = resolve_categorical_lookup(
+        categorical_lookup,
+        sum_product_layer=sum_product_layer,
+        num_units=num_units,
+    )
+    path_optimized_program = (
+        # Paper sec:contraction-path: merge nested einsums and lower them to the
+        # optimizer-selected pairwise schedule.
+        OptimizeContractionPaths.apply(folded.program) if optimize_contraction_paths else folded.program
+    )
+    runtime_program = AnnotateShortSameIndexContractions.apply(
+        path_optimized_program
+    )
+    gather_index_orders = folded.gather_index_orders
+    index_input_ids = frozenset(range(runtime_program.n_inputs - len(gather_index_orders), runtime_program.n_inputs))
+    run = torch_program_runner(
+        runtime_program,
+        device=device,
+        index_input_ids=index_input_ids,
+        shift_mode=shift_mode,
+        scale_interval=scale_interval,
+    )
 
     num_variables = width * height
     input_shape = input_shape_tuple(inputs[0])
@@ -491,16 +620,19 @@ def setup_xe_training(
         num_samples=num_samples,
         num_variables=num_variables,
         pixel_values=pixel_values,
+        download=download,
     )
-    train_images = train_images.index_select(1, data_axis_order_tensor)
-    categorical_logits = torch.nn.Parameter(
-        torch.normal(
-            mean=0.0,
-            std=1.0,
-            size=(num_variables, pixel_values, categorical_units),
-            device=device,
-        ).index_select(0, data_axis_order_tensor)
+    if preorder_inputs:
+        train_images = train_images.index_select(1, data_axis_order_tensor)
+    initial_categorical_logits = torch.normal(
+        mean=0.0,
+        std=1.0,
+        size=(num_variables, pixel_values, categorical_units),
+        device=device,
     )
+    if preorder_inputs:
+        initial_categorical_logits = initial_categorical_logits.index_select(0, data_axis_order_tensor)
+    categorical_logits = torch.nn.Parameter(initial_categorical_logits)
     used_input_ids = {argument for instruction in program.instructions for argument in instruction.argument_ssa_ids if argument < program.n_inputs}
     packed_parameter_input_sequence = tuple(input_id for stack_order in folded.parameter_stack_orders for input_id in stack_order)
     packed_parameter_input_ids = set(packed_parameter_input_sequence)
@@ -519,12 +651,27 @@ def setup_xe_training(
     }
     parameter_inputs = {input_id: torch.nn.Parameter(tensor) for input_id, tensor in initialized_parameter_inputs.items() if input_id not in packed_parameter_input_ids}
     packed_parameter_inputs = [torch.nn.Parameter(torch.stack([initialized_parameter_inputs[input_id] for input_id in stack_order], dim=0)) for stack_order in folded.parameter_stack_orders]
+    gather_index_inputs = [torch.tensor(indices, dtype=torch.long, device=device) for indices in gather_index_orders]
     constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
     pixel_range = torch.arange(num_variables, device=device)[:, None]
+    flattened_pixel_offsets = pixel_values * pixel_range
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:
         probabilities = F.softmax(categorical_logits, dim=1)
-        return probabilities[pixel_range, batch.T].contiguous()
+        transposed_batch = batch.T
+        if resolved_categorical_lookup == "advanced":
+            data_input = probabilities[pixel_range, transposed_batch].contiguous()
+        elif resolved_categorical_lookup == "gather":
+            indices = transposed_batch.unsqueeze(-1).expand(-1, -1, categorical_units)
+            data_input = torch.gather(probabilities, 1, indices)
+        else:
+            flattened_indices = (flattened_pixel_offsets + transposed_batch).reshape(-1)
+            flattened_probabilities = probabilities.reshape(num_variables * pixel_values, categorical_units)
+            selected = flattened_probabilities.index_select(0, flattened_indices)
+            data_input = selected.reshape(num_variables, batch.shape[0], categorical_units)
+        if not preorder_inputs:
+            data_input = data_input.index_select(0, data_axis_order_tensor)
+        return data_input
 
     def original_input_tensor(input_id: int, data_input: torch.Tensor) -> torch.Tensor:
         if input_id == 0:
@@ -535,21 +682,17 @@ def setup_xe_training(
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         data_input = categorical_input(batch)
-        if use_torch_compile and semiring == "scaled-max":
-            # Keep Inductor from fusing categorical indexing/softmax backward
-            # into the much larger scaled-circuit backward graph.  Both sides
-            # of this boundary are still compiled independently.
-            torch._dynamo.graph_break()
         runtime_tensors: list[torch.Tensor] = [original_input_tensor(input_id, data_input) for input_id in retained_input_ids]
         runtime_tensors[data_input_id] = data_input
         runtime_tensors.extend(packed_parameter_inputs)
+        runtime_tensors.extend(gather_index_inputs)
         if len(runtime_tensors) != runtime_program.n_inputs:
             raise RuntimeError(f"Expected {runtime_program.n_inputs} runtime inputs, got {len(runtime_tensors)}")
         log_likelihoods = run(runtime_tensors)
         return -torch.mean(log_likelihoods)
 
-    if use_torch_compile:
-        step = torch.compile(step, mode="reduce-overhead" if device.type == "cuda" else None)
+    compile_mode = "reduce-overhead" if device.type == "cuda" else None
+    step = torch.compile(step, mode=compile_mode)
 
     optimizer = make_optimizer((categorical_logits, *parameter_inputs.values(), *packed_parameter_inputs), device, lr)
     return step, optimizer, train_images, runtime_program
@@ -574,8 +717,9 @@ def setup_cirkit_training(
     data_dir: str,
     num_samples: int,
     pixel_values: int,
-    use_torch_compile: bool,
     lr: float,
+    semiring: str = "lse-sum",
+    download: bool = True,
 ):
     symbolic_circuit = make_symbolic_circuit(
         width=width,
@@ -586,13 +730,11 @@ def setup_cirkit_training(
     )
     ctx = PipelineContext(
         backend="torch",
-        semiring="lse-sum",
+        semiring=semiring,
         fold=True,
         optimize=True,
     )
     circuit = ctx.compile(symbolic_circuit).to(device)
-    if use_torch_compile:
-        circuit = torch.compile(circuit)
 
     train_images = load_train_images(
         dataset=dataset,
@@ -601,12 +743,16 @@ def setup_cirkit_training(
         num_samples=num_samples,
         num_variables=width * height,
         pixel_values=pixel_values,
+        download=download,
     )
     optimizer = make_optimizer(circuit.parameters(), device, lr)
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         log_likelihoods = circuit(batch)
         return -torch.mean(log_likelihoods)
+
+    compile_mode = "reduce-overhead" if device.type == "cuda" else None
+    step = torch.compile(step, mode=compile_mode)
 
     return step, optimizer, train_images, None
 
@@ -764,10 +910,7 @@ def display_backend(backend: str, args: argparse.Namespace) -> str:
     backend_name = backend if args.region_graph == "quad-tree-2" else f"{backend}-{args.region_graph}"
     if backend != "xe":
         return backend_name
-    suffixes = [args.semiring]
-    if args.torch_compile:
-        suffixes.append("torch-compile")
-    return "-".join((backend_name, *suffixes))
+    return "-".join((backend_name, args.semiring, "torch-compile"))
 
 
 def base_row(
@@ -778,6 +921,7 @@ def base_row(
     args: argparse.Namespace,
     device: torch.device,
 ) -> dict:
+    is_cirkit = backend.startswith("cirkit")
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "backend": backend,
@@ -799,8 +943,17 @@ def base_row(
         "region_graph": args.region_graph,
         "sum_product_layer": args.sum_product_layer,
         "semiring": args.semiring,
-        "backend_type": "cirkit" if backend.startswith("cirkit") else "xe",
-        "torch_compile": args.torch_compile,
+        "backend_type": "cirkit" if is_cirkit else "xe",
+        "torch_compile": True,
+        "compile_scope": "whole-step",
+        "fold_strategy": (
+            "cirkit"
+            if is_cirkit
+            else "input-depth"
+        ),
+        "gather_materialization": not is_cirkit,
+        "optimizer": "adam",
+        "optimizer_fused": device.type == "cuda",
         "seed": args.seed,
         "warmup_steps": args.warmup_steps,
         "warmup_epochs": args.warmup_epochs,
@@ -818,6 +971,12 @@ def run_training_config(
     # Include model construction, compilation, and warmup in the VRAM high-water
     # mark. Resetting after warmup would hide CUDA graph pools allocated during
     # capture even though the run needs to keep that reservation.
+    if device.type == "cuda":
+        baseline_allocated = torch.cuda.memory_allocated(device)
+        baseline_reserved = torch.cuda.memory_reserved(device)
+    else:
+        baseline_allocated = 0
+        baseline_reserved = 0
     reset_peak_memory(device)
     setup_fn = setup_cirkit_training if backend == "cirkit" else setup_xe_training
     setup_start = time.perf_counter()
@@ -832,10 +991,9 @@ def run_training_config(
         "data_dir": args.data_dir,
         "num_samples": args.num_samples,
         "pixel_values": args.pixel_values,
-        "use_torch_compile": args.torch_compile,
         "lr": args.lr,
     }
-    if backend == "xe":
+    if backend != "cirkit":
         setup_kwargs["batch_size"] = batch_size
         setup_kwargs["semiring"] = args.semiring
     step, optimizer, train_images, _program = setup_fn(**setup_kwargs)
@@ -878,7 +1036,27 @@ def run_training_config(
             }
         )
         row.update(stats)
-        row.update(memory_snapshot(device))
+        memory = memory_snapshot(device)
+        peak_allocated = memory.get("peak_allocated_memory_bytes", "")
+        peak_reserved = memory.get("peak_reserved_memory_bytes", "")
+        memory.update(
+            {
+                "memory_scope": "setup+warmup+measured-training",
+                "baseline_allocated_memory_bytes": baseline_allocated,
+                "baseline_reserved_memory_bytes": baseline_reserved,
+                "peak_incremental_allocated_memory_bytes": (
+                    max(0, int(peak_allocated) - baseline_allocated)
+                    if peak_allocated != ""
+                    else ""
+                ),
+                "peak_incremental_reserved_memory_bytes": (
+                    max(0, int(peak_reserved) - baseline_reserved)
+                    if peak_reserved != ""
+                    else ""
+                ),
+            }
+        )
+        row.update(memory)
         rows.append(row)
     return rows
 
@@ -955,11 +1133,11 @@ def parse_args() -> argparse.Namespace:
         metavar="N[,N...]",
         help="Batch size, or comma-separated sizes for a training sweep.",
     )
-    parser.add_argument("--sum-product-layer", choices=("cp", "tucker"), default="cp")
+    parser.add_argument("--sum-product-layer", choices=("cp", "cp-t", "tucker"), default="cp")
     parser.add_argument("--region-graph", choices=("quad-tree-2", "quad-graph"), default="quad-tree-2")
     parser.add_argument(
         "--semiring",
-        choices=("scaled-max", "lse-sum"),
+        choices=("scaled-min", "scaled-max", "scaled-sum", "lse-sum"),
         default="lse-sum",
         help="Numerical-stability mode to request from XE.",
     )
@@ -1020,7 +1198,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--verbose-errors", action="store_true")
     args = parser.parse_args()
@@ -1051,7 +1228,12 @@ def main() -> None:
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
         batch_size=batch_size,
-        stability="logspace_max" if args.semiring == "lse-sum" else "scaled_min",
+        stability={
+            "lse-sum": "logspace_max",
+            "scaled-min": "scaled_min",
+            "scaled-max": "scaled_max",
+            "scaled-sum": "scaled_sum",
+        }[args.semiring],
     )
 
     print(

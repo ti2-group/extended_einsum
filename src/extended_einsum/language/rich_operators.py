@@ -381,6 +381,7 @@ class OperatorSoftmax(RichOperator):
 @dataclass(frozen=True)
 class OperatorEinsum(RichOperator):
     format_string: str
+    short_contraction_labels: tuple[str, ...] = ()
 
     def __post_init__(self):
         index_strings, output_string = parse_format_string(self.format_string)

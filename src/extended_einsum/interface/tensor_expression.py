@@ -40,6 +40,13 @@ from extended_einsum.language.types import (
     TensorFormat,
 )
 
+# Paper implementation map:
+# - "Extended Einsum" / "Frontend": TensorExpression records the user-facing
+#   tensor DAG, while extract_program lowers the shared DAG to the SSA-like IR.
+# - "Compiler Optimizations" (sec:compiler-optimizations): materialize follows
+#   the paper's final lowering stages by inserting the requested stability
+#   translation before compiling the backend call sequence.
+
 
 @dataclass(frozen=True)
 class Parameter(Generic[TArray]):
@@ -102,8 +109,13 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         return self._format
 
     def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
+        # Paper "Frontend": record the complete expression DAG as an
+        # extended-einsum program before choosing any backend operations.
         self._rich_program, self._input_arguments = extract_program(self, stability_mode)
         backend_functions = get_backend_functions(self.backend)
+        # Paper "Automatic Numerical Stability" (sec:numerical-stability):
+        # translate the backend-independent IR using the selected unstable,
+        # log-space, or scaled representation.
         self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
         compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
         backend_inputs = [argument.backend_array for argument in self._input_arguments]
@@ -145,10 +157,12 @@ def _compile_recursive(
     shapes: dict[int, Shape],
     tensor_formats: dict[int, TensorFormat],
 ) -> int:
-    # get a unique key for this expression
+    # Paper "Beyond Standard Einsum": key nodes by identity so a reused
+    # intermediate is emitted once and keeps all of its consumers in the DAG.
     expression_key = id(tensor_expression)
 
-    # if the expression is a tensor, just add it to the inputs
+    # Paper "Frontend": backend tensors are IR inputs; Parameter additionally
+    # marks weights so stability lowering can keep them in linear space.
     if not isinstance(tensor_expression, TensorExpression):
         # if we already found this input, return its SSA-ID
         if expression_key in input_ssa_ids:
@@ -170,7 +184,8 @@ def _compile_recursive(
     if expression_key in ssa_ids:
         return ssa_ids[expression_key]
 
-    # recursively compile the children
+    # Postorder traversal gives a topological instruction order while retaining
+    # explicit dataflow between einsums (paper "Level of Abstraction").
     argument_ssa_ids = tuple(
         _compile_recursive(
             argument,
@@ -198,6 +213,10 @@ def extract_program(
     stability_mode: StabilityMode,
 ) -> tuple[RichProgram, list[TArray]]:
     """Compiles a tensor expression into a rich program and a list of arguments.
+
+    This implements the recording step in the paper's "Frontend" subsection:
+    operations become IR instructions, repeated objects remain shared DAG
+    values, and backend arrays become inputs annotated as data or parameters.
 
     Parameters
     ----------
@@ -230,7 +249,9 @@ def extract_program(
         tensor_formats,
     )
 
-    # prepare shifting ssa ids
+    # The recursive walk numbers operations from zero and inputs with temporary
+    # negative IDs. Shift both into the paper's first-class intermediate-value
+    # representation: inputs first, then topologically ordered operation results.
     n_inputs = len(input_ssa_ids)
 
     def shift_ssa_id(old_ssa_id: int) -> int:

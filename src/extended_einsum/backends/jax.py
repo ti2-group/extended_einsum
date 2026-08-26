@@ -11,7 +11,10 @@ from extended_einsum.backend_translation.runtime import run_program
 
 class JaxBackendFunctions(BackendFunctions[jax.Array]):
     @override
-    def stop_gradient(self, array: jax.Array) -> jax.Array:
+    @staticmethod
+    def stop_gradient(array: jax.Array) -> jax.Array:
+        # Paper "Detached reference shifts" (sec:numerical-stability):
+        # remove the backward path through max-based reference shifts.
         return jax.lax.stop_gradient(array)
 
     @override

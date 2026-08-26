@@ -10,7 +10,10 @@ from extended_einsum.backend_translation.runtime import run_program
 
 class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
     @override
-    def stop_gradient(self, array: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def stop_gradient(array: torch.Tensor) -> torch.Tensor:
+        # Paper "Detached reference shifts" (sec:numerical-stability):
+        # remove the backward path through max-based reference shifts.
         return array.detach()
 
     @override
@@ -30,7 +33,8 @@ class TorchBackendFunctions(BackendFunctions[torch.Tensor]):
         return torch.sum(array, dim=axis, keepdim=keepdims)
 
     @override
-    def max(self, array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
+    @staticmethod
+    def max(array: torch.Tensor, axis: int | tuple[int, ...] | None = None, keepdims: bool = False) -> torch.Tensor:
         if axis is None:
             if keepdims:
                 return torch.amax(
