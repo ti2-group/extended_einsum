@@ -84,7 +84,7 @@ python examples/jax_backend.py                    # requires [jax]
 python examples/visualize_expression.py graph.png # requires [visualization]
 ```
 
-The advanced [`demo/cirkit.py`](https://github.com/ti2-group/extended_einsum/blob/main/demo/cirkit.py) integration is also standalone, but requires the repository demo dependencies and currently Python 3.12 or 3.13 because of Cirkit's SciPy constraint. Its defaults use a small synthetic circuit; training and benchmark sweeps are opt-in. Generated benchmark data and plots are repository artifacts and are never included in distributions.
+The advanced [`demo/cirkit.py`](https://github.com/ti2-group/extended_einsum/blob/main/demo/cirkit.py) integration is also standalone, but requires the repository demo dependencies and currently Python 3.12 or 3.13 because of Cirkit's SciPy constraint. Its defaults use a small synthetic circuit; training and benchmark sweeps are opt-in. Besides the fixed `quad-tree-2` and `quad-graph` region graphs, `--region-graph chow-liu-tree` builds a Hidden Chow-Liu Tree circuit whose structure is learned from the training data (binned with `--clt-bins` and cached on disk). Generated benchmark data and plots are repository artifacts and are never included in distributions.
 
 ## Development
 

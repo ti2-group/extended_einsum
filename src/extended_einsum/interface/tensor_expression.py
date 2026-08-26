@@ -135,8 +135,8 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         raise NotImplementedError("Indexing is not yet implemented. This should produce a select, take, or slice operator.")
 
 
-def _compile_recursive(
-    tensor_expression: TensorExpression[TArray] | Parameter[TArray] | TArray,
+def _compile_expression_graph(
+    root: TensorExpression[TArray] | Parameter[TArray] | TArray,
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[RichInstruction],
@@ -145,11 +145,8 @@ def _compile_recursive(
     shapes: dict[int, Shape],
     tensor_formats: dict[int, TensorFormat],
 ) -> int:
-    # get a unique key for this expression
-    expression_key = id(tensor_expression)
-
-    # if the expression is a tensor, just add it to the inputs
-    if not isinstance(tensor_expression, TensorExpression):
+    def register_input(tensor_expression: Parameter[TArray] | TArray) -> int:
+        expression_key = id(tensor_expression)
         # if we already found this input, return its SSA-ID
         if expression_key in input_ssa_ids:
             return input_ssa_ids[expression_key]
@@ -166,31 +163,42 @@ def _compile_recursive(
         tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
         return input_ssa_ids[expression_key]
 
-    # if we have already seen this expression, return its SSA-ID
-    if expression_key in ssa_ids:
-        return ssa_ids[expression_key]
+    # Iterative post-order traversal with an explicit stack. Expression graphs
+    # can be arbitrarily deep (e.g. learned tree-structured circuits), so a
+    # recursive walk would exhaust Python's recursion limit.
+    stack: list[tuple[TensorExpression[TArray] | Parameter[TArray] | TArray, bool]] = [(root, False)]
+    while stack:
+        tensor_expression, arguments_compiled = stack.pop()
 
-    # recursively compile the children
-    argument_ssa_ids = tuple(
-        _compile_recursive(
-            argument,
-            ssa_ids,
-            input_ssa_ids,
-            instructions,
-            input_tensors,  # pyright: ignore[reportArgumentType]
-            parameter_positions,
-            shapes,
-            tensor_formats,
-        )
-        for argument in tensor_expression.arguments
-    )
+        if not isinstance(tensor_expression, TensorExpression):
+            register_input(tensor_expression)
+            continue
 
-    # add the instruction to the program
-    ssa_ids[expression_key] = len(ssa_ids)
-    instructions.append(RichInstruction(tensor_expression.operator, argument_ssa_ids))
-    shapes[ssa_ids[expression_key]] = tensor_expression.shape
-    tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
-    return ssa_ids[expression_key]
+        expression_key = id(tensor_expression)
+        # if we have already seen this expression, its instruction exists
+        if expression_key in ssa_ids:
+            continue
+
+        if not arguments_compiled:
+            # revisit this expression once all of its arguments are compiled
+            stack.append((tensor_expression, True))
+            # push the arguments in reverse so they are compiled left to right,
+            # preserving the SSA numbering of the recursive formulation
+            for argument in reversed(tensor_expression.arguments):
+                stack.append((argument, False))
+            continue
+
+        argument_ssa_ids = tuple(ssa_ids[id(argument)] if isinstance(argument, TensorExpression) else input_ssa_ids[id(argument)] for argument in tensor_expression.arguments)
+
+        # add the instruction to the program
+        ssa_ids[expression_key] = len(ssa_ids)
+        instructions.append(RichInstruction(tensor_expression.operator, argument_ssa_ids))
+        shapes[ssa_ids[expression_key]] = tensor_expression.shape
+        tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
+
+    if isinstance(root, TensorExpression):
+        return ssa_ids[id(root)]
+    return input_ssa_ids[id(root)]
 
 
 def extract_program(
@@ -219,7 +227,7 @@ def extract_program(
     parameter_positions: list[int] = []
     shapes: dict[int, Shape] = {}
     tensor_formats: dict[int, TensorFormat] = {}
-    _compile_recursive(
+    _compile_expression_graph(
         tensor_expression,
         ssa_ids,
         input_ssa_ids,

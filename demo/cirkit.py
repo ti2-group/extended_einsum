@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import gc
 import itertools
 import random
@@ -19,11 +20,15 @@ _THIS_DIR = str(Path(__file__).resolve().parent)
 if sys.path and Path(sys.path[0]).resolve() == Path(_THIS_DIR):
     sys.path.pop(0)
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from cirkit.pipeline import PipelineContext
 from cirkit.symbolic.layers import HadamardLayer, InputLayer, KroneckerLayer, SumLayer
+from cirkit.symbolic.parameters import mixing_weight_factory
 from cirkit.templates import data_modalities, utils
+from cirkit.templates.region_graph import ChowLiuTree
+from cirkit.templates.region_graph.algorithms.utils import tree2rg
 from torch import optim
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -42,6 +47,11 @@ DEFAULT_BATCH_SIZE = 256
 DEFAULT_EPOCHS = 1
 DEFAULT_NUM_SAMPLES = 0
 DEFAULT_PIXEL_VALUES = 256
+DEFAULT_CLT_BINS = 8
+DEFAULT_CLT_SYNTHETIC_SAMPLES = 1024
+# Chunked mutual-information counting keeps the temporary joint-value tensor
+# (variables x variables x chunk) around 1 GiB for MNIST-sized inputs.
+CLT_CHUNK_SIZE = 256
 EINSUM_SYMBOLS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CSV_FIELDS = (
     "timestamp",
@@ -62,6 +72,7 @@ CSV_FIELDS = (
     "num_samples",
     "dataset",
     "region_graph",
+    "clt_bins",
     "sum_product_layer",
     "semiring",
     "backend_type",
@@ -70,6 +81,7 @@ CSV_FIELDS = (
     "warmup_steps",
     "warmup_epochs",
     "setup_ms",
+    "structure_learning_ms",
     "warmup_ms",
     "epoch_total_ms",
     "data_loading_ms",
@@ -94,6 +106,57 @@ CSV_FIELDS = (
 )
 
 
+def learn_clt_tree(data: torch.Tensor, *, pixel_values: int, num_bins: int) -> np.ndarray:
+    """Learns a Chow-Liu tree from integer data and returns it as a predecessor array.
+
+    Cirkit's own ``num_bins`` option sizes the joint-count tensor with the
+    original category count (322 GB for MNIST), so the data is binned here
+    before handing it to ``ChowLiuTree``.
+    """
+    if data.ndim != 2 or data.shape[0] < 2:
+        raise ValueError("Chow-Liu structure learning requires at least two data samples (with --dataset synthetic, pass --num-samples).")
+    if num_bins < pixel_values:
+        data = torch.div(data, pixel_values // num_bins, rounding_mode="floor")
+    tree = ChowLiuTree(
+        data=data.cpu(),
+        input_type="categorical",
+        num_categories=min(num_bins, pixel_values),
+        chunk_size=CLT_CHUNK_SIZE,
+        as_region_graph=False,
+    )
+    return np.asarray(tree, dtype=np.int64)
+
+
+def clt_tree_cache_path(
+    data_dir: str,
+    *,
+    dataset: str,
+    num_variables: int,
+    pixel_values: int,
+    num_bins: int,
+    num_samples: int,
+    seed: int,
+) -> Path:
+    suffix = f"seed{seed}" if dataset == "synthetic" else "data"
+    return Path(data_dir) / "hclt_trees" / f"{dataset}_{num_variables}v_{pixel_values}p_{num_bins}b_{num_samples}n_{suffix}.npy"
+
+
+def load_or_learn_clt_tree(
+    data: torch.Tensor,
+    *,
+    pixel_values: int,
+    num_bins: int,
+    cache_path: Path | None = None,
+) -> np.ndarray:
+    if cache_path is not None and cache_path.exists():
+        return np.load(cache_path)
+    tree = learn_clt_tree(data, pixel_values=pixel_values, num_bins=num_bins)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, tree)
+    return tree
+
+
 def make_symbolic_circuit(
     *,
     width: int,
@@ -101,7 +164,25 @@ def make_symbolic_circuit(
     num_units: int,
     sum_product_layer: str,
     region_graph: str = "quad-tree-2",
+    pixel_values: int = DEFAULT_PIXEL_VALUES,
+    clt_tree: np.ndarray | None = None,
 ):
+    if region_graph == "chow-liu-tree":
+        if clt_tree is None:
+            raise ValueError("region_graph='chow-liu-tree' requires a learned tree; pass clt_tree (see learn_clt_tree).")
+        if len(clt_tree) != width * height:
+            raise ValueError(f"The Chow-Liu tree covers {len(clt_tree)} variables, but width*height is {width * height}.")
+        sum_weight_factory = utils.parameterization_to_factory(utils.Parameterization(activation="softmax", initialization="normal"))
+        return tree2rg(clt_tree).build_circuit(
+            input_factory=utils.name_to_input_layer_factory("categorical", num_categories=pixel_values),
+            sum_product=sum_product_layer,
+            sum_weight_factory=sum_weight_factory,
+            nary_sum_weight_factory=functools.partial(mixing_weight_factory, param_factory=sum_weight_factory),
+            num_input_units=num_units,
+            num_sum_units=num_units,
+            num_classes=1,
+            factorize_multivariate=True,
+        )
     return data_modalities.image_data(
         (1, width, height),
         region_graph=region_graph,
@@ -131,20 +212,25 @@ def generate_symbols(count: int) -> str:
 def to_xe_expression(symbolic_circuit, layer, data_by_scope, expression_by_layer=None):
     if expression_by_layer is None:
         expression_by_layer = {}
-    if layer in expression_by_layer:
-        return expression_by_layer[layer]
 
-    children = symbolic_circuit.layer_inputs(layer)
-    child_nodes = [
-        to_xe_expression(
-            symbolic_circuit,
-            child,
-            data_by_scope,
-            expression_by_layer,
-        )
-        for child in children
-    ]
+    # Iterative post-order traversal: learned tree circuits (e.g. HCLTs) can be
+    # deeper than Python's recursion limit.
+    stack = [(layer, False)]
+    while stack:
+        current, children_translated = stack.pop()
+        if current in expression_by_layer:
+            continue
+        children = symbolic_circuit.layer_inputs(current)
+        if not children_translated:
+            stack.append((current, True))
+            stack.extend((child, False) for child in reversed(children))
+            continue
+        child_nodes = [expression_by_layer[child] for child in children]
+        expression_by_layer[current] = _translate_layer(current, children, child_nodes, data_by_scope)
+    return expression_by_layer[layer]
 
+
+def _translate_layer(layer, children, child_nodes, data_by_scope):
     if not children:
         scope_id = get_scope_id(layer.scope)
         result = xe.select(data_by_scope, scope_id)
@@ -183,7 +269,6 @@ def to_xe_expression(symbolic_circuit, layer, data_by_scope, expression_by_layer
     else:
         raise NotImplementedError(f"Unsupported Cirkit layer: {layer!r}")
 
-    expression_by_layer[layer] = result
     return result
 
 
@@ -446,6 +531,66 @@ def torch_program_runner(program: RichProgram, *, use_make_fx: bool, device: tor
     return run_graph
 
 
+def prepare_training_circuit(
+    *,
+    width: int,
+    height: int,
+    num_units: int,
+    sum_product_layer: str,
+    region_graph: str,
+    device: torch.device,
+    dataset: str,
+    data_dir: str,
+    num_samples: int,
+    pixel_values: int,
+    clt_bins: int,
+    seed: int,
+):
+    """Loads the training data and builds the symbolic circuit.
+
+    The data is loaded first because the chow-liu-tree region graph learns its
+    structure from it (cached under ``data_dir``).
+    """
+    num_variables = width * height
+    train_images = load_train_images(
+        dataset=dataset,
+        device=device,
+        data_dir=data_dir,
+        num_samples=num_samples,
+        num_variables=num_variables,
+        pixel_values=pixel_values,
+    )
+    clt_tree = None
+    structure_learning_ms = 0.0
+    if region_graph == "chow-liu-tree":
+        structure_learning_start = time.perf_counter()
+        clt_tree = load_or_learn_clt_tree(
+            train_images,
+            pixel_values=pixel_values,
+            num_bins=clt_bins,
+            cache_path=clt_tree_cache_path(
+                data_dir,
+                dataset=dataset,
+                num_variables=num_variables,
+                pixel_values=pixel_values,
+                num_bins=clt_bins,
+                num_samples=num_samples,
+                seed=seed,
+            ),
+        )
+        structure_learning_ms = (time.perf_counter() - structure_learning_start) * 1000.0
+    symbolic_circuit = make_symbolic_circuit(
+        width=width,
+        height=height,
+        num_units=num_units,
+        sum_product_layer=sum_product_layer,
+        region_graph=region_graph,
+        pixel_values=pixel_values,
+        clt_tree=clt_tree,
+    )
+    return symbolic_circuit, train_images, {"structure_learning_ms": structure_learning_ms}
+
+
 def setup_xe_training(
     *,
     width: int,
@@ -459,16 +604,25 @@ def setup_xe_training(
     data_dir: str,
     num_samples: int,
     pixel_values: int,
+    clt_bins: int,
+    seed: int,
     use_torch_compile: bool,
     semiring: str,
     lr: float,
 ):
-    symbolic_circuit = make_symbolic_circuit(
+    symbolic_circuit, train_images, setup_stats = prepare_training_circuit(
         width=width,
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
         region_graph=region_graph,
+        device=device,
+        dataset=dataset,
+        data_dir=data_dir,
+        num_samples=num_samples,
+        pixel_values=pixel_values,
+        clt_bins=clt_bins,
+        seed=seed,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,
@@ -484,14 +638,6 @@ def setup_xe_training(
     categorical_units = input_shape[-1]
     data_axis_order = folded.input_axis0_orders.get(0, tuple(range(num_variables)))
     data_axis_order_tensor = torch.tensor(data_axis_order, dtype=torch.long, device=device)
-    train_images = load_train_images(
-        dataset=dataset,
-        device=device,
-        data_dir=data_dir,
-        num_samples=num_samples,
-        num_variables=num_variables,
-        pixel_values=pixel_values,
-    )
     train_images = train_images.index_select(1, data_axis_order_tensor)
     categorical_logits = torch.nn.Parameter(
         torch.normal(
@@ -552,7 +698,7 @@ def setup_xe_training(
         step = torch.compile(step, mode="reduce-overhead" if device.type == "cuda" else None)
 
     optimizer = make_optimizer((categorical_logits, *parameter_inputs.values(), *packed_parameter_inputs), device, lr)
-    return step, optimizer, train_images, runtime_program
+    return step, optimizer, train_images, runtime_program, setup_stats
 
 
 def input_shape_tuple(value: object) -> tuple[int, ...]:
@@ -574,15 +720,24 @@ def setup_cirkit_training(
     data_dir: str,
     num_samples: int,
     pixel_values: int,
+    clt_bins: int,
+    seed: int,
     use_torch_compile: bool,
     lr: float,
 ):
-    symbolic_circuit = make_symbolic_circuit(
+    symbolic_circuit, train_images, setup_stats = prepare_training_circuit(
         width=width,
         height=height,
         num_units=num_units,
         sum_product_layer=sum_product_layer,
         region_graph=region_graph,
+        device=device,
+        dataset=dataset,
+        data_dir=data_dir,
+        num_samples=num_samples,
+        pixel_values=pixel_values,
+        clt_bins=clt_bins,
+        seed=seed,
     )
     ctx = PipelineContext(
         backend="torch",
@@ -594,21 +749,13 @@ def setup_cirkit_training(
     if use_torch_compile:
         circuit = torch.compile(circuit)
 
-    train_images = load_train_images(
-        dataset=dataset,
-        device=device,
-        data_dir=data_dir,
-        num_samples=num_samples,
-        num_variables=width * height,
-        pixel_values=pixel_values,
-    )
     optimizer = make_optimizer(circuit.parameters(), device, lr)
 
     def step(batch: torch.Tensor) -> torch.Tensor:
         log_likelihoods = circuit(batch)
         return -torch.mean(log_likelihoods)
 
-    return step, optimizer, train_images, None
+    return step, optimizer, train_images, None, setup_stats
 
 
 def run_warmup(
@@ -797,6 +944,7 @@ def base_row(
         "num_samples": args.num_samples,
         "dataset": args.dataset,
         "region_graph": args.region_graph,
+        "clt_bins": args.clt_bins if args.region_graph == "chow-liu-tree" else "",
         "sum_product_layer": args.sum_product_layer,
         "semiring": args.semiring,
         "backend_type": "cirkit" if backend.startswith("cirkit") else "xe",
@@ -832,13 +980,15 @@ def run_training_config(
         "data_dir": args.data_dir,
         "num_samples": args.num_samples,
         "pixel_values": args.pixel_values,
+        "clt_bins": args.clt_bins,
+        "seed": args.seed,
         "use_torch_compile": args.torch_compile,
         "lr": args.lr,
     }
     if backend == "xe":
         setup_kwargs["batch_size"] = batch_size
         setup_kwargs["semiring"] = args.semiring
-    step, optimizer, train_images, _program = setup_fn(**setup_kwargs)
+    step, optimizer, train_images, _program, setup_stats = setup_fn(**setup_kwargs)
     setup_ms = elapsed_wall_ms(setup_start, device)
     warmup_ms = run_warmup(
         step,
@@ -874,6 +1024,7 @@ def run_training_config(
             {
                 "status": "ok",
                 "setup_ms": setup_ms if epoch == 0 else 0.0,
+                "structure_learning_ms": setup_stats["structure_learning_ms"] if epoch == 0 else 0.0,
                 "warmup_ms": warmup_ms if epoch == 0 else 0.0,
             }
         )
@@ -956,7 +1107,14 @@ def parse_args() -> argparse.Namespace:
         help="Batch size, or comma-separated sizes for a training sweep.",
     )
     parser.add_argument("--sum-product-layer", choices=("cp", "tucker"), default="cp")
-    parser.add_argument("--region-graph", choices=("quad-tree-2", "quad-graph"), default="quad-tree-2")
+    parser.add_argument("--region-graph", choices=("quad-tree-2", "quad-graph", "chow-liu-tree"), default="quad-tree-2")
+    parser.add_argument(
+        "--clt-bins",
+        type=int,
+        default=DEFAULT_CLT_BINS,
+        metavar="N",
+        help="Number of bins the pixel values are rescaled into for Chow-Liu structure learning (chow-liu-tree only).",
+    )
     parser.add_argument(
         "--semiring",
         choices=("scaled-max", "lse-sum"),
@@ -1041,12 +1199,23 @@ def main() -> None:
     num_units = args.unit_sizes[0]
     batch_size = args.batch_sizes[0]
 
+    clt_tree = None
+    if args.region_graph == "chow-liu-tree":
+        # The inspection path has no training data, so learn the structure
+        # from seeded synthetic samples; only the tree's shape matters here.
+        set_seed(args.seed)
+        num_structure_samples = args.num_samples or DEFAULT_CLT_SYNTHETIC_SAMPLES
+        structure_samples = torch.randint(args.pixel_values, size=(num_structure_samples, args.width * args.height))
+        clt_tree = learn_clt_tree(structure_samples, pixel_values=args.pixel_values, num_bins=args.clt_bins)
+
     symbolic_circuit = make_symbolic_circuit(
         width=args.width,
         height=args.height,
         num_units=num_units,
         sum_product_layer=args.sum_product_layer,
         region_graph=args.region_graph,
+        pixel_values=args.pixel_values,
+        clt_tree=clt_tree,
     )
     program, inputs = translate_cirkit_to_xe(
         symbolic_circuit,

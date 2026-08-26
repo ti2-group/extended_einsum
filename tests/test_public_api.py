@@ -65,3 +65,32 @@ def test_missing_jax_backend_has_actionable_error(monkeypatch: pytest.MonkeyPatc
         registry.get_backend_functions("jax")
     with pytest.raises(ModuleNotFoundError, match=r"extended-einsum\[jax\]"):
         registry.get_backend_compiler("jax")
+
+
+def test_extract_program_handles_expressions_deeper_than_the_recursion_limit() -> None:
+    # Learned tree-structured circuits (e.g. HCLTs) produce expression graphs
+    # far deeper than Python's default recursion limit.
+    depth = 5_000
+    source = xe.array(np.array([1.0, 2.0]))
+    expression = xe.exp(source)
+    for _ in range(depth - 1):
+        expression = xe.exp(expression)
+
+    program, inputs = xe.extract_program(expression, stability_mode="unstable")
+
+    assert len(program.instructions) == depth
+    assert program.n_inputs == 1
+    assert len(inputs) == 1
+
+
+def test_materialize_handles_expressions_deeper_than_the_recursion_limit() -> None:
+    depth = 2_048
+    source_numpy = np.ones((2, 2))
+    source = xe.array(source_numpy)
+    expression = xe.log(xe.exp(source))
+    for _ in range(depth):
+        expression = expression * source
+
+    result = expression.materialize()
+
+    np.testing.assert_allclose(result.backend_array, source_numpy)

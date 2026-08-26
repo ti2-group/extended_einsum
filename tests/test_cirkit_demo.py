@@ -1,10 +1,12 @@
 import csv
 from collections import Counter
 
+import numpy as np
 import pytest
+import torch
 from cirkit.symbolic.layers import SumLayer
 
-from demo.cirkit import append_row, make_symbolic_circuit, preprocess_xe_program, translate_cirkit_to_xe
+from demo.cirkit import append_row, learn_clt_tree, load_or_learn_clt_tree, make_symbolic_circuit, preprocess_xe_program, translate_cirkit_to_xe
 
 
 def test_tucker_sum_weights_use_output_first_layout_and_normalize_all_inputs() -> None:
@@ -84,3 +86,98 @@ def test_append_row_keeps_an_existing_legacy_csv_schema(tmp_path) -> None:
     with output.open(newline="") as output_file:
         rows = list(csv.reader(output_file))
     assert rows == [["backend", "status"], ["xe-lse-sum", "ok"]]
+
+
+def _correlated_synthetic_data(num_variables: int, num_categories: int, num_samples: int = 400) -> "torch.Tensor":
+    torch.manual_seed(0)
+    base = torch.randint(num_categories, size=(num_samples, 1))
+    noise = torch.randint(2, size=(num_samples, num_variables))
+    return (base + noise.cumsum(dim=1)) % num_categories
+
+
+def test_learn_clt_tree_bins_data_and_returns_a_rooted_tree() -> None:
+    # 256 pixel values with 8 bins exercises the pre-binning workaround for
+    # Cirkit's num_bins path, which allocates counts for the unbinned categories.
+    data = _correlated_synthetic_data(num_variables=12, num_categories=256)
+
+    tree = learn_clt_tree(data, pixel_values=256, num_bins=8)
+
+    assert tree.shape == (12,)
+    assert (tree == -1).sum() == 1
+    assert all(-1 <= parent < 12 for parent in tree)
+
+
+def test_learn_clt_tree_rejects_insufficient_samples() -> None:
+    with pytest.raises(ValueError, match="at least two"):
+        learn_clt_tree(torch.zeros((0, 12), dtype=torch.long), pixel_values=4, num_bins=4)
+
+
+def test_load_or_learn_clt_tree_reuses_the_cached_tree(tmp_path) -> None:
+    data = _correlated_synthetic_data(num_variables=8, num_categories=4)
+    cache_path = tmp_path / "hclt_trees" / "tree.npy"
+
+    tree = load_or_learn_clt_tree(data, pixel_values=4, num_bins=4, cache_path=cache_path)
+    cached = load_or_learn_clt_tree(torch.zeros((0, 8), dtype=torch.long), pixel_values=4, num_bins=4, cache_path=cache_path)
+
+    assert cache_path.exists()
+    assert (tree == cached).all()
+
+
+@pytest.mark.parametrize("sum_product_layer", ["cp", "tucker"])
+@pytest.mark.parametrize("stability_mode", ["logspace_max", "scaled_sum"])
+def test_chow_liu_tree_circuit_translates_without_mixing_layers(sum_product_layer: str, stability_mode: str) -> None:
+    data = _correlated_synthetic_data(num_variables=12, num_categories=4)
+    tree = learn_clt_tree(data, pixel_values=4, num_bins=4)
+    circuit = make_symbolic_circuit(
+        width=3,
+        height=4,
+        num_units=3,
+        sum_product_layer=sum_product_layer,
+        region_graph="chow-liu-tree",
+        pixel_values=4,
+        clt_tree=tree,
+    )
+
+    program, _inputs = translate_cirkit_to_xe(circuit, batch_size=2, stability=stability_mode)
+    folded = preprocess_xe_program(program, optimize_stacking=True)
+
+    # Tree region graphs have one partition per region, so no mixing layers
+    # appear and every symbolic sum layer is translated exactly once.
+    num_sum_layers = sum(isinstance(layer, SumLayer) for layer in circuit.layers)
+    assert program.n_inputs == num_sum_layers + 1
+    assert not any(instruction.operator.name == "stack" for instruction in program.instructions)
+    assert any(instruction.operator.name == "einsum" for instruction in folded.instructions)
+
+
+def test_chow_liu_tree_translation_handles_trees_deeper_than_the_recursion_limit() -> None:
+    # A path-shaped tree maximizes depth: with 500 variables the layer graph is
+    # far deeper than Python's default recursion limit.
+    num_variables = 500
+    tree = np.arange(-1, num_variables - 1)
+    circuit = make_symbolic_circuit(
+        width=num_variables,
+        height=1,
+        num_units=2,
+        sum_product_layer="cp",
+        region_graph="chow-liu-tree",
+        pixel_values=4,
+        clt_tree=tree,
+    )
+
+    program, _inputs = translate_cirkit_to_xe(circuit, batch_size=2, stability="logspace_max")
+
+    assert sum(instruction.operator.name == "select" for instruction in program.instructions) == num_variables
+
+
+def test_make_symbolic_circuit_requires_a_learned_tree_for_chow_liu() -> None:
+    with pytest.raises(ValueError, match="clt_tree"):
+        make_symbolic_circuit(width=2, height=2, num_units=2, sum_product_layer="cp", region_graph="chow-liu-tree")
+    with pytest.raises(ValueError, match="4"):
+        make_symbolic_circuit(
+            width=2,
+            height=2,
+            num_units=2,
+            sum_product_layer="cp",
+            region_graph="chow-liu-tree",
+            clt_tree=np.array([-1, 0]),
+        )
