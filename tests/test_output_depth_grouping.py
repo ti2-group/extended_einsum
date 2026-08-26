@@ -20,6 +20,7 @@ from extended_einsum.language.rich_operators import (
 )
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.preprocess import (
+    AnnotateShortSameIndexContractions,
     FoldSameShapedOperations,
     OptimizeContractionPaths,
     extract_connected_einsum_components,
@@ -1067,6 +1068,65 @@ class OptimizeContractionPathsTests(unittest.TestCase):
 
         self.assertEqual(compute_path.call_count, 8)
         self.assertEqual(optimized, program)
+
+
+class AnnotateShortSameIndexContractionsTests(unittest.TestCase):
+    def test_marks_short_weighted_reduction_without_splitting_instruction(self) -> None:
+        program = RichProgram(
+            instructions=[_einsum_instruction("abc,ac->ab", 0, 1)],
+            n_inputs=2,
+            stability_mode="scaled_max",
+            shapes=[(2, 3, 4), (2, 4), (2, 3)],
+            tensor_formats=["dense"] * 3,
+            parameter_indices=frozenset({1}),
+        )
+
+        annotated = AnnotateShortSameIndexContractions.apply(program)
+
+        self.assertEqual(len(annotated.instructions), 1)
+        operator = annotated.instructions[0].operator
+        self.assertIsInstance(operator, OperatorEinsum)
+        assert isinstance(operator, OperatorEinsum)
+        self.assertEqual(operator.short_contraction_labels, ("c",))
+        self.assertEqual(operator.raw_extra_arguments, ("abc,ac->ab",))
+        self.assertEqual(annotated.shapes, program.shapes)
+
+    def test_does_not_mark_long_weighted_reduction(self) -> None:
+        program = RichProgram(
+            instructions=[_einsum_instruction("abc,ac->ab", 0, 1)],
+            n_inputs=2,
+            stability_mode="scaled_max",
+            shapes=[(2, 3, 5), (2, 5), (2, 3)],
+            tensor_formats=["dense"] * 3,
+            parameter_indices=frozenset({1}),
+        )
+
+        self.assertIs(AnnotateShortSameIndexContractions.apply(program), program)
+
+    def test_annotated_contraction_preserves_stable_results(self) -> None:
+        data = torch.rand((2, 3, 4)) + 0.5
+        weights = torch.rand((2, 4)) + 0.5
+        expected = torch.einsum("abc,ac->ab", data, weights)
+
+        for stability_mode in ("scaled_max", "logspace_max"):
+            with self.subTest(stability_mode=stability_mode):
+                program = RichProgram(
+                    instructions=[_einsum_instruction("abc,ac->ab", 0, 1)],
+                    n_inputs=2,
+                    stability_mode=stability_mode,
+                    shapes=[(2, 3, 4), (2, 4), (2, 3)],
+                    tensor_formats=["dense"] * 3,
+                    parameter_indices=frozenset({1}),
+                )
+                annotated = AnnotateShortSameIndexContractions.apply(program)
+                backend_program = translate_to_backend_program(
+                    annotated,
+                    TorchBackendFunctions(),
+                )
+
+                actual = run_program(backend_program, [data, weights])
+
+                torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

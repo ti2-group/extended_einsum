@@ -1224,6 +1224,114 @@ class OptimizeContractionPaths(PreprocessingRoutine):
         )
 
 
+def _short_same_index_contraction_labels(
+    input_strings: list[str],
+    output_string: str,
+    input_shapes: tuple[Shape, ...],
+    parameter_derived: tuple[bool, ...],
+) -> tuple[str, ...] | None:
+    """Identify a short weighted reduction that should not become a GEMV."""
+
+    if (
+        len(input_strings) != 2
+        or len(input_shapes) != 2
+        or parameter_derived.count(True) != 1
+        or any(len(set(input_string)) != len(input_string) for input_string in input_strings)
+    ):
+        return None
+    input_label_sets = tuple(set(input_string) for input_string in input_strings)
+    if not (
+        input_label_sets[0] <= input_label_sets[1]
+        or input_label_sets[1] <= input_label_sets[0]
+    ):
+        return None
+    superset_index = 0 if input_label_sets[1] <= input_label_sets[0] else 1
+    subset_index = 1 - superset_index
+    contracted_labels = tuple(
+        label
+        for label in input_strings[superset_index]
+        if label not in output_string
+    )
+    if not contracted_labels or any(
+        label not in input_label_sets[subset_index]
+        for label in contracted_labels
+    ):
+        return None
+    label_sizes: dict[str, int] = {}
+    for input_string, input_shape in zip(input_strings, input_shapes, strict=True):
+        label_sizes.update(zip(input_string, input_shape, strict=True))
+    contracted_size = 1
+    for label in contracted_labels:
+        contracted_size *= label_sizes[label]
+    return contracted_labels if contracted_size <= 4 else None
+
+
+class AnnotateShortSameIndexContractions(PreprocessingRoutine):
+    """Mark short weighted contractions for fused backend decomposition.
+
+    The optimization decision belongs to the compiler pipeline, but the
+    operation remains one IR instruction so numerical-stability lowering does
+    not introduce a representation boundary between product and reduction.
+    Run this after contraction-path selection.
+    """
+
+    @override
+    @staticmethod
+    def apply(program: RichProgram) -> RichProgram:
+        parameter_derived = set(program.parameter_indices)
+        for op_index, instruction in enumerate(program.instructions):
+            if instruction.argument_ssa_ids and all(
+                argument in parameter_derived
+                for argument in instruction.argument_ssa_ids
+            ):
+                parameter_derived.add(program.n_inputs + op_index)
+
+        instructions: list[RichInstruction] = []
+        changed = False
+
+        for instruction in program.instructions:
+            contracted_labels: tuple[str, ...] | None = None
+            if isinstance(instruction.operator, OperatorEinsum):
+                input_strings, output_string = parse_format_string(
+                    instruction.operator.format_string
+                )
+                contracted_labels = _short_same_index_contraction_labels(
+                    input_strings,
+                    output_string,
+                    tuple(program.shapes[argument] for argument in instruction.argument_ssa_ids),
+                    tuple(
+                        argument in parameter_derived
+                        for argument in instruction.argument_ssa_ids
+                    ),
+                )
+
+            if contracted_labels is None:
+                instructions.append(instruction)
+                continue
+
+            changed = True
+            instructions.append(
+                replace(
+                    instruction,
+                    operator=replace(
+                        instruction.operator,
+                        short_contraction_labels=contracted_labels,
+                    ),
+                )
+            )
+
+        if not changed:
+            return program
+        return RichProgram(
+            instructions=instructions,
+            n_inputs=program.n_inputs,
+            stability_mode=program.stability_mode,
+            shapes=program.shapes,
+            tensor_formats=program.tensor_formats,
+            parameter_indices=program.parameter_indices,
+        )
+
+
 def _ssa_depths_from_inputs(program: RichProgram) -> dict[int, int]:
     depths = {input_id: 0 for input_id in range(program.n_inputs)}
     for op_index, instruction in enumerate(program.instructions):

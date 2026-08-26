@@ -372,6 +372,7 @@ def _append_scaled_einsum(
     result_ssa_id: int,
     stability_mode: Literal["scaled_min", "scaled_max", "scaled_sum"],
     parameter_derived_ssa_ids: frozenset[int],
+    short_contraction_labels: tuple[str, ...],
     *,
     normalize_output: bool,
 ) -> None:
@@ -446,9 +447,40 @@ def _append_scaled_einsum(
         scale_shapes[result_ssa_id] = result_scale_shape
         return
 
-    # Paper "Scaled evaluation": contract normalized data with the unchanged
-    # linear weights using an ordinary dense backend einsum.
-    raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
+    # Paper "Scaled evaluation": contract normalized data with unchanged
+    # linear weights. The compiler marks very short same-index contractions;
+    # expose those as multiply/reduce in backend IR instead of tiny GEMVs.
+    if not short_contraction_labels:
+        raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(einsum_argument_positions))
+    else:
+        expanded_string = output_string + "".join(short_contraction_labels)
+        aligned_positions = tuple(
+            builder.wrap_and_append(
+                partial(
+                    _broadcast_einsum_operand,
+                    backend_functions,
+                    input_string,
+                    expanded_string,
+                ),
+                (argument_position,),
+            )
+            for input_string, argument_position in zip(
+                input_strings,
+                einsum_argument_positions,
+                strict=True,
+            )
+        )
+        product_position = builder.wrap_and_append(
+            backend_functions.multiply,
+            aligned_positions,
+        )
+        raw_einsum_position = builder.wrap_and_append(
+            partial(
+                backend_functions.sum,
+                axis=tuple(range(len(output_string), len(expanded_string))),
+            ),
+            (product_position,),
+        )
     log_scale_position: int | None
     if normalize_output:
         match stability_mode:
@@ -696,7 +728,7 @@ def _append_scaled_instruction(
                 else:
                     value_axis = normalize_axis(axis, len(value_shapes[result_ssa_id]))
                     scale_shapes[result_ssa_id] = (*source_scale_shape[:scale_axis], value_shapes[result_ssa_id][value_axis], *source_scale_shape[scale_axis + 1 :])
-        case OperatorEinsum(format_string):
+        case OperatorEinsum(format_string, short_contraction_labels):
             _append_scaled_einsum(
                 builder,
                 backend_functions,
@@ -708,6 +740,7 @@ def _append_scaled_instruction(
                 result_ssa_id,
                 stability_mode,
                 parameter_derived_ssa_ids,
+                short_contraction_labels,
                 normalize_output=normalize_einsum_output,
             )
         case _:
@@ -819,63 +852,6 @@ def _broadcast_einsum_operand(backend_functions: BackendFunctions[TBackendArray]
     return backend_functions.reshape(operand, output_shape)
 
 
-def _short_same_index_contraction_labels(
-    input_strings: list[str],
-    output_string: str,
-    input_shapes: tuple[Shape, ...],
-    parameter_derived: tuple[bool, ...],
-) -> tuple[str, ...] | None:
-    """Identify small weighted reductions that should not become dense GEMVs.
-
-    If one binary operand's labels are a subset of the other's, the operation
-    has no all-to-all output mixing: it is a broadcasted elementwise product
-    followed by a reduction. Decomposition does not enlarge the superset
-    operand. Limit it to one linear parameter operand and at most four elements
-    in the contracted fiber, where dense dispatch overhead dominates.
-    """
-
-    if (
-        len(input_strings) != 2
-        or len(input_shapes) != 2
-        or parameter_derived.count(True) != 1
-        or any(len(set(input_string)) != len(input_string) for input_string in input_strings)
-    ):
-        return None
-    input_label_sets = tuple(set(input_string) for input_string in input_strings)
-    if not (
-        input_label_sets[0] <= input_label_sets[1]
-        or input_label_sets[1] <= input_label_sets[0]
-    ):
-        return None
-    superset_index = (
-        0 if input_label_sets[1] <= input_label_sets[0] else 1
-    )
-    subset_index = 1 - superset_index
-    contracted_labels = tuple(
-        label
-        for label in input_strings[superset_index]
-        if label not in output_string
-    )
-    if not contracted_labels or any(
-        label not in input_label_sets[subset_index]
-        for label in contracted_labels
-    ):
-        return None
-    label_sizes: dict[str, int] = {}
-    for input_string, input_shape in zip(
-        input_strings,
-        input_shapes,
-        strict=True,
-    ):
-        label_sizes.update(zip(input_string, input_shape, strict=True))
-    contracted_size = 1
-    for label in contracted_labels:
-        contracted_size *= label_sizes[label]
-    if contracted_size > 4:
-        return None
-    return contracted_labels
-
-
 def _append_logspace_einsum(
     builder: _ProgramBuilder[TBackendArray],
     backend_functions: BackendFunctions[TBackendArray],
@@ -885,7 +861,7 @@ def _append_logspace_einsum(
     result_ssa_id: int,
     stability_mode: Literal["logspace_min", "logspace_max"],
     parameter_derived_ssa_ids: frozenset[int],
-    value_shapes: list[Shape],
+    short_contraction_labels: tuple[str, ...],
 ) -> None:
     """Implement the paper's shifted log-space einsum formula.
 
@@ -951,16 +927,7 @@ def _append_logspace_einsum(
 
     # Central operation from paper "Log-space einsum": contract the shifted
     # positive operands with unchanged linear weights.
-    short_contraction_labels = _short_same_index_contraction_labels(
-        input_strings,
-        output_string,
-        tuple(value_shapes[argument] for argument in argument_ssa_ids),
-        tuple(
-            argument in parameter_derived_ssa_ids
-            for argument in argument_ssa_ids
-        ),
-    )
-    if short_contraction_labels is None:
+    if not short_contraction_labels:
         raw_einsum_position = builder.wrap_and_append(partial(backend_functions.einsum, format_string), tuple(raw_argument_positions))
     else:
         # This is an elementwise weighted reduction, not a dense contraction:
@@ -1070,7 +1037,7 @@ def _append_logspace_instruction(
             log_argument_position = _as_logspace_position(builder, backend_functions, positions, argument_ssa_ids[0])
             indices_position = _as_raw_position(builder, backend_functions, positions, argument_ssa_ids[1])
             positions[result_ssa_id, "logspace"] = builder.append(_operator_to_backend_call(instruction.operator, backend_functions), (log_argument_position, indices_position))
-        case OperatorEinsum(format_string):
-            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids, value_shapes)
+        case OperatorEinsum(format_string, short_contraction_labels):
+            _append_logspace_einsum(builder, backend_functions, positions, format_string, argument_ssa_ids, result_ssa_id, stability_mode, parameter_derived_ssa_ids, short_contraction_labels)
         case _:
             raise NotImplementedError(f"The operator {instruction.operator.name} has no logspace backend translation.")

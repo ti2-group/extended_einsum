@@ -36,7 +36,11 @@ from extended_einsum.backends.torch import TorchBackendFunctions
 from extended_einsum.interface.tensor_expression import Parameter
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import StabilityMode
-from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
+from extended_einsum.preprocess import (
+    AnnotateShortSameIndexContractions,
+    FoldSameShapedOperations,
+    OptimizeContractionPaths,
+)
 
 WIDTH = 4
 HEIGHT = 4
@@ -256,9 +260,11 @@ def preprocess_xe_program(
 
     # Paper compiler pipeline (sec:compiler-optimizations): first apply
     # "IR-Level Folding" plus the consumer ordering of sec:memory-layout, then
-    # merge nested einsums and choose pairwise paths (sec:contraction-path).
+    # merge nested einsums, choose pairwise paths (sec:contraction-path), and
+    # mark short weighted reductions for backend fusion.
     folded = FoldSameShapedOperations.apply(program)
-    return OptimizeContractionPaths.apply(folded)
+    path_optimized = OptimizeContractionPaths.apply(folded)
+    return AnnotateShortSameIndexContractions.apply(path_optimized)
 
 
 def input_shape(value: object) -> tuple[int, ...] | str:
@@ -584,10 +590,13 @@ def setup_xe_training(
         sum_product_layer=sum_product_layer,
         num_units=num_units,
     )
-    runtime_program = (
+    path_optimized_program = (
         # Paper sec:contraction-path: merge nested einsums and lower them to the
         # optimizer-selected pairwise schedule.
         OptimizeContractionPaths.apply(folded.program) if optimize_contraction_paths else folded.program
+    )
+    runtime_program = AnnotateShortSameIndexContractions.apply(
+        path_optimized_program
     )
     gather_index_orders = folded.gather_index_orders
     index_input_ids = frozenset(range(runtime_program.n_inputs - len(gather_index_orders), runtime_program.n_inputs))
