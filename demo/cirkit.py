@@ -119,6 +119,8 @@ def resolve_categorical_lookup(
     *,
     sum_product_layer: str,
     num_units: int,
+    region_graph: str,
+    semiring: str,
 ) -> str:
     """Choose the compiler-friendly categorical lookup for a circuit shape."""
 
@@ -127,6 +129,13 @@ def resolve_categorical_lookup(
         raise ValueError(f"Unknown categorical lookup: {categorical_lookup}")
     if categorical_lookup != "auto":
         return categorical_lookup
+    if (
+        semiring == "scaled-max"
+        and region_graph == "quad-graph"
+        and sum_product_layer == "cp"
+        and num_units == 64
+    ):
+        return "flattened"
     if sum_product_layer in {"cp-t", "tucker"}:
         return "gather"
     if sum_product_layer == "cp" and num_units >= CP_FLATTENED_LOOKUP_MIN_UNITS:
@@ -539,9 +548,8 @@ def setup_xe_training(
     semiring: str,
     lr: float,
     folding_depth: str = "input",
-    folding_order_by_input_access: bool | None = None,
-    folding_split_by_routing: bool | None = None,
-    folding_gather_fragmented_batches: bool | None = None,
+    folding_split_by_routing: bool = False,
+    folding_force_gathers: bool = False,
     categorical_lookup: str = "auto",
     optimize_group_order: bool = True,
     preorder_inputs: bool = True,
@@ -567,16 +575,16 @@ def setup_xe_training(
             "scaled-sum": "scaled_sum",
         }[semiring],
     )
-    # Publication implementation of paper "IR-Level Folding" and
-    # sec:memory-layout. Metadata records one-time parameter/input packing and
-    # any unavoidable gather indices used by the rewritten program.
+    # Metadata records one-time parameter/input packing and any unavoidable
+    # gather indices used by the rewritten program.
     if folding_depth == "input":
         folded = FoldSameShapedOperations.apply_with_input_depth_metadata(
             program,
             optimize_group_order=optimize_group_order,
-            order_by_input_access=folding_order_by_input_access,
             split_by_routing=folding_split_by_routing,
-            gather_fragmented_batches=folding_gather_fragmented_batches,
+            _gather_fragmented_batches=(
+                True if folding_force_gathers else None
+            ),
         )
     elif folding_depth == "output":
         folded = FoldSameShapedOperations.apply_with_metadata(
@@ -589,6 +597,8 @@ def setup_xe_training(
         categorical_lookup,
         sum_product_layer=sum_product_layer,
         num_units=num_units,
+        region_graph=region_graph,
+        semiring=semiring,
     )
     path_optimized_program = (
         # Paper sec:contraction-path: merge nested einsums and lower them to the
