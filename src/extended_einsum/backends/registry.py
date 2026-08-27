@@ -42,11 +42,11 @@ def register_backend(
         interpreted call by call.
     is_array : Callable[[object], bool] | None
         Optional predicate deciding whether an object is one of this backend's
-        arrays, used by ``extended_einsum.array`` to detect the backend of an
-        unwrapped array. Later-registered predicates take precedence, so a
-        custom backend whose arrays subclass a built-in array type still
-        detects correctly. Without a predicate, arrays must be wrapped with an
-        explicit ``backend=name`` argument.
+        arrays, used to detect the backend of raw arrays passed to expression
+        functions. Later-registered predicates take precedence, so a custom
+        backend whose arrays subclass a built-in array type still detects
+        correctly. Without a predicate, arrays must be wrapped with
+        ``TensorLeaf(array, backend=name)``.
     """
 
     if not name:
@@ -84,7 +84,7 @@ def get_backend_of_array(array: BackendArray) -> Backend:
     for name, is_array in reversed(BACKEND_TO_IS_ARRAY.items()):
         if is_array(array):
             return name
-    raise ValueError(f"Unsupported array type: {type(array)}. Wrap it with an explicit backend name via array(..., backend=...), or register its backend with an is_array predicate.")
+    raise ValueError(f"Unsupported array type: {type(array)}. Wrap it with an explicit backend name via TensorLeaf(..., backend=...), or register its backend with an is_array predicate.")
 
 
 def _unknown_backend_error(backend: Backend) -> Exception:

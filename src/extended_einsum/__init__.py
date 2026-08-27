@@ -7,7 +7,7 @@ from extended_einsum.backend_translation import translate_to_backend_program as 
 from extended_einsum.backends.registry import get_backend_functions as get_backend_functions
 from extended_einsum.backends.registry import register_backend as register_backend
 from extended_einsum.interface import TensorExpression as TensorExpression
-from extended_einsum.interface import array as array
+from extended_einsum.interface import TensorLeaf as TensorLeaf
 from extended_einsum.interface import cos as cos
 from extended_einsum.interface import einsum as einsum
 from extended_einsum.interface import exp as exp
@@ -40,8 +40,8 @@ __all__ = [
     "PreprocessingRoutine",
     "RichProgram",
     "TensorExpression",
+    "TensorLeaf",
     "__version__",
-    "array",
     "cos",
     "einsum",
     "exp",

@@ -92,12 +92,12 @@ register_backend("boxed", BoxedBackendFunctions(), is_array=_is_boxed_array)
 
 def test_custom_backend_is_detected_and_materializes_with_default_compiler() -> None:
     source_numpy = np.array([[1.0, 2.0], [3.0, 4.0]])
-    source = xe.array(BoxedArray(source_numpy))
-    assert source.backend == "boxed"
+    expression = xe.exp(BoxedArray(source_numpy))
+    assert expression.backend == "boxed"
 
-    result = xe.exp(source).materialize()
+    result = expression.materialize()
 
-    np.testing.assert_allclose(result.backend_array.data, np.exp(source_numpy))
+    np.testing.assert_allclose(result.data, np.exp(source_numpy))
 
 
 def test_custom_backend_passes_conformance_including_default_implementations() -> None:
@@ -116,8 +116,8 @@ def test_later_registered_detection_predicate_takes_precedence() -> None:
 
 
 def test_explicit_backend_name_overrides_detection() -> None:
-    wrapped = xe.array(np.array([1.0, 2.0]), backend="boxed")
-    assert wrapped.backend == "boxed"
+    leaf = xe.TensorLeaf(np.array([1.0, 2.0]), backend="boxed")
+    assert leaf.backend == "boxed"
 
 
 def test_incomplete_backend_functions_subclass_fails_at_instantiation() -> None:
@@ -154,4 +154,4 @@ def test_unknown_backend_name_has_actionable_error() -> None:
 
 def test_undetectable_array_type_has_actionable_error() -> None:
     with pytest.raises(ValueError, match="Unsupported array type"):
-        xe.array([1.0, 2.0])  # type: ignore[arg-type]
+        xe.TensorLeaf([1.0, 2.0])  # type: ignore[arg-type]

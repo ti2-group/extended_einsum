@@ -7,7 +7,7 @@
 
 `extended-einsum` builds tensor-expression graphs, rewrites contraction programs, and executes them with numerically stable evaluation strategies. PyTorch is the primary backend; NumPy is included in the base installation and JAX is optional.
 
-The package is an expression engine, not a drop-in replacement for `torch.einsum` or `numpy.einsum`. Wrap backend arrays with `xe.array`, compose operations lazily, then call `materialize`.
+The package is an expression engine, not a drop-in replacement for `torch.einsum` or `numpy.einsum`. Pass backend arrays directly to the expression functions, compose operations lazily, then call `materialize`.
 
 ## Installation
 
@@ -33,17 +33,15 @@ The CUDA extra follows JAX's CUDA 13 installation. PyTorch device support is det
 import torch
 import extended_einsum as xe
 
-left_torch = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-right_torch = torch.tensor([[2.0, 0.0], [1.0, 2.0]])
+left = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+right = torch.tensor([[2.0, 0.0], [1.0, 2.0]])
 
-left = xe.array(left_torch)
-right = xe.array(right_torch)
 expression = xe.einsum("ik,kj->ij", xe.exp(left), right)
 result = expression.materialize(stability_mode="unstable")
 
 assert torch.allclose(
-    result.backend_array,
-    torch.einsum("ik,kj->ij", torch.exp(left_torch), right_torch),
+    result,
+    torch.einsum("ik,kj->ij", torch.exp(left), right),
 )
 ```
 
@@ -53,25 +51,24 @@ The same interface accepts NumPy arrays. With the `jax` extra installed it also 
 import numpy as np
 import extended_einsum as xe
 
-source = xe.array(np.arange(6.0).reshape(2, 3))
-result = xe.softmax(source, axis=1).materialize()
-print(result.backend_array)
+result = xe.softmax(np.arange(6.0).reshape(2, 3), axis=1).materialize()
+print(result)
 ```
 
 ## Expressions and stability
 
 The public interface currently includes:
 
-- `array`, `einsum`, `stack`, `take`, `slice`, and `select`
+- `einsum`, `stack`, `take`, `slice`, and `select`
 - `exp`, `log`, `sin`, `cos`, `tan`, `sqrt`, `inverse`, and `softmax`
-- the arithmetic operators `+`, `-`, `*`, `/`, and `@` (numpy matmul semantics for 1-D/2-D operands), and basic indexing (`expression[0]`, `expression[:, 1:3]`) on expressions and wrapped arrays
-- `TensorExpression.materialize` and `extract_program`
+- the arithmetic operators `+`, `-`, `*`, `/`, and `@` (numpy matmul semantics for 1-D/2-D operands), and basic indexing (`expression[0]`, `expression[:, 1:3]`)
+- `TensorExpression.materialize` (returns a raw backend array) and `extract_program`
 
-Raw backend arrays passed to these functions are wrapped automatically when their backend is detectable, so `xe.array` is only required for backends registered without an `is_array` predicate or for non-default tensor formats.
+Raw backend arrays passed to these functions (and used as operands of the arithmetic operators, on either side) become expression leaves automatically when their backend is detectable. Construct a `xe.TensorLeaf` explicitly for backends registered without an `is_array` predicate (`backend=...`), for non-default tensor formats (`format=...`), or to mark a learnable parameter (`is_parameter=True`).
 
 Supported execution backends are PyTorch, NumPy, and optional JAX. Rich programs can be evaluated in `unstable`, `scaled_min`, `scaled_max`, `scaled_sum`, `logspace_min`, or `logspace_max` mode. Support is operator-dependent; unsupported combinations raise `NotImplementedError` instead of silently changing semantics.
 
-Custom execution backends plug in through `extended_einsum.register_backend`: subclass `extended_einsum.BackendFunctions` (only a small set of primitives is abstract; derived operations such as `softmax`, `select`, and the arithmetic operators have defaults composed from them), then register it under a name, optionally with a compiler and an `is_array` predicate for automatic backend detection in `xe.array`. Without a compiler, programs are interpreted call by call; without a predicate, wrap arrays with `xe.array(data, backend="yourname")`. Validate an implementation with `extended_einsum.testing.check_backend`, which runs every operator through every stability mode against the NumPy reference backend.
+Custom execution backends plug in through `extended_einsum.register_backend`: subclass `extended_einsum.BackendFunctions` (only a small set of primitives is abstract; derived operations such as `softmax`, `select`, and the arithmetic operators have defaults composed from them), then register it under a name, optionally with a compiler and an `is_array` predicate for automatic backend detection of raw arrays. Without a compiler, programs are interpreted call by call; without a predicate, wrap arrays with `xe.TensorLeaf(data, backend="yourname")`. Validate an implementation with `extended_einsum.testing.check_backend`, which runs every operator through every stability mode against the NumPy reference backend.
 
 The preprocessing API provides expression folding (`FoldSameShapedOperations`) and contraction-path optimization (`OptimizeContractionPaths`). Extract a program from an expression, rewrite it, then translate and run it:
 
@@ -80,7 +77,7 @@ program, inputs = xe.extract_program(expression, stability_mode="unstable")
 program = xe.FoldSameShapedOperations.apply(program)
 program = xe.OptimizeContractionPaths.apply(program)
 backend_program = xe.translate_to_backend_program(program, xe.get_backend_functions("numpy"))
-result = xe.run_program(backend_program, [wrapped.backend_array for wrapped in inputs])
+result = xe.run_program(backend_program, inputs)
 ```
 
 DAG plotting is available from `extended_einsum.visualization` when the visualization extra is installed.

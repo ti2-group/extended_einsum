@@ -10,7 +10,7 @@ from extended_einsum.backends import registry
 
 PUBLIC_OPERATIONS = {
     "TensorExpression",
-    "array",
+    "TensorLeaf",
     "cos",
     "einsum",
     "exp",
@@ -69,21 +69,19 @@ def test_version_comes_from_distribution_metadata() -> None:
 
 
 def test_torch_backend_is_available_in_base_install() -> None:
-    source_torch = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    source = xe.array(source_torch)
+    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
 
     result = xe.exp(source).materialize()
 
-    torch.testing.assert_close(result.backend_array, torch.exp(source_torch))
+    torch.testing.assert_close(result, torch.exp(source))
 
 
 def test_numpy_backend_is_available_in_base_install() -> None:
-    source_numpy = np.array([[1.0, 2.0], [3.0, 4.0]])
-    source = xe.array(source_numpy)
+    source = np.array([[1.0, 2.0], [3.0, 4.0]])
 
     result = xe.exp(source).materialize()
 
-    np.testing.assert_allclose(result.backend_array, np.exp(source_numpy))
+    np.testing.assert_allclose(result, np.exp(source))
 
 
 def test_missing_jax_backend_has_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -100,8 +98,7 @@ def test_extract_program_handles_expressions_deeper_than_the_recursion_limit() -
     # Learned tree-structured circuits (e.g. HCLTs) produce expression graphs
     # far deeper than Python's default recursion limit.
     depth = 5_000
-    source = xe.array(np.array([1.0, 2.0]))
-    expression = xe.exp(source)
+    expression = xe.exp(np.array([1.0, 2.0]))
     for _ in range(depth - 1):
         expression = xe.exp(expression)
 
@@ -114,12 +111,11 @@ def test_extract_program_handles_expressions_deeper_than_the_recursion_limit() -
 
 def test_materialize_handles_expressions_deeper_than_the_recursion_limit() -> None:
     depth = 2_048
-    source_numpy = np.ones((2, 2))
-    source = xe.array(source_numpy)
+    source = np.ones((2, 2))
     expression = xe.log(xe.exp(source))
     for _ in range(depth):
         expression = expression * source
 
     result = expression.materialize()
 
-    np.testing.assert_allclose(result.backend_array, source_numpy)
+    np.testing.assert_allclose(result, source)

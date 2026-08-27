@@ -20,7 +20,6 @@ from cirkit.symbolic.layers import HadamardLayer, InputLayer, KroneckerLayer, Su
 from cirkit.templates import data_modalities, utils
 
 import extended_einsum.interface as xe
-from extended_einsum.interface.tensor_expression import Parameter
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
 from extended_einsum.visualization import plot_expression_dag
@@ -92,7 +91,7 @@ def to_xe_expression(symbolic_circuit, layer, data_by_scope):
         weight_indices = output_unit_index + child_indices[1:]
         out_indices = child_indices[0] + output_unit_index
         format_string = f"{child_indices},{weight_indices}->{out_indices}"
-        weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
+        weight_logits = xe.TensorLeaf(torch.empty(weight_shape, dtype=torch.float32), is_parameter=True)
         weight_input_axes = tuple(range(1, len(weight_shape)))
         softmax_axis: int | tuple[int, ...] = weight_input_axes[0] if len(weight_input_axes) == 1 else weight_input_axes
         weights = xe.softmax(weight_logits, axis=softmax_axis)
@@ -116,7 +115,7 @@ def build_quad_tree_program(
         sum_product_layer=sum_product_layer,
     )
     input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
-    data_by_scope = xe.array(
+    data_by_scope = xe.TensorLeaf(
         torch.empty(
             (symbolic_circuit.num_variables, batch_size, input_layer.params["probs"].shape[0]),
             dtype=torch.float32,

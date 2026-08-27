@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
 from typing import Any, Generic, cast, get_args, override
 
 from extended_einsum.backend_translation import BackendCompiler, translate_to_backend_program
@@ -30,9 +30,6 @@ from extended_einsum.language.rich_operators import (
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import (
     Backend,
-    HasBackend,
-    HasFormat,
-    HasShape,
     Shape,
     StabilityMode,
     TArray,
@@ -40,71 +37,148 @@ from extended_einsum.language.types import (
 )
 
 
-@dataclass(frozen=True)
-class Parameter(Generic[TArray]):
-    array: TArray
+class TensorExpression(ABC, Generic[TArray]):
+    """A lazy tensor computation over raw backend arrays.
+
+    Expressions form a graph whose leaves are ``TensorLeaf`` nodes wrapping
+    raw backend arrays (e.g. ``numpy.ndarray`` or ``torch.Tensor``) and whose
+    inner nodes are ``OperatorExpression`` nodes. ``materialize`` compiles and
+    executes the graph on the arrays' backend and returns a raw backend array.
+    """
 
     @property
+    @abstractmethod
+    def shape(self) -> Shape: ...
+
+    @property
+    @abstractmethod
+    def backend(self) -> Backend: ...
+
+    @property
+    @abstractmethod
+    def format(self) -> TensorFormat: ...
+
+    def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
+        _check_stability_mode(stability_mode)
+        rich_program, backend_inputs = extract_program(self, stability_mode)
+        backend_functions = get_backend_functions(self.backend)
+        backend_program = translate_to_backend_program(rich_program, backend_functions)
+        compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
+        backend_code = compiler.compile(backend_program, backend_inputs)
+        return backend_code(backend_inputs)
+
+    def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorAdd(), [self, other])
+
+    def __radd__(self, other: TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorAdd(), [other, self])
+
+    def __sub__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorSubtract(), [self, other])
+
+    def __rsub__(self, other: TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorSubtract(), [other, self])
+
+    def __mul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorMultiply(), [self, other])
+
+    def __rmul__(self, other: TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorMultiply(), [other, self])
+
+    def __truediv__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorDivide(), [self, other])
+
+    def __rtruediv__(self, other: TArray) -> TensorExpression[TArray]:
+        return OperatorExpression(OperatorDivide(), [other, self])
+
+    def __matmul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+        return matmul_expression(self, other)
+
+    def __rmatmul__(self, other: TArray) -> TensorExpression[TArray]:
+        return matmul_expression(other, self)
+
+    def __getitem__(self, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[TArray]:
+        return getitem_expression(self, item)
+
+
+class TensorLeaf(TensorExpression[TArray]):
+    """A tensor expression holding a raw backend array.
+
+    Raw arrays passed to expression functions become leaves automatically when
+    their backend is detectable; construct one explicitly for backends
+    registered without an ``is_array`` predicate (``backend=...``), for
+    non-default tensor formats (``format=...``), or to mark a learnable
+    parameter (``is_parameter=True``, recorded in the extracted program's
+    ``parameter_indices``).
+    """
+
+    def __init__(
+        self,
+        array: TArray,
+        format: TensorFormat = "dense",
+        *,
+        backend: Backend | None = None,
+        is_parameter: bool = False,
+    ) -> None:
+        if backend is None:
+            backend = get_backend_of_array(cast(Any, array))
+        else:
+            # validate the name eagerly so a typo fails here, not at materialize
+            get_backend_functions(backend)
+        self.array = array
+        self.is_parameter = is_parameter
+        self._backend = backend
+        self._format: TensorFormat = format
+
+    @property
+    @override
     def shape(self) -> Shape:
         return tuple(self.array.shape)
 
     @property
+    @override
     def backend(self) -> Backend:
-        return self.array.backend
+        return self._backend
 
     @property
+    @override
     def format(self) -> TensorFormat:
-        return self.array.format
+        return self._format
+
+    @override
+    def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
+        """A leaf is already materialized; returns its raw backend array."""
+
+        _check_stability_mode(stability_mode)
+        return self.array
+
+    @override
+    def __repr__(self) -> str:
+        return f"<TensorLeaf shape={self.shape} backend={self._backend!r} format={self._format!r}>"
 
 
-def as_expression_argument(argument: object) -> object:
-    """Coerces an operand into something a tensor expression can hold.
+class OperatorExpression(TensorExpression[TArray]):
+    """A tensor expression applying an operator to argument expressions."""
 
-    Expressions, parameters, and wrapped arrays pass through unchanged. Raw
-    backend arrays (e.g. a ``numpy.ndarray`` or ``torch.Tensor``) are wrapped
-    automatically when their backend can be detected. Python scalars and other
-    unsupported objects raise a ``TypeError`` explaining what to do instead.
-    """
-
-    if isinstance(argument, (TensorExpression, Parameter)):
-        return argument
-    if hasattr(argument, "backend") and hasattr(argument, "format") and hasattr(argument, "shape"):
-        # already a wrapped array (or a compatible duck-typed object)
-        return argument
-    if isinstance(argument, (bool, int, float, complex)):
-        raise TypeError(f"Tensor expressions do not support Python scalars (got {argument!r}). Wrap a 0-d backend array with extended_einsum.array instead.")
-    try:
-        backend = get_backend_of_array(cast(Any, argument))
-    except ValueError as error:
-        raise TypeError(f"Tensor expressions do not support {type(argument).__name__} operands. Convert it to a backend array and wrap it with extended_einsum.array.") from error
-
-    # Import locally to avoid the module cycle between the expression and
-    # public interface-function modules.
-    from extended_einsum.interface.functions import BackendArrayWrapper
-
-    return BackendArrayWrapper(cast(Any, argument), backend, "dense")
-
-
-class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def __init__(
         self,
         operator: RichOperator,
-        arguments: list[TensorExpression[TArray] | Parameter[TArray] | TArray],
+        arguments: list[TensorExpression[TArray] | TArray],
     ) -> None:
-        arguments = cast("list[TensorExpression[TArray] | Parameter[TArray] | TArray]", [as_expression_argument(argument) for argument in arguments])
+        coerced_arguments = [cast("TensorExpression[TArray]", as_expression(argument)) for argument in arguments]
+        if len(coerced_arguments) == 0:
+            raise ValueError("Tensor expression must have at least one argument.")
         self.operator = operator
-        self.arguments = arguments
-        operator.check_inputs(arguments)
-        self._shape = operator.propagate_shapes([tuple(argument.shape) for argument in arguments])
+        self.arguments = coerced_arguments
+        operator.check_inputs(coerced_arguments)
+        self._shape = operator.propagate_shapes([argument.shape for argument in coerced_arguments])
         self._format: TensorFormat = _propagate_tensor_format(
             operator,
-            [argument.format for argument in arguments],
+            [argument.format for argument in coerced_arguments],
         )
         # check that the backends are consistent
-        if len(arguments) == 0:
-            raise ValueError("Tensor expression must have at least one argument.")
-        self._backend: Backend = arguments[0].backend
-        for argument in arguments[1:]:
+        self._backend: Backend = coerced_arguments[0].backend
+        for argument in coerced_arguments[1:]:
             if argument.backend != self._backend:
                 raise ValueError(f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}.")
 
@@ -123,51 +197,40 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def format(self) -> TensorFormat:
         return self._format
 
-    def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
-        if stability_mode not in get_args(StabilityMode):
-            raise ValueError(f"Unknown stability mode {stability_mode!r}. Valid modes are: {', '.join(get_args(StabilityMode))}.")
-        rich_program, input_arguments = extract_program(self, stability_mode)
-        backend_functions = get_backend_functions(self.backend)
-        backend_program = translate_to_backend_program(rich_program, backend_functions)
-        compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
-        backend_inputs = [argument.backend_array for argument in input_arguments]
-        backend_code = compiler.compile(backend_program, backend_inputs)
-        backend_array = backend_code(backend_inputs)
-
-        # Import locally to avoid the module cycle between the expression and
-        # public interface-function modules.
-        from extended_einsum.interface.functions import BackendArrayWrapper
-
-        return cast(TArray, BackendArrayWrapper(backend_array, self.backend, self.format))
-
     @override
     def __repr__(self) -> str:
         return f"<TensorExpression {self.operator.name} shape={self._shape} backend={self._backend!r}>"
 
-    def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return TensorExpression(OperatorAdd(), [self, other])
 
-    def __sub__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return TensorExpression(OperatorSubtract(), [self, other])
+def as_expression(argument: TArray | TensorExpression[TArray]) -> TensorExpression[TArray]:
+    """Coerces an operand into a tensor expression.
 
-    def __mul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return TensorExpression(OperatorMultiply(), [self, other])
+    Expressions pass through unchanged. Raw backend arrays (e.g. a
+    ``numpy.ndarray`` or ``torch.Tensor``) become leaves automatically when
+    their backend can be detected. Python scalars and other unsupported
+    objects raise a ``TypeError`` explaining what to do instead.
+    """
 
-    def __truediv__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return TensorExpression(OperatorDivide(), [self, other])
+    if isinstance(argument, TensorExpression):
+        return argument
+    if isinstance(argument, (bool, int, float, complex)):
+        raise TypeError(f"Tensor expressions do not support Python scalars (got {argument!r}). Use a 0-d backend array instead, e.g. numpy.array({argument!r}).")
+    try:
+        return TensorLeaf(argument)
+    except ValueError as error:
+        raise TypeError(f"Tensor expressions do not support {type(argument).__name__} operands. Convert it to a backend array first, e.g. with numpy.asarray or torch.as_tensor.") from error
 
-    def __matmul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return matmul_expression(self, other)
 
-    def __getitem__(self, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[TArray]:
-        return getitem_expression(self, item)
+def _check_stability_mode(stability_mode: StabilityMode) -> None:
+    if stability_mode not in get_args(StabilityMode):
+        raise ValueError(f"Unknown stability mode {stability_mode!r}. Valid modes are: {', '.join(get_args(StabilityMode))}.")
 
 
 def matmul_expression(left: TensorExpression[TArray] | TArray, right: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
     """Builds the einsum expression for ``left @ right`` with numpy's 1-D/2-D matmul semantics."""
 
-    left = cast("TensorExpression[TArray] | TArray", as_expression_argument(left))
-    right = cast("TensorExpression[TArray] | TArray", as_expression_argument(right))
+    left = as_expression(left)
+    right = as_expression(right)
     match (len(left.shape), len(right.shape)):
         case (1, 1):
             format_string = "k, k -> "
@@ -179,7 +242,7 @@ def matmul_expression(left: TensorExpression[TArray] | TArray, right: TensorExpr
             format_string = "ik, kj -> ij"
         case _:
             raise ValueError(f"The @ operator supports operands with one or two axes, but got shapes {left.shape} and {right.shape}. Use einsum for higher-dimensional products.")
-    return TensorExpression(OperatorEinsum(format_string), [left, right])
+    return OperatorExpression(OperatorEinsum(format_string), [left, right])
 
 
 def getitem_expression(source: TensorExpression[TArray] | TArray, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[TArray]:
@@ -188,31 +251,39 @@ def getitem_expression(source: TensorExpression[TArray] | TArray, item: int | sl
     entries = item if isinstance(item, tuple) else (item,)
     if len(entries) == 0:
         raise TypeError("indexing with an empty tuple is not supported.")
-    expression = source
+    expression = as_expression(source)
     axis = 0
     for entry in entries:
         if axis >= len(expression.shape):
-            raise IndexError(f"too many indices: the expression has shape {source.shape}, but {len(entries)} indices were given.")
+            raise IndexError(f"too many indices: the expression has shape {expression.shape}, but {len(entries)} indices were given.")
         axis_size = expression.shape[axis]
         if isinstance(entry, int):
             if not -axis_size <= entry < axis_size:
                 raise IndexError(f"index {entry} is out of bounds for axis {axis} with size {axis_size}.")
             index = entry + axis_size if entry < 0 else entry
-            expression = TensorExpression(OperatorSelect(axis, index), [expression])
+            expression = OperatorExpression(OperatorSelect(axis, index), [expression])
             # selecting removes the axis, so the next entry applies to the same position
         elif isinstance(entry, slice):
             if entry.step not in (None, 1):
                 raise ValueError(f"slicing with a step is not supported (got step {entry.step!r}).")
             start, stop, _ = entry.indices(axis_size)
-            expression = TensorExpression(OperatorSlice(start, stop, axis), [expression])
+            expression = OperatorExpression(OperatorSlice(start, stop, axis), [expression])
             axis += 1
         else:
             raise TypeError(f"indices must be integers, slices, or tuples of those, but got {type(entry).__name__}.")
-    return cast(TensorExpression[TArray], expression)
+    return expression
+
+
+def _leaf_input_key(leaf: TensorLeaf[TArray]) -> int:
+    return id(leaf.array)
+
+
+def _expression_key(expression: TensorExpression[TArray]) -> int:
+    return id(expression)
 
 
 def _compile_expression_graph(
-    root: TensorExpression[TArray] | Parameter[TArray] | TArray,
+    root: TensorExpression[TArray],
     ssa_ids: dict[int, int],
     input_ssa_ids: dict[int, int],
     instructions: list[RichInstruction],
@@ -221,36 +292,35 @@ def _compile_expression_graph(
     shapes: dict[int, Shape],
     tensor_formats: dict[int, TensorFormat],
 ) -> int:
-    def register_input(tensor_expression: Parameter[TArray] | TArray) -> int:
-        expression_key = id(tensor_expression)
+    def register_input(leaf: TensorLeaf[TArray]) -> int:
+        # inputs are deduplicated by the identity of the underlying backend
+        # array, so reusing the same raw array yields a single program input
+        input_key = _leaf_input_key(leaf)
         # if we already found this input, return its SSA-ID
-        if expression_key in input_ssa_ids:
-            return input_ssa_ids[expression_key]
+        if input_key in input_ssa_ids:
+            return input_ssa_ids[input_key]
         # if not, continue counting left of 0
-        input_ssa_ids[expression_key] = -1 - len(input_ssa_ids)
+        input_ssa_ids[input_key] = -1 - len(input_ssa_ids)
         # add it to the list of inputs and maybe also add it to the list of parameters
-        if isinstance(tensor_expression, Parameter):
-            input_tensors.append(tensor_expression.array)
-            parameter_positions.append(input_ssa_ids[expression_key])
-        else:
-            input_tensors.append(tensor_expression)
+        input_tensors.append(leaf.array)
+        if leaf.is_parameter:
+            parameter_positions.append(input_ssa_ids[input_key])
         # add shape and format information
-        shapes[input_ssa_ids[expression_key]] = tensor_expression.shape
-        tensor_formats[input_ssa_ids[expression_key]] = tensor_expression.format
-        return input_ssa_ids[expression_key]
+        shapes[input_ssa_ids[input_key]] = leaf.shape
+        tensor_formats[input_ssa_ids[input_key]] = leaf.format
+        return input_ssa_ids[input_key]
 
-    # Iterative post-order traversal with an explicit stack. Expression graphs
-    # can be arbitrarily deep (e.g. learned tree-structured circuits), so a
-    # recursive walk would exhaust Python's recursion limit.
-    stack: list[tuple[TensorExpression[TArray] | Parameter[TArray] | TArray, bool]] = [(root, False)]
+    # Iterative post-order traversal with stack: [(expression, arguments_compiled)]
+    stack: list[tuple[TensorExpression[TArray], bool]] = [(root, False)]
     while stack:
         tensor_expression, arguments_compiled = stack.pop()
 
-        if not isinstance(tensor_expression, TensorExpression):
+        if isinstance(tensor_expression, TensorLeaf):
             register_input(tensor_expression)
             continue
+        assert isinstance(tensor_expression, OperatorExpression), f"Unsupported expression node type: {type(tensor_expression).__name__}."
 
-        expression_key = id(tensor_expression)
+        expression_key = _expression_key(tensor_expression)
         # if we have already seen this expression, its instruction exists
         if expression_key in ssa_ids:
             continue
@@ -264,7 +334,7 @@ def _compile_expression_graph(
                 stack.append((argument, False))
             continue
 
-        argument_ssa_ids = tuple(ssa_ids[id(argument)] if isinstance(argument, TensorExpression) else input_ssa_ids[id(argument)] for argument in tensor_expression.arguments)
+        argument_ssa_ids = tuple(input_ssa_ids[_leaf_input_key(argument)] if isinstance(argument, TensorLeaf) else ssa_ids[id(argument)] for argument in tensor_expression.arguments)
 
         # add the instruction to the program
         ssa_ids[expression_key] = len(ssa_ids)
@@ -272,16 +342,16 @@ def _compile_expression_graph(
         shapes[ssa_ids[expression_key]] = tensor_expression.shape
         tensor_formats[ssa_ids[expression_key]] = tensor_expression.format
 
-    if isinstance(root, TensorExpression):
-        return ssa_ids[id(root)]
-    return input_ssa_ids[id(root)]
+    if isinstance(root, TensorLeaf):
+        return input_ssa_ids[_leaf_input_key(root)]
+    return ssa_ids[_expression_key(root)]
 
 
 def extract_program(
     tensor_expression: TensorExpression[TArray],
     stability_mode: StabilityMode,
 ) -> tuple[RichProgram, list[TArray]]:
-    """Compiles a tensor expression into a rich program and a list of arguments.
+    """Compiles a tensor expression into a rich program and its raw input arrays.
 
     Parameters
     ----------
@@ -293,7 +363,8 @@ def extract_program(
     Returns
     -------
     tuple[RichProgram, list[TArray]]
-        A tuple containing the compiled rich program and a list of arguments.
+        A tuple containing the compiled rich program and the raw backend
+        arrays that are its inputs, in program input order.
     """
 
     instructions: list[RichInstruction] = []

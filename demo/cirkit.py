@@ -35,7 +35,6 @@ from torch.fx.experimental.proxy_tensor import make_fx
 import extended_einsum.interface as xe
 from extended_einsum.backend_translation import run_program, translate_to_backend_program
 from extended_einsum.backends.torch import TorchBackendFunctions
-from extended_einsum.interface.tensor_expression import Parameter
 from extended_einsum.language.rich_program import RichProgram
 from extended_einsum.language.types import StabilityMode
 from extended_einsum.preprocess import FoldSameShapedOperations, OptimizeContractionPaths
@@ -250,7 +249,7 @@ def _translate_layer(layer, children, child_nodes, data_by_scope):
             if layer.num_input_units != output_units or not all(child.shape == child_nodes[0].shape for child in child_nodes):
                 raise ValueError("Multi-input sum layers must be mixing layers over equally shaped children")
             stacked_children = xe.stack(child_nodes, axis=1)
-            mixing_logits = Parameter(xe.array(torch.empty((output_units, len(children)), dtype=torch.float32)))
+            mixing_logits = xe.TensorLeaf(torch.empty((output_units, len(children)), dtype=torch.float32), is_parameter=True)
             mixing_weights = xe.softmax(mixing_logits, axis=1)
             result = xe.einsum("bhu,uh->bu", stacked_children, mixing_weights)
         else:
@@ -261,7 +260,7 @@ def _translate_layer(layer, children, child_nodes, data_by_scope):
             weight_indices = output_unit_index + child_indices[1:]
             out_indices = child_indices[0] + output_unit_index
             format_string = f"{child_indices},{weight_indices}->{out_indices}"
-            weight_logits = Parameter(xe.array(torch.empty(weight_shape, dtype=torch.float32)))
+            weight_logits = xe.TensorLeaf(torch.empty(weight_shape, dtype=torch.float32), is_parameter=True)
             weight_input_axes = tuple(range(1, len(weight_shape)))
             softmax_axis: int | tuple[int, ...] = weight_input_axes[0] if len(weight_input_axes) == 1 else weight_input_axes
             weights = xe.softmax(weight_logits, axis=softmax_axis)
@@ -279,7 +278,7 @@ def translate_cirkit_to_xe(
     stability: StabilityMode,
 ) -> tuple[RichProgram, list[object]]:
     input_layer = next(layer for layer in symbolic_circuit.layers if isinstance(layer, InputLayer))
-    data_by_scope = xe.array(
+    data_by_scope = xe.TensorLeaf(
         torch.empty(
             (symbolic_circuit.num_variables, batch_size, input_layer.params["probs"].shape[0]),
             dtype=torch.float32,
@@ -665,7 +664,7 @@ def setup_xe_training(
     }
     parameter_inputs = {input_id: torch.nn.Parameter(tensor) for input_id, tensor in initialized_parameter_inputs.items() if input_id not in packed_parameter_input_ids}
     packed_parameter_inputs = [torch.nn.Parameter(torch.stack([initialized_parameter_inputs[input_id] for input_id in stack_order], dim=0)) for stack_order in folded.parameter_stack_orders]
-    constant_inputs = {input_id: inputs[input_id].backend_array.to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
+    constant_inputs = {input_id: inputs[input_id].to(device) for input_id in range(program.n_inputs) if input_id != 0 and input_id not in program.parameter_indices}
     pixel_range = torch.arange(num_variables, device=device)[:, None]
 
     def categorical_input(batch: torch.Tensor) -> torch.Tensor:

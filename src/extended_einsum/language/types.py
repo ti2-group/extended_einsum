@@ -21,17 +21,4 @@ class HasShape(Protocol):
     def shape(self) -> Shape: ...
 
 
-class HasBackend(Protocol):
-    @property
-    def backend(self) -> Backend: ...
-
-
-class HasFormat(Protocol):
-    @property
-    def format(self) -> TensorFormat: ...
-
-
-class Array(HasShape, HasBackend, HasFormat, Protocol): ...
-
-
-TArray = TypeVar("TArray", bound=Array)
+TArray = TypeVar("TArray", bound=HasShape)

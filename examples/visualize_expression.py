@@ -12,8 +12,8 @@ from extended_einsum.visualization import plot_expression_dag
 def main() -> None:
     output = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("expression.png")
 
-    left = xe.array(torch.ones((2, 3)))
-    right = xe.array(torch.ones((3, 4)))
+    left = torch.ones((2, 3))
+    right = torch.ones((3, 4))
     expression = xe.softmax(xe.einsum("ik,kj->ij", left, right), axis=1)
     program, _ = xe.extract_program(expression, stability_mode="unstable")
 

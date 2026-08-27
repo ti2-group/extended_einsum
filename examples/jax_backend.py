@@ -6,12 +6,11 @@ import extended_einsum as xe
 
 
 def main() -> None:
-    source_jax = jnp.arange(6.0).reshape(2, 3)
-    source = xe.array(source_jax)
+    source = jnp.arange(6.0).reshape(2, 3)
     result = xe.exp(source).materialize()
 
-    assert jnp.allclose(result.backend_array, jnp.exp(source_jax))
-    print(result.backend_array)
+    assert jnp.allclose(result, jnp.exp(source))
+    print(result)
 
 
 if __name__ == "__main__":

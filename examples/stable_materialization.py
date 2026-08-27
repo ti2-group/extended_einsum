@@ -6,13 +6,13 @@ import extended_einsum as xe
 
 
 def main() -> None:
-    left = xe.array(torch.tensor([[0.2, 0.3], [0.4, 0.5]]))
-    right = xe.array(torch.tensor([[0.6, 0.7], [0.8, 0.9]]))
+    left = torch.tensor([[0.2, 0.3], [0.4, 0.5]])
+    right = torch.tensor([[0.6, 0.7], [0.8, 0.9]])
     expression = xe.einsum("ik,kj->ij", left, right)
 
-    direct = expression.materialize("unstable").backend_array
-    scaled = expression.materialize("scaled_sum").backend_array
-    logspace = expression.materialize("logspace_max").backend_array
+    direct = expression.materialize("unstable")
+    scaled = expression.materialize("scaled_sum")
+    logspace = expression.materialize("logspace_max")
 
     torch.testing.assert_close(scaled, direct)
     torch.testing.assert_close(logspace, direct)
