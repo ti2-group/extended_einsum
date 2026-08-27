@@ -1,28 +1,37 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Generic, TypeVar, override
+from typing import Any, Generic, TypeVar, cast, override
 
 from extended_einsum.backend_translation import BackendArray
-from extended_einsum.backends.registry import get_backend_of_array
+from extended_einsum.backends.registry import get_backend_functions, get_backend_of_array
 from extended_einsum.interface.tensor_expression import (
     Parameter,
     TensorExpression,
+    as_expression_argument,
+    getitem_expression,
+    matmul_expression,
 )
 from extended_einsum.language.rich_operators import (
+    OperatorAdd,
     OperatorCos,
+    OperatorDivide,
     OperatorEinsum,
     OperatorExp,
     OperatorInverse,
     OperatorLog,
+    OperatorMultiply,
     OperatorSelect,
     OperatorSin,
     OperatorSlice,
     OperatorSoftmax,
     OperatorSqrt,
     OperatorStack,
+    OperatorSubtract,
     OperatorTake,
     OperatorTan,
 )
-from extended_einsum.language.types import Array, Backend, Shape, TArray, TensorFormat
+from extended_einsum.language.types import Array, Backend, Shape, StabilityMode, TArray, TensorFormat
 from extended_einsum.utils import normalize_axis, parse_format_string
 
 TBackendArray = TypeVar("TBackendArray", bound=BackendArray)
@@ -49,6 +58,32 @@ class BackendArrayWrapper(Array, Generic[TBackendArray]):
     def format(self) -> TensorFormat:
         return self._format
 
+    def materialize(self, stability_mode: StabilityMode = "unstable") -> BackendArrayWrapper[TBackendArray]:
+        """A wrapped array is already materialized; returns itself."""
+
+        return self
+
+    def __repr__(self) -> str:
+        return f"array({self.backend_array!r}, format={self._format!r}, backend={self._backend!r})"
+
+    def __add__(self, other: TensorExpression[Any] | Any) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return TensorExpression(OperatorAdd(), [self, other])
+
+    def __sub__(self, other: TensorExpression[Any] | Any) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return TensorExpression(OperatorSubtract(), [self, other])
+
+    def __mul__(self, other: TensorExpression[Any] | Any) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return TensorExpression(OperatorMultiply(), [self, other])
+
+    def __truediv__(self, other: TensorExpression[Any] | Any) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return TensorExpression(OperatorDivide(), [self, other])
+
+    def __matmul__(self, other: TensorExpression[Any] | Any) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return matmul_expression(self, other)
+
+    def __getitem__(self, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[BackendArrayWrapper[TBackendArray]]:
+        return getitem_expression(self, item)
+
 
 def array(backend_array: TBackendArray, format: TensorFormat = "dense", *, backend: Backend | None = None) -> BackendArrayWrapper[TBackendArray]:
     """Wraps a backend array for use in tensor expressions.
@@ -59,6 +94,9 @@ def array(backend_array: TBackendArray, format: TensorFormat = "dense", *, backe
 
     if backend is None:
         backend = get_backend_of_array(backend_array)
+    else:
+        # validate the name eagerly so a typo fails here, not at materialize
+        get_backend_functions(backend)
     return BackendArrayWrapper(backend_array, backend, format)
 
 
@@ -110,10 +148,12 @@ def einsum(
 ) -> TensorExpression[TArray]:
     index_strings, output_string = parse_format_string(format_string)
     if len(index_strings) != len(operands):
-        raise ValueError(f"format string {format_string} has {len(index_strings)} indices, but {len(operands)} operands.")
+        operand_word = "operand was" if len(operands) == 1 else "operands were"
+        raise ValueError(f"The einsum format string {format_string!r} has {len(index_strings)} input terms, but {len(operands)} {operand_word} given.")
     all_input_symbols = frozenset("".join(index_strings))
-    if any(output_symbol not in all_input_symbols for output_symbol in output_string):
-        raise ValueError(f"format string {format_string} contains output symbols that are not present in the operands.")
+    missing_symbols = sorted(set(output_string) - all_input_symbols)
+    if missing_symbols:
+        raise ValueError(f"The einsum format string {format_string!r} has output symbols that do not appear in any input term: {', '.join(missing_symbols)}.")
     return TensorExpression(OperatorEinsum(format_string), list(operands))
 
 
@@ -122,11 +162,11 @@ def stack(
     *,
     axis: int = 0,
 ) -> TensorExpression[TArray]:
-    axis = normalize_axis(axis, len(operands[0].shape))
     if len(operands) == 0:
-        raise ValueError("stack requires at least one argument")
-    if any(operand.shape != operands[0].shape for operand in operands[1:]):
-        raise ValueError("The stack operator requires all arguments to have the same shape along the stack axis.")
+        raise ValueError("stack requires at least one operand")
+    first_operand = cast("TensorExpression[TArray] | Parameter[TArray] | TArray", as_expression_argument(operands[0]))
+    # the stack axis refers to the output, which has one more axis than the operands
+    axis = normalize_axis(axis, len(first_operand.shape) + 1)
     return TensorExpression(OperatorStack(axis), operands)
 
 
@@ -136,11 +176,13 @@ def take(
     *,
     axis: int = 0,
 ) -> TensorExpression[TArray]:
-    axis = normalize_axis(axis, len(source.shape))
+    source = cast("TensorExpression[TArray] | TArray", as_expression_argument(source))
+    index = cast("TensorExpression[TArray] | TArray", as_expression_argument(index))
     if not source.shape:
-        raise ValueError("The take operator requires an operand with a leading axis.")
+        raise ValueError("The take operator requires a non-scalar source, but the source has shape ().")
     if not index.shape:
-        raise ValueError("The take operator requires an index with a leading axis.")
+        raise ValueError("The take operator requires an index vector with one axis, but the index has shape ().")
+    axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(OperatorTake(axis), [source, index])
 
 
@@ -151,6 +193,7 @@ def slice(
     *,
     axis: int = 0,
 ) -> TensorExpression[TArray]:
+    source = cast("TensorExpression[TArray] | TArray", as_expression_argument(source))
     axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(OperatorSlice(start, stop, axis), [source])
 
@@ -161,16 +204,19 @@ def select(
     *,
     axis: int = 0,
 ) -> TensorExpression[TArray]:
+    source = cast("TensorExpression[TArray] | TArray", as_expression_argument(source))
     axis = normalize_axis(axis, len(source.shape))
     return TensorExpression(OperatorSelect(axis, index), [source])
 
 
 def softmax(
     a: TensorExpression[TArray] | TArray,
-    axis: int | tuple[int, ...] = 0,
+    *,
+    axis: int | tuple[int, ...],
 ) -> TensorExpression[TArray]:
-    """Applies the softmax function to the input tensor."""
+    """Applies the softmax function to the input tensor along the given axis or axes."""
 
+    a = cast("TensorExpression[TArray] | TArray", as_expression_argument(a))
     if not a.shape:
         raise ValueError("softmax requires an input tensor with at least one axis")
 

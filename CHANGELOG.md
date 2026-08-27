@@ -7,10 +7,26 @@ All notable changes to this project are documented here. The project follows [Se
 ### Added
 
 - Hidden Chow-Liu Tree (HCLT) circuits in the Cirkit demo: `--region-graph chow-liu-tree` learns the tree structure from the training data (binned mutual information, cached on disk under the data directory) and records the structure-learning time and bin count in the benchmark CSV.
+- Wrapped arrays (`xe.array(...)`) now support the arithmetic operators (`+`, `-`, `*`, `/`, `@`), indexing, and `materialize`, so expressions can start from two wrapped arrays directly.
+- Basic indexing on expressions and wrapped arrays: `expression[0]`, `expression[:, 1:3]`, and tuples of integers and slices build `select` and `slice` operators (steps are not supported).
+- `@` follows numpy's matmul semantics for all 1-D/2-D operand combinations; higher-dimensional operands raise a `ValueError` pointing to `einsum`.
+- Raw backend arrays (e.g. `numpy.ndarray`, `torch.Tensor`) passed to expression functions are wrapped automatically when their backend is detectable; Python scalars and other unsupported operands raise a `TypeError` explaining what to wrap instead.
+- The preprocessing pipeline is part of the top-level API: `FoldSameShapedOperations`, `OptimizeContractionPaths`, `PreprocessingRoutine`, `RichProgram`, `translate_to_backend_program`, `run_program`, and `get_backend_functions`.
+- `TensorExpression` and wrapped arrays have informative `repr`s showing the operator, shape, and backend.
+
+### Changed
+
+- **Breaking:** `stack` interprets `axis` relative to the output rank, matching `numpy.stack`: `axis=-1` now stacks along a new trailing axis, and `axis=rank` is accepted.
+- **Breaking:** `softmax` requires an explicit keyword-only `axis` argument; the previous default of `axis=0` silently normalized the wrong axis for code ported from other libraries.
+- `materialize` validates the stability mode eagerly and raises a `ValueError` listing the valid modes, instead of a late `NotImplementedError` indistinguishable from an unsupported operator/mode combination.
+- `xe.array(..., backend=...)` validates the backend name at wrap time instead of at materialize.
+- `materialize` no longer stores intermediate compilation state on the expression object.
+- Error messages across `einsum`, `stack`, `take`, and format-string parsing name the offending operand, shapes, and terms consistently; einsum axis-size conflicts raise `ValueError` instead of `RuntimeError`; format strings without `->` explain that an explicit output is required; visualization import errors name the `[visualization]` extra.
 
 ### Fixed
 
 - `extract_program` compiles expression graphs iteratively, so expressions deeper than Python's recursion limit (such as learned tree-structured circuits) no longer raise `RecursionError`.
+- `stack([])` raises a clear `ValueError` instead of an `IndexError`.
 
 ## 0.1.0 - 2026-07-16
 

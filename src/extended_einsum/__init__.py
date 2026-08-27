@@ -2,6 +2,9 @@ from importlib.metadata import PackageNotFoundError, version
 
 from extended_einsum.backend_translation import BackendCompiler as BackendCompiler
 from extended_einsum.backend_translation import BackendFunctions as BackendFunctions
+from extended_einsum.backend_translation import run_program as run_program
+from extended_einsum.backend_translation import translate_to_backend_program as translate_to_backend_program
+from extended_einsum.backends.registry import get_backend_functions as get_backend_functions
 from extended_einsum.backends.registry import register_backend as register_backend
 from extended_einsum.interface import TensorExpression as TensorExpression
 from extended_einsum.interface import array as array
@@ -19,6 +22,10 @@ from extended_einsum.interface import sqrt as sqrt
 from extended_einsum.interface import stack as stack
 from extended_einsum.interface import take as take
 from extended_einsum.interface import tan as tan
+from extended_einsum.language.rich_program import RichProgram as RichProgram
+from extended_einsum.preprocess import FoldSameShapedOperations as FoldSameShapedOperations
+from extended_einsum.preprocess import OptimizeContractionPaths as OptimizeContractionPaths
+from extended_einsum.preprocess import PreprocessingRoutine as PreprocessingRoutine
 
 try:
     __version__ = version("extended-einsum")
@@ -28,6 +35,10 @@ except PackageNotFoundError:
 __all__ = [
     "BackendCompiler",
     "BackendFunctions",
+    "FoldSameShapedOperations",
+    "OptimizeContractionPaths",
+    "PreprocessingRoutine",
+    "RichProgram",
     "TensorExpression",
     "__version__",
     "array",
@@ -35,9 +46,11 @@ __all__ = [
     "einsum",
     "exp",
     "extract_program",
+    "get_backend_functions",
     "inverse",
     "log",
     "register_backend",
+    "run_program",
     "select",
     "sin",
     "slice",
@@ -46,4 +59,5 @@ __all__ = [
     "stack",
     "take",
     "tan",
+    "translate_to_backend_program",
 ]

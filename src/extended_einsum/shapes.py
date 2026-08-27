@@ -12,7 +12,7 @@ def get_axis_sizes(index_strings: list[str], tensor_shapes: list[Shape]) -> dict
             if index not in axis_sizes:
                 axis_sizes[index] = tensor_shape[index_string.index(index)]
             elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
-                raise RuntimeError(f"Incompatible shapes for index {index_string}: {tensor_shape} and {axis_sizes[index]}.")
+                raise ValueError(f"Incompatible axis sizes for index {index!r}: term {index_string!r} with shape {tensor_shape} conflicts with the earlier size {axis_sizes[index]}.")
     return axis_sizes
 
 

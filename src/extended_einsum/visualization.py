@@ -47,7 +47,7 @@ def build_expression_dag(program: RichProgram) -> Any:
     try:
         import networkx as nx
     except ImportError as exc:
-        raise ImportError("build_expression_dag requires networkx.") from exc
+        raise ImportError("build_expression_dag requires networkx. Install the visualization extra: pip install 'extended-einsum[visualization]'.") from exc
 
     graph = nx.DiGraph()
     graph.add_nodes_from(range(program.output_ssa + 1))
@@ -97,7 +97,7 @@ def plot_expression_dag(
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyArrowPatch
     except ImportError as exc:
-        raise ImportError("plot_expression_dag requires matplotlib.") from exc
+        raise ImportError("plot_expression_dag requires matplotlib. Install the visualization extra: pip install 'extended-einsum[visualization]'.") from exc
 
     graph = _build_visual_expression_dag(
         program,
@@ -187,7 +187,7 @@ def _build_visual_expression_dag(
     try:
         import networkx as nx
     except ImportError as exc:
-        raise ImportError("plot_expression_dag requires networkx.") from exc
+        raise ImportError("plot_expression_dag requires networkx. Install the visualization extra: pip install 'extended-einsum[visualization]'.") from exc
 
     source_graph = build_expression_dag(program)
     groups = _find_fused_einsum_groups(program) if collapse_fused_einsums else {}

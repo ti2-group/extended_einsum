@@ -24,6 +24,19 @@ from extended_einsum.shapes import (
 )
 from extended_einsum.utils import is_contraction_free_einsum, parse_format_string
 
+__all__ = [
+    "FoldSameShapedOperations",
+    "FoldSameShapedOperationsResult",
+    "OptimizeContractionPaths",
+    "OutputDepthOpGroup",
+    "OutputDepthOpGroupMember",
+    "PreprocessingRoutine",
+    "extract_connected_einsum_components",
+    "group_identical_ops_by_input_depth",
+    "group_identical_ops_by_output_depth",
+    "to_annotated_ssa_path",
+]
+
 _LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _COMMUTATIVE_OPERATORS = frozenset({"+", "*"})
 _POINTWISE_OPERATOR_NAMES = frozenset(

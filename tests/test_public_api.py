@@ -28,11 +28,40 @@ PUBLIC_OPERATIONS = {
 }
 
 
+TOP_LEVEL_PIPELINE_API = {
+    "BackendCompiler",
+    "BackendFunctions",
+    "FoldSameShapedOperations",
+    "OptimizeContractionPaths",
+    "PreprocessingRoutine",
+    "RichProgram",
+    "get_backend_functions",
+    "register_backend",
+    "run_program",
+    "translate_to_backend_program",
+}
+
+
 def test_top_level_api_matches_interface_namespace() -> None:
     assert PUBLIC_OPERATIONS <= set(xe.__all__)
     assert PUBLIC_OPERATIONS == set(interface.__all__)
     for name in PUBLIC_OPERATIONS:
         assert getattr(xe, name) is getattr(interface, name)
+
+
+def test_preprocessing_pipeline_is_exported_at_top_level() -> None:
+    assert TOP_LEVEL_PIPELINE_API <= set(xe.__all__)
+    for name in TOP_LEVEL_PIPELINE_API:
+        assert getattr(xe, name) is not None
+
+
+def test_preprocess_module_does_not_leak_imports_in_all() -> None:
+    from extended_einsum import preprocess
+
+    leaked_import_names = {"Any", "Counter", "Protocol", "dataclass", "defaultdict", "deque", "replace", "override", "Sequence"}
+    assert set(preprocess.__all__) & leaked_import_names == set()
+    for name in preprocess.__all__:
+        assert getattr(preprocess, name) is not None
 
 
 def test_version_comes_from_distribution_metadata() -> None:

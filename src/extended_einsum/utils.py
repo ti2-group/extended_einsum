@@ -21,8 +21,10 @@ def parse_format_string(format_string: str) -> tuple[list[str], str]:
     """
 
     arrow_split = format_string.split("->")
+    if len(arrow_split) == 1:
+        raise ValueError(f'The einsum format string "{format_string}" has no output: an explicit "->" output is required (implicit-output format strings are not supported), e.g. "ij,jk->ik".')
     if len(arrow_split) != 2:
-        raise ValueError(f'"{format_string}" is not a valid einsum format string.')
+        raise ValueError(f'The einsum format string "{format_string}" contains more than one "->".')
     index_string_part, output_string_part = arrow_split
     index_strings = [index_string.strip() for index_string in index_string_part.split(",")]
     output_string = output_string_part.strip()

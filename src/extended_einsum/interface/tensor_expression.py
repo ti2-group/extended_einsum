@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable, Generic, cast, override
+from typing import Any, Generic, cast, get_args, override
 
-from extended_einsum.backend_translation import BackendCompiler, BackendProgram, translate_to_backend_program
-from extended_einsum.backends.registry import get_backend_compiler, get_backend_functions
+from extended_einsum.backend_translation import BackendCompiler, translate_to_backend_program
+from extended_einsum.backends.registry import get_backend_compiler, get_backend_functions, get_backend_of_array
 from extended_einsum.language.rich_instruction import RichInstruction, map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
@@ -58,12 +57,41 @@ class Parameter(Generic[TArray]):
         return self.array.format
 
 
+def as_expression_argument(argument: object) -> object:
+    """Coerces an operand into something a tensor expression can hold.
+
+    Expressions, parameters, and wrapped arrays pass through unchanged. Raw
+    backend arrays (e.g. a ``numpy.ndarray`` or ``torch.Tensor``) are wrapped
+    automatically when their backend can be detected. Python scalars and other
+    unsupported objects raise a ``TypeError`` explaining what to do instead.
+    """
+
+    if isinstance(argument, (TensorExpression, Parameter)):
+        return argument
+    if hasattr(argument, "backend") and hasattr(argument, "format") and hasattr(argument, "shape"):
+        # already a wrapped array (or a compatible duck-typed object)
+        return argument
+    if isinstance(argument, (bool, int, float, complex)):
+        raise TypeError(f"Tensor expressions do not support Python scalars (got {argument!r}). Wrap a 0-d backend array with extended_einsum.array instead.")
+    try:
+        backend = get_backend_of_array(cast(Any, argument))
+    except ValueError as error:
+        raise TypeError(f"Tensor expressions do not support {type(argument).__name__} operands. Convert it to a backend array and wrap it with extended_einsum.array.") from error
+
+    # Import locally to avoid the module cycle between the expression and
+    # public interface-function modules.
+    from extended_einsum.interface.functions import BackendArrayWrapper
+
+    return BackendArrayWrapper(cast(Any, argument), backend, "dense")
+
+
 class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def __init__(
         self,
         operator: RichOperator,
         arguments: list[TensorExpression[TArray] | Parameter[TArray] | TArray],
     ) -> None:
+        arguments = cast("list[TensorExpression[TArray] | Parameter[TArray] | TArray]", [as_expression_argument(argument) for argument in arguments])
         self.operator = operator
         self.arguments = arguments
         operator.check_inputs(arguments)
@@ -79,12 +107,6 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         for argument in arguments[1:]:
             if argument.backend != self._backend:
                 raise ValueError(f"Tensor expression has arguments with different backends: {self.backend} and {argument.backend}.")
-
-        # these only exist once the tensor has materialized
-        self._rich_program: RichProgram | None = None
-        self._input_arguments: list[TArray] | None = None
-        self._backend_program: BackendProgram[TArray] | None = None
-        self._backend_code: Callable[[Sequence[TArray]], TArray] | None = None
 
     @property
     @override
@@ -102,19 +124,25 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         return self._format
 
     def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
-        self._rich_program, self._input_arguments = extract_program(self, stability_mode)
+        if stability_mode not in get_args(StabilityMode):
+            raise ValueError(f"Unknown stability mode {stability_mode!r}. Valid modes are: {', '.join(get_args(StabilityMode))}.")
+        rich_program, input_arguments = extract_program(self, stability_mode)
         backend_functions = get_backend_functions(self.backend)
-        self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
+        backend_program = translate_to_backend_program(rich_program, backend_functions)
         compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
-        backend_inputs = [argument.backend_array for argument in self._input_arguments]
-        self._backend_code = compiler.compile(self._backend_program, backend_inputs)
-        backend_array = self._backend_code(backend_inputs)
+        backend_inputs = [argument.backend_array for argument in input_arguments]
+        backend_code = compiler.compile(backend_program, backend_inputs)
+        backend_array = backend_code(backend_inputs)
 
         # Import locally to avoid the module cycle between the expression and
         # public interface-function modules.
         from extended_einsum.interface.functions import BackendArrayWrapper
 
         return cast(TArray, BackendArrayWrapper(backend_array, self.backend, self.format))
+
+    @override
+    def __repr__(self) -> str:
+        return f"<TensorExpression {self.operator.name} shape={self._shape} backend={self._backend!r}>"
 
     def __add__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
         return TensorExpression(OperatorAdd(), [self, other])
@@ -129,10 +157,58 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         return TensorExpression(OperatorDivide(), [self, other])
 
     def __matmul__(self, other: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
-        return TensorExpression(OperatorEinsum("ik, kj -> ij"), [self, other])
+        return matmul_expression(self, other)
 
-    def __getitem__(self, index: int | slice) -> TensorExpression[TArray]:
-        raise NotImplementedError("Indexing is not yet implemented. This should produce a select, take, or slice operator.")
+    def __getitem__(self, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[TArray]:
+        return getitem_expression(self, item)
+
+
+def matmul_expression(left: TensorExpression[TArray] | TArray, right: TensorExpression[TArray] | TArray) -> TensorExpression[TArray]:
+    """Builds the einsum expression for ``left @ right`` with numpy's 1-D/2-D matmul semantics."""
+
+    left = cast("TensorExpression[TArray] | TArray", as_expression_argument(left))
+    right = cast("TensorExpression[TArray] | TArray", as_expression_argument(right))
+    match (len(left.shape), len(right.shape)):
+        case (1, 1):
+            format_string = "k, k -> "
+        case (1, 2):
+            format_string = "k, kj -> j"
+        case (2, 1):
+            format_string = "ik, k -> i"
+        case (2, 2):
+            format_string = "ik, kj -> ij"
+        case _:
+            raise ValueError(f"The @ operator supports operands with one or two axes, but got shapes {left.shape} and {right.shape}. Use einsum for higher-dimensional products.")
+    return TensorExpression(OperatorEinsum(format_string), [left, right])
+
+
+def getitem_expression(source: TensorExpression[TArray] | TArray, item: int | slice | tuple[int | slice, ...]) -> TensorExpression[TArray]:
+    """Builds select and slice expressions for ``source[item]`` with numpy's basic indexing semantics (no step)."""
+
+    entries = item if isinstance(item, tuple) else (item,)
+    if len(entries) == 0:
+        raise TypeError("indexing with an empty tuple is not supported.")
+    expression = source
+    axis = 0
+    for entry in entries:
+        if axis >= len(expression.shape):
+            raise IndexError(f"too many indices: the expression has shape {source.shape}, but {len(entries)} indices were given.")
+        axis_size = expression.shape[axis]
+        if isinstance(entry, int):
+            if not -axis_size <= entry < axis_size:
+                raise IndexError(f"index {entry} is out of bounds for axis {axis} with size {axis_size}.")
+            index = entry + axis_size if entry < 0 else entry
+            expression = TensorExpression(OperatorSelect(axis, index), [expression])
+            # selecting removes the axis, so the next entry applies to the same position
+        elif isinstance(entry, slice):
+            if entry.step not in (None, 1):
+                raise ValueError(f"slicing with a step is not supported (got step {entry.step!r}).")
+            start, stop, _ = entry.indices(axis_size)
+            expression = TensorExpression(OperatorSlice(start, stop, axis), [expression])
+            axis += 1
+        else:
+            raise TypeError(f"indices must be integers, slices, or tuples of those, but got {type(entry).__name__}.")
+    return cast(TensorExpression[TArray], expression)
 
 
 def _compile_expression_graph(

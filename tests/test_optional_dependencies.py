@@ -31,15 +31,15 @@ def reject_import(monkeypatch: pytest.MonkeyPatch, blocked_name: str) -> None:
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
 
-def test_networkx_error_names_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_networkx_error_names_missing_dependency_and_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     reject_import(monkeypatch, "networkx")
 
-    with pytest.raises(ImportError, match="requires networkx"):
+    with pytest.raises(ImportError, match=r"requires networkx.*extended-einsum\[visualization\]"):
         build_expression_dag(simple_program())
 
 
-def test_matplotlib_error_names_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_matplotlib_error_names_missing_dependency_and_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     reject_import(monkeypatch, "matplotlib")
 
-    with pytest.raises(ImportError, match="requires matplotlib"):
+    with pytest.raises(ImportError, match=r"requires matplotlib.*extended-einsum\[visualization\]"):
         plot_expression_dag(simple_program())

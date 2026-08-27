@@ -176,7 +176,7 @@ class OperatorStack(RichOperator):
             raise ValueError("stack requires at least one argument")
         non_stacked_shape = operands[0].shape
         if any(operand.shape != non_stacked_shape for operand in operands[1:]):
-            raise ValueError("The stack operator requires all arguments to have the same shape along the stack axis.")
+            raise ValueError(f"The stack operator requires all arguments to have the same shape, but got {[operand.shape for operand in operands]}.")
         if not 0 <= self.axis <= len(non_stacked_shape):
             raise ValueError(f"The stack operator wants to stack axis {self.axis} but the operands only have {len(non_stacked_shape)} axes. Bounds are 0 <= axis <= {len(non_stacked_shape)}.")
 
@@ -402,12 +402,16 @@ class OperatorEinsum(RichOperator):
     @override
     def check_inputs(self, operands: list[HasShape]) -> None:
         index_strings, _ = parse_format_string(self.format_string)
-        # check that the number of indices in the format string matches the number of operands
+        # check that the number of input terms in the format string matches the number of operands
         if len(index_strings) != len(operands):
-            raise ValueError(f"The number of indices in the einsum format string ({len(index_strings)}) does not match the number of arguments ({len(operands)}).")
-        # check that the length of index strings in the format string matches the orders of the operands
-        if any(len(index_string) != len(operand.shape) for index_string, operand in zip(index_strings, operands)):
-            raise ValueError(f"The einsum format string ({self.format_string}) has indices of different lengths than the order of the operands.")
+            raise ValueError(f"The number of input terms in the einsum format string ({len(index_strings)}) does not match the number of operands ({len(operands)}).")
+        # check that the length of each input term matches the rank of its operand
+        for i, (index_string, operand) in enumerate(zip(index_strings, operands)):
+            if len(index_string) != len(operand.shape):
+                raise ValueError(
+                    f"In the einsum format string {self.format_string!r}, operand {i} has {len(operand.shape)} axes (shape {operand.shape}) "
+                    f"but its input term {index_string!r} has {len(index_string)} indices."
+                )
         # check that all axes have consistent sizes
         _get_axis_sizes(index_strings, [operand.shape for operand in operands])
 
@@ -429,9 +433,8 @@ def _get_axis_sizes(index_strings: list[str], tensor_shapes: list[Shape]) -> dic
             elif axis_sizes[index] != tensor_shape[index_string.index(index)]:
                 current_size = tensor_shape[index_string.index(index)]
                 previous_source = size_sources[index]
-                raise RuntimeError(
-                    f"Incompatible axis sizes for index {index}: argument {i} says {current_size} "
-                    f"({index_string} and {tensor_shape}) but tensor {previous_source} says {axis_sizes[index]} "
-                    f"({tensor_shapes[previous_source]} and {index_strings[previous_source]})."
+                raise ValueError(
+                    f"Incompatible axis sizes for index {index!r}: operand {i} (term {index_string!r}, shape {tensor_shape}) has size {current_size}, "
+                    f"but operand {previous_source} (term {index_strings[previous_source]!r}, shape {tensor_shapes[previous_source]}) has size {axis_sizes[index]}."
                 )
     return axis_sizes
