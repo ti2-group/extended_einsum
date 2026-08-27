@@ -18,23 +18,29 @@ from extended_einsum.preprocess import FoldSameShapedOperations
 
 
 @pytest.mark.parametrize(
-    ("layer", "units", "expected"),
+    ("layer", "units", "region_graph", "semiring", "expected"),
     [
-        ("cp", 64, "advanced"),
-        ("cp", 128, "flattened"),
-        ("cp", 512, "flattened"),
-        ("cp-t", 64, "gather"),
-        ("cp-t", 512, "gather"),
-        ("tucker", 32, "gather"),
-        ("tucker", 64, "gather"),
+        ("cp", 64, "quad-tree-2", "lse-sum", "advanced"),
+        ("cp", 64, "quad-graph", "scaled-max", "flattened"),
+        ("cp", 128, "quad-tree-2", "lse-sum", "flattened"),
+        ("cp", 512, "quad-tree-2", "lse-sum", "flattened"),
+        ("cp-t", 64, "quad-tree-2", "scaled-max", "gather"),
+        ("cp-t", 64, "quad-graph", "scaled-max", "gather"),
+        ("cp-t", 512, "quad-tree-2", "lse-sum", "gather"),
+        ("tucker", 32, "quad-graph", "lse-sum", "gather"),
+        ("tucker", 64, "quad-tree-2", "scaled-max", "gather"),
     ],
 )
-def test_categorical_lookup_auto_selection(layer, units, expected) -> None:
+def test_categorical_lookup_auto_selection(
+    layer, units, region_graph, semiring, expected
+) -> None:
     assert (
         resolve_categorical_lookup(
             "auto",
             sum_product_layer=layer,
             num_units=units,
+            region_graph=region_graph,
+            semiring=semiring,
         )
         == expected
     )
@@ -184,7 +190,7 @@ def test_input_depth_fold_routes_same_index_products_without_gathers_by_default(
     folded = FoldSameShapedOperations.apply_with_input_depth_metadata(program)
     gathered = FoldSameShapedOperations.apply_with_input_depth_metadata(
         program,
-        gather_fragmented_batches=True,
+        _gather_fragmented_batches=True,
     )
 
     assert folded.gather_index_orders == ()
@@ -212,7 +218,7 @@ def test_input_depth_fold_auto_gathers_fragmented_shared_graph_batches() -> None
     folded = FoldSameShapedOperations.apply_with_input_depth_metadata(program)
     gathered = FoldSameShapedOperations.apply_with_input_depth_metadata(
         program,
-        gather_fragmented_batches=True,
+        _gather_fragmented_batches=True,
     )
 
     assert folded.gather_index_orders

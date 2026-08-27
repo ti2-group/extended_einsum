@@ -288,15 +288,14 @@ def group_identical_ops_by_input_depth(
                 )
             )
 
-    result = tuple(groups)
     if split_by_routing:
-        result = _split_input_depth_groups_by_routing(
+        return _split_input_depth_groups_by_routing(
             program,
-            result,
+            tuple(groups),
             live_ssa_ids=live_ssa_ids,
             min_group_size=min_group_size,
         )
-    return result
+    return tuple(groups)
 
 
 def _split_input_depth_groups_by_routing(
@@ -358,41 +357,6 @@ def _split_input_depth_groups_by_routing(
     return tuple(split_groups)
 
 
-_InputAccessToken = tuple[int, int]
-
-
-def _order_input_depth_groups_by_input_access(
-    program: RichProgram,
-    groups: tuple[OutputDepthOpGroup, ...],
-) -> tuple[OutputDepthOpGroup, ...]:
-    """Use the input traversal as the canonical order within native folds.
-
-    The flattened instruction list is commonly depth-first, so preserving its
-    order interleaves spatially distant branches.  Input-frontier folding is
-    instead given a stable, metadata-free order by the axis-0 input elements
-    that can reach each result. Parameter-only transforms inherit the access
-    scope of their consumers so weights remain aligned with the data branch
-    that uses them.
-    """
-
-    scopes = _input_access_scopes(program)
-
-    def member_key(
-        member: OutputDepthOpGroupMember,
-    ) -> tuple[tuple[_InputAccessToken, ...], int, int]:
-        scope = scopes.get(member.result_id, frozenset())
-        ordered_scope = tuple(sorted(scope))
-        return ordered_scope, len(scope), member.op_index
-
-    return tuple(
-        replace(
-            group,
-            members=tuple(sorted(group.members, key=member_key)),
-        )
-        for group in groups
-    )
-
-
 def _has_same_index_product_contraction(program: RichProgram) -> bool:
     """Detect CP's elementwise product contraction from the tensor program."""
 
@@ -413,78 +377,6 @@ def _is_same_index_product_operator(operator: RichOperator) -> bool:
         and input_strings[0] == input_strings[1]
         and input_strings[0] == output_string
     )
-
-
-def _input_access_scopes(
-    program: RichProgram,
-) -> dict[int, frozenset[_InputAccessToken]]:
-    """Return the non-parameter axis-0 input elements reaching each SSA value."""
-
-    live_ssa_ids = frozenset(_nearest_output_depths(program))
-    scopes: dict[int, frozenset[_InputAccessToken]] = {}
-    for input_id in range(program.n_inputs):
-        if input_id in program.parameter_indices or not program.shapes[input_id]:
-            scopes[input_id] = frozenset()
-            continue
-        scopes[input_id] = frozenset(
-            (input_id, index)
-            for index in range(program.shapes[input_id][0])
-        )
-
-    parameter_derived_ssa_ids = set(program.parameter_indices)
-    for op_index, instruction in enumerate(program.instructions):
-        result_id = program.n_inputs + op_index
-        if instruction.argument_ssa_ids and all(
-            argument in parameter_derived_ssa_ids
-            for argument in instruction.argument_ssa_ids
-        ):
-            parameter_derived_ssa_ids.add(result_id)
-
-        direct_scope = _direct_non_parameter_input_access_scope(
-            program,
-            instruction,
-        )
-        if direct_scope is not None:
-            scopes[result_id] = direct_scope
-        else:
-            scopes[result_id] = frozenset().union(
-                *(scopes[argument] for argument in instruction.argument_ssa_ids)
-            )
-
-    for ssa_id in sorted(
-        parameter_derived_ssa_ids.intersection(live_ssa_ids),
-        reverse=True,
-    ):
-        consumer_scopes = [
-            scopes[consumer]
-            for consumer in program.consumers_of_ssa_id[ssa_id]
-            if consumer in live_ssa_ids
-        ]
-        if consumer_scopes:
-            scopes[ssa_id] = frozenset().union(*consumer_scopes)
-
-    return scopes
-
-
-def _direct_non_parameter_input_access_scope(
-    program: RichProgram,
-    instruction: RichInstruction,
-) -> frozenset[_InputAccessToken] | None:
-    if len(instruction.argument_ssa_ids) != 1:
-        return None
-    input_id = instruction.argument_ssa_ids[0]
-    if input_id >= program.n_inputs or input_id in program.parameter_indices:
-        return None
-
-    operator = instruction.operator
-    if isinstance(operator, OperatorSelect) and operator.axis == 0:
-        return frozenset({(input_id, operator.index)})
-    if isinstance(operator, OperatorSlice) and operator.axis == 0:
-        return frozenset(
-            (input_id, index)
-            for index in range(operator.start, operator.stop)
-        )
-    return None
 
 
 def _input_frontier_depths(
@@ -1509,42 +1401,31 @@ class FoldSameShapedOperations(PreprocessingRoutine):
         program: RichProgram,
         *,
         optimize_group_order: bool = True,
-        order_by_input_access: bool | None = None,
-        split_by_routing: bool | None = None,
-        gather_fragmented_batches: bool | None = None,
+        split_by_routing: bool = False,
+        _gather_fragmented_batches: bool | None = None,
     ) -> FoldSameShapedOperationsResult:
         """Fold using XE-native input frontiers without source metadata.
 
-        This is the publication experiment path for paper "IR-Level Folding"
-        and "Memory Layout Optimizations" (sec:memory-layout). It applies the
-        same fold-axis batching, consumer ordering, and input-permutation
-        metadata as :meth:`apply_with_metadata`, but discovers layers from
-        input frontiers when no symbolic-circuit layer metadata is available.
+        This applies the same fold-axis batching, consumer ordering, and
+        input-permutation metadata as :meth:`apply_with_metadata`, but
+        discovers layers from input frontiers when no symbolic-circuit layer
+        metadata is available.
 
-        Same-index product programs skip the CP-specific input-access pre-sort
-        and routing split. Their fragmented batches use slice/concatenate when
+        Same-index product programs use slice/concatenate when
         that produces a compact routing graph, but automatically fall back to
         gathers when shared subgraphs would otherwise generate substantially
-        more routing IR. Other contraction structures retain the gather route;
-        callers can force either behavior with the routing options.
+        more routing IR. Other contraction structures retain the gather route.
+        ``_gather_fragmented_batches`` is a private override for tests and
+        targeted benchmark diagnostics.
         """
 
         is_same_index_product_program = _has_same_index_product_contraction(
             program
         )
-        if split_by_routing is None:
-            split_by_routing = False
         groups = group_identical_ops_by_input_depth(
             program,
             split_by_routing=split_by_routing,
         )
-        if order_by_input_access is None:
-            order_by_input_access = False
-        if order_by_input_access:
-            groups = _order_input_depth_groups_by_input_access(
-                program,
-                groups,
-            )
         if not groups:
             return FoldSameShapedOperationsResult(
                 program=program,
@@ -1562,11 +1443,11 @@ class FoldSameShapedOperations(PreprocessingRoutine):
             if optimize_group_order
             else events
         )
-        if gather_fragmented_batches is not None:
+        if _gather_fragmented_batches is not None:
             return _rewrite_output_depth_group_events(
                 program,
                 ordered_events,
-                emit_fragmented_batch_gathers=gather_fragmented_batches,
+                emit_fragmented_batch_gathers=_gather_fragmented_batches,
             )
         if not is_same_index_product_program:
             return _rewrite_output_depth_group_events(

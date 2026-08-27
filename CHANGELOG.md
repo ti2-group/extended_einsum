@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## 1.2.0 - 2026-08-27
+
+### Changed
+
+- Removed the ineffective input-access folding-order option and made natural input ordering unconditional.
+- Narrowed the public routing control to automatic routing or explicitly forced gathers.
+- Updated automatic categorical lookup selection for scaled 64-unit CP quad graphs.
+
 ## 1.1.1 - 2026-08-26
 
 ### Added
