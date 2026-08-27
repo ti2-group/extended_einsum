@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## 1.2.0 - 2026-08-27
+
+### Changed
+
+- Removed the ineffective input-access folding-order option and made natural input ordering unconditional.
+- Narrowed the public routing control to automatic routing or explicitly forced gathers.
+- Updated automatic categorical lookup selection for scaled 64-unit CP quad graphs.
+
 ## 1.1.1 - 2026-08-26
 
 ### Added
@@ -12,8 +20,6 @@ All notable changes to this project are documented here. The project follows [Se
 ### Changed
 
 - Reworked input-depth folding to choose between contiguous slice/concatenate routing and indexed gathers based on program structure and estimated routing cost.
-- Removed the ineffective input-access fold-ordering path and narrowed the Cirkit demo's routing override to automatic routing or explicitly forced gathers.
-- Updated automatic categorical lookup selection for scaled 64-unit CP quad graphs.
 - Changed scaled evaluation to normalize according to contraction depth, with a configurable interval and a default of three contractions, while still normalizing at representation boundaries.
 - Improved consumer-aware fold ordering, input preordering, parameter packing, and gather materialization for shared and deeply folded expression graphs.
 - Extended Cirkit benchmark output with reproducibility, compilation, routing, optimizer, and incremental memory metrics.
