@@ -1,0 +1,407 @@
+[
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.7392034843786439,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.7398238959679238,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 4
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 1.0377522758815598,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 64
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 135168, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.8512147669206586,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 167,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.6999137823922293,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 191,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 0.7947997296442751,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 236,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 135168, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.8216137772899563,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 122,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.6817135649842101,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 124,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 0.766522858359597,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 116,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 16,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 135168, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.7043186412138097,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 88
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.6697512361738417,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 98
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 1.0393778179002844,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 156
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 139264, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.6092284822463989,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.5428808932834202,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 0.5985917234420777,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 254,
+    "spill": 0
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 139264, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.5970793793841106,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 6
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.5272504522445354,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 2
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 0.6129724381845209,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 22
+  },
+  {
+    "config": {
+      "block_size": 32,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 139264, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 1.719974858420236,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 410
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 4,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 1.7502194863778573,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 388
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 1.8971422882080078,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 478
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 4,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 147456, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.6898414445960003,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 96
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 8,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.6289649712411981,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 98
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 0.7099104095907772,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 255,
+    "spill": 116
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 8,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 147456, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 1
+    },
+    "ms": 0.8217790829933296,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 76
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 16,
+      "reduction_block_size": 32,
+      "pipeline_stages": 3
+    },
+    "ms": 0.6928741401349995,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 68
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 1
+    },
+    "ms": 1.176854873285061,
+    "error_vs_helion": 0.0023193359375,
+    "regs": 128,
+    "spill": 106
+  },
+  {
+    "config": {
+      "block_size": 64,
+      "num_warps": 16,
+      "reduction_block_size": 64,
+      "pipeline_stages": 3
+    },
+    "error": "out of resource: shared memory, Required: 147456, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+  }
+]
