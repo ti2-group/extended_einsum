@@ -40,7 +40,8 @@ it is not required for the Triton tree path. An existing inference runner uses
 Torch when a later call requests gradients, so gradients are never dropped.
 
 Regular Triton inference currently requires explicit `precision="tf32"`.
-`tf32x3` (default) and `ieee` use Torch/Helion. TF32 rounds matrix operands and
+`tf32x3` (default) and `ieee` use Torch/Helion. Precision options govern custom
+kernels; Torch fallback respects the caller's Torch precision settings. TF32 rounds matrix operands and
 accumulates in FP32; approximate exp/log intrinsics are used. Likelihood-relative
 errors accumulate with depth. Validate precision on your own model.
 
@@ -79,7 +80,10 @@ through `model.variable_ids`; categorical parameter banks are separate per leaf.
 For Adam use `parameterization="logits"` and `trainer="adam"`; the original
 logits remain the optimizer parameters. The custom backward returns gradients
 with respect to log probabilities and autograd applies the log_softmax Jacobian.
-Normalized Anemone parameters do **not** pass through a softmax. The fused update
+Adam can amplify roundoff in nearly zero gradients into larger individual
+logit changes; check likelihoods and aggregate gradients rather than requiring
+identical logits across implementations. Normalized Anemone parameters do
+**not** pass through a softmax. The fused update
 includes data flows, model flows, momentum bias correction, a float32 floor and
 log normalization. Its GPU step counter advances on CUDA graph replay.
 
@@ -143,3 +147,26 @@ used root-major grid ordering and should not be treated as the winning Helion
 baseline. `triton-reciprocal-tuning.json` alternates measurements against the
 correct sample-major Helion schedule. Measurements can vary with GPU load;
 use the supplied scripts to confirm choices on the target device.
+
+## Packaged training measurements
+
+All twelve cases completed on the A6000 with 784 synthetic categorical pixels,
+TF32 circuit operations, and raw lookup plus complete training steps in the
+measurement. Each entry is custom / compiled Torch time in milliseconds.
+
+| Batch | Units | Softmax Adam | EM | Anemone |
+|---:|---:|---:|---:|---:|
+| 128 | 32 | 1.59 / 1.75 | 0.66 / 1.97 | 0.76 / 1.91 |
+| 128 | 256 | 19.55 / 20.98 | 8.42 / 26.35 | 10.56 / 26.19 |
+| 256 | 32 | 2.06 / 2.53 | 1.12 / 2.74 | 1.20 / 2.73 |
+| 256 | 256 | 25.20 / 27.23 | 14.03 / 32.61 | 16.60 / 32.50 |
+
+The full repeats and initial likelihood differences are in
+`benchmarks/training-packaged.json` and `.csv`. Initial NLL differences were at
+most 0.002 nats per image. These are synthetic timing and initial-parity checks,
+not new MNIST training-quality results. The matched Torch reference differentiates
+the partition for model flows; the historical MNIST reference used a manually
+optimized top-down flow pass and a different tree. Keep those comparisons separate.
+The benchmark resumed after four cases using `dynamic=False` to avoid a Torch
+Inductor `SymFloat` compiler failure on a subsequent shape. No eager reference
+was substituted into the timing table.

@@ -73,7 +73,7 @@ def compile_cuda(program, inputs, *, batch_axes, backend="auto", precision="tf32
     if precision not in ("tf32", "tf32x3", "ieee"):
         raise ValueError("Unsupported precision")
     reason = "Explicit Torch backend"
-    eligible = _cuda_ready(inputs) and not _gradients(inputs) and find_spec("helion") is not None
+    eligible = _cuda_ready(inputs) and not (torch.is_grad_enabled() and _gradients(inputs)) and find_spec("helion") is not None
     if backend == "helion" or (backend == "auto" and eligible):
         from extended_einsum.backends.helion import compile_helion
 
@@ -148,13 +148,13 @@ class CompiledCircuit:
         selected = backend
         options = {}
         reason = "Explicit backend"
-        eligible = _cuda_ready(inputs) and not _gradients(inputs)
+        eligible = _cuda_ready(inputs) and not (torch.is_grad_enabled() and _gradients(inputs))
         ampere = eligible and torch.cuda.get_device_capability(binding.device) == (8, 6)
         # Measured A6000 profile. Other devices retain conservative generic paths.
         if backend == "auto":
             selected = "torch"
             reason = "Torch fallback for autograd, CPU, or an unprofiled device/shape"
-            if ampere and precision == "tf32" and u in (64, 128, 256) and b >= 128 and find_spec("triton"):
+            if ampere and precision == "tf32" and u in (64, 128, 256) and b >= 128 and f * b * u < 2**31 and find_spec("triton"):
                 selected = "triton"
                 reason = "A6000 Triton profile; Helion remains an explicit comparison backend"
         if selected == "triton":

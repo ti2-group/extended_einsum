@@ -36,7 +36,7 @@ def test_cpu_fallback_has_gradients_and_dynamic_data(mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("units", [9, 65, 256])
+@pytest.mark.parametrize("units", [2, 9, 65, 256])
 def test_triton_modes_routes_zeros_and_grad_fallback(mode, units):
     binding, weights = inputs("cuda", units=units)
     runner = compile_circuit(binding, weights, stability=mode, backend="triton", precision="tf32")
@@ -72,3 +72,31 @@ def test_triton_graph_and_current_stream():
             binding.pixels.add_(1).remainder_(7)
             weights[0].mul_(0.9)
     torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_auto_inference_inside_no_grad_and_scaled_profile():
+    binding, weights = inputs("cuda", units=128, batch=128, leaves=4)
+    binding = replace(binding, tables=binding.tables.requires_grad_())
+    weights = [w.requires_grad_() for w in weights]
+    with torch.no_grad():
+        runner = compile_circuit(binding, weights, stability="scaled_max", precision="tf32")
+        if torch.cuda.get_device_capability() == (8, 6):
+            assert runner.selection.backend == "triton"
+            assert runner.selection.options["pipeline_stages"] == 3
+        assert torch.isfinite(runner(binding, weights)).all()
+    runner(binding, weights).sum().backward()
+    assert all(w.grad is not None for w in weights)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_inference_consumes_normalized_probability_floor():
+    floor = torch.tensor(torch.finfo(torch.float32).tiny, device="cuda").log()
+    table = torch.stack([torch.stack([floor * 0, floor]), torch.stack([floor, floor * 0])]).expand(2, -1, -1).contiguous()
+    binding = CategoricalInput(torch.zeros((17, 2), dtype=torch.uint8, device="cuda"), table, torch.arange(2, device="cuda"))
+    leaf = table.exp().clone()
+    root = torch.stack([floor, floor * 0]).exp().reshape(1, 1, 2).expand(1, 2, 2).contiguous()
+    with torch.no_grad():
+        runner = compile_circuit(binding, [leaf, root], backend="triton", precision="tf32")
+        result = runner(binding, [leaf, root])
+        torch.testing.assert_close(result, floor.expand_as(result), atol=3e-5, rtol=0)

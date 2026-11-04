@@ -324,7 +324,7 @@ def _tl_kernel(
     else:
         root, tile = tl.program_id(0), tl.program_id(1)
     rows = tile * M + tl.arange(0, M)
-    P: tl.constexpr = tr.next_power_of_2(U)
+    P: tl.constexpr = max(16, tr.next_power_of_2(U))
     x, s = _tl_node(Pixels, Tables, Variables, Banks, Prev, Scales, Weights, root, rows, B, V, C, BANKS, U, P, M, K, H, FIRST, MODE, LOOKUP, STAGES, STORAGE, ONLINE, PAIR, TRANSPOSE_FRONTIER)
     if MODE.startswith("scaled"):
         if LAST:
@@ -351,6 +351,8 @@ class TritonCircuit:
             raise ValueError("Requires a complete binary tree")
         if stability not in ("logspace_max", "logspace_min", "scaled_max", "scaled_sum", "scaled_min"):
             raise ValueError("Unsupported stability mode")
+        if f * binding.shape[1] * u >= 2**31:
+            raise ValueError("Node storage exceeds 32-bit indexing")
         self.mode, self.m, self.warps, self.stages = stability, block_size, num_warps, pipeline_stages
         self.k = reduction_block_size
         self.online = online_weights
@@ -360,7 +362,9 @@ class TritonCircuit:
 
     def _check_weights(self, weights):
         f, _, u = self.shape
-        if len(weights) != f.bit_length() or any(tuple(w.shape) != (f >> i, u, u) or w.device != self.device or w.dtype != torch.float32 or not w.is_contiguous() for i, w in enumerate(weights)):
+        if len(weights) != f.bit_length() or any(
+            tuple(w.shape) != (f >> i, u, u) or w.device != self.device or w.dtype != torch.float32 or not w.is_contiguous() or w.numel() >= 2**31 for i, w in enumerate(weights)
+        ):
             raise ValueError("Weights must be contiguous FP32 [fold,output,input] tensors per level")
 
     def __call__(self, binding, weights):
@@ -392,7 +396,7 @@ class TritonCircuit:
                         binding.tables.shape[0],
                         u,
                         self.m,
-                        min(self.k, tr.next_power_of_2(u)),
+                        max(16, min(self.k, tr.next_power_of_2(u))),
                         h,
                         level == 0,
                         level + h == len(weights),

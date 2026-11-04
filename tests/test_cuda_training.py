@@ -105,3 +105,42 @@ def test_cuda_graph_updates_and_checkpoint(trainer):
     assert torch.isfinite(loss)
     for p, q in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p, q, atol=8e-4, rtol=0)
+
+
+@CUDA
+def test_backward_preserves_forward_pixel_routes():
+    model = balanced_tree(pixels=4, units=5, categories=7, device="cuda", parameterization="logits")
+    reference = copy.deepcopy(model)
+    runner = compile_training(model, 17, trainer="adam", backend="triton", precision="tf32x3")
+    x = torch.randint(7, (17, 4), device="cuda")
+    loss = runner.loss(x)
+    expected = reference.loss(x)
+    model.variable_ids = model.variable_ids.flip(0)
+    loss.backward()
+    expected.backward()
+    for p, q in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(p.grad, q.grad, atol=4e-6, rtol=1e-3)
+    loss = runner.loss(x)
+    model.variable_ids.add_(1)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        loss.backward()
+
+
+@CUDA
+@pytest.mark.parametrize("precision", ["tf32", "tf32x3"])
+def test_float32_floor_survives_tensor_core_boundaries(precision):
+    model = balanced_tree(pixels=2, units=2, categories=2, device="cuda")
+    floor = torch.tensor(torch.finfo(torch.float32).tiny, device="cuda").log()
+    with torch.no_grad():
+        model.categorical.copy_(torch.stack([torch.stack([floor * 0, floor]), torch.stack([floor, floor * 0])]).expand(2, -1, -1))
+        model.weights[0].copy_(torch.stack([torch.stack([floor * 0, floor]), torch.stack([floor, floor * 0])]).expand(2, -1, -1))
+        model.weights[-1].copy_(torch.stack([floor, floor * 0]).reshape(1, 1, 2))
+    reference = copy.deepcopy(model).double()
+    x = torch.zeros((17, 2), dtype=torch.uint8, device="cuda")
+    runner = compile_training(model, 17, backend="triton", precision=precision)
+    loss = runner.loss(x)
+    torch.testing.assert_close(loss.double(), reference.loss(x), atol=3e-5, rtol=0)
+    loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters())
+    assert torch.isfinite(runner.step(x))
+    assert all(torch.isfinite(p).all() for p in model.parameters())

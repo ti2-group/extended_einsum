@@ -367,14 +367,14 @@ class _CircuitLoss(torch.autograd.Function):
     def forward(ctx, runner, images, *parameters):
         loss, state = runner.forward_values(images)
         ctx.runner = runner
-        ctx.save_for_backward(images, *state, *parameters)
+        ctx.save_for_backward(images, runner.source.variable_ids, *state, *parameters)
         return loss
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad):
-        images, nodes, cached_x, shifts, *parameters = ctx.saved_tensors
-        result = ctx.runner.backward_values(images, (nodes, cached_x, shifts), grad, update=False, parameters=parameters)
+        images, variables, nodes, cached_x, shifts, *parameters = ctx.saved_tensors
+        result = ctx.runner.backward_values(images, (nodes, cached_x, shifts), grad, update=False, parameters=parameters, variables=variables)
         return None, None, *result
 
 
@@ -502,7 +502,8 @@ class TritonAnemone:
 
     @torch.no_grad()
     @_device_guard
-    def backward_values(self, images, state, grad, *, update, parameters=None):
+    def backward_values(self, images, state, grad, *, update, parameters=None, variables=None):
+        variables = self.source.variable_ids if variables is None else variables
         parameters = self.parameters if parameters is None else tuple(parameters)
         nodes, cached_x, shifts = state
         u, b = self.u, self.b
@@ -579,7 +580,7 @@ class TritonAnemone:
         kernels.append(
             _categorical_backward[(tr.cdiv(u, self.cn), self.f)](
                 images,
-                self.source.variable_ids,
+                variables,
                 flow,
                 parameters[0],
                 result[0],
