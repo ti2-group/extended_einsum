@@ -85,3 +85,57 @@ for an optimizer update. Custom double backward is unsupported. Save the model's
 resuming with the same optimizer hyperparameters. Compile a new trainer after
 moving/replacing model parameters or changing topology/batch size. Warm forward,
 backward and optimizer kernels on a side stream before CUDA graph capture.
+
+## Cirkit input kernels
+
+The input implementation is separate from the circuit implementation:
+`extended_einsum/inputs.py` holds evidence bindings and the Cirkit adapter;
+`backends/triton_inputs.py` holds the input evaluation and gradient kernels.
+There is no Helion backend or dependency in this runtime.
+
+```python
+from extended_einsum.inputs import compile_input
+
+# A Cirkit Torch input layer, with its existing parameters and semiring.
+input_fn = compile_input(cirkit_input_layer)
+scores = input_fn(raw_data)  # raw_data[batch, variables] -> [fold, batch, units]
+# Gradients propagate to the original parameters and to continuous data.
+scores.backward(upstream_flows)
+print(input_fn.selection)
+```
+
+Cirkit remains an optional dependency. The adapter supports categorical,
+embedding, binomial (including Bernoulli), Gaussian (with optional log partition),
+polynomial, constant-value and evidence layers. It preserves Cirkit's linear or
+log output space. Categorical logits are **unnormalized log values**, as in Cirkit;
+they are not passed through a softmax. This differs from the explicit
+`CategoricalInput(logits=True).materialize()` normalization option.
+
+FP32 CUDA input evaluation fuses raw-variable selection with the distribution or
+function calculation. Custom first-order backward reduces input-parameter flows;
+continuous input gradients accumulate correctly for repeated variable routes.
+The adapter reads parameter values on every call. It bypasses only provable
+identity gathers on direct tensor parameters; changed fold routing falls back
+to Cirkit's parameter graph. Recapture CUDA graphs after changing parameter-fold
+routing or replacing parameters. Raw data, parameter values and variable-scope
+indices can change in place between replays. General parameter transforms stay owned by Cirkit.
+
+Constants transform their small parameter vector before broadcasting. Evidence
+is evaluated once before broadcasting across the batch. These paths avoid full
+batch-sized output writes. Outputs may be strided or broadcast views and should be treated as read-only.
+Use `clone()` for a writable copy, or request contiguity when a consuming
+operation requires it.
+
+The selected tiles depend on the input family and unit count. `tile`,
+`output_layout`, `table_layout`, `backward_units` and `backward_categories` offer
+explicit overrides. No parameter pack is cached; a requested packed table is
+rebuilt on every call. CPU, complex semirings and unsupported precision/shape
+setups preserve Cirkit's Torch execution. Custom kernels assume valid
+parameter domains, for example positive Gaussian standard deviations.
+Polynomial singleton batches retain the installed Cirkit implementation's
+behavior via Torch. Custom backward supports batches up to 512; larger training
+batches fall back to Torch.
+
+This adapter can supply tensors to existing extended-einsum expressions. The
+specialized `TreeCircuit` trainer above continues to model categorical leaves;
+the adapter does not introduce Gaussian EM update rules into that trainer.

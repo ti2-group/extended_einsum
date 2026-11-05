@@ -12,22 +12,9 @@ import torch
 import triton as tr
 import triton.language as tl
 
+from extended_einsum.backends.triton_inputs import _categorical_values
+
 _USE_RECIPROCAL = tl.constexpr(os.environ.get("XE_TRITON_NORMALIZATION", "division") == "reciprocal")
-
-
-@tr.jit
-def _categorical_kernel(Pixels, Tables, Variables, Banks, Out, B: tl.constexpr, V: tl.constexpr, C: tl.constexpr, BANKS: tl.constexpr, U: tl.constexpr, M: tl.constexpr, N: tl.constexpr):
-    rows = tl.program_id(0) * M + tl.arange(0, M)
-    cols = tl.program_id(1) * N + tl.arange(0, N)
-    root = tl.program_id(2)
-    variable = tl.load(Variables + root)
-    bank = tl.load(Banks + root)
-    valid_id = (variable >= 0) & (variable < V) & (bank >= 0) & (bank < BANKS)
-    category = tl.load(Pixels + rows * V + variable.to(tl.int32), (rows < B) & valid_id, other=0).to(tl.int64)
-    valid = valid_id & (category >= 0) & (category < C)
-    x = tl.load(Tables + (bank.to(tl.int32) * C + category.to(tl.int32)[:, None]) * U + cols[None, :], (rows < B)[:, None] & valid[:, None] & (cols < U)[None, :], other=0.0)
-    x = tl.where(valid[:, None], x, float("nan"))
-    tl.store(Out + (root * B + rows[:, None]) * U + cols[None, :], x, (rows < B)[:, None] & (cols < U)[None, :])
 
 
 @tr.jit
@@ -184,21 +171,10 @@ def _tl_prepare(
         else:
             x = left + right
     elif FIRST:
-        variable = tl.load(Variables + root)
-        bank = tl.load(Banks + root)
-        valid_id = (variable >= 0) & (variable < V) & (bank >= 0) & (bank < BANKS)
         if LOOKUP == 2:
             x = tl.load(Prev + (root * B + rows[:, None]) * U + cols[None, :], (rows < B)[:, None] & (cols < U)[None, :], other=0.0)
-        elif LOOKUP == 0:
-            category = tl.load(Pixels + rows * V + variable.to(tl.int32), (rows < B) & valid_id, other=0).to(tl.int64)
-            valid = valid_id & (category >= 0) & (category < C)
-            x = tl.load(Tables + (bank.to(tl.int32) * C + category.to(tl.int32)[:, None]) * U + cols[None, :], (rows < B)[:, None] & valid[:, None] & (cols < U)[None, :], other=0.0)
-            x = tl.where(valid[:, None], x, float("nan"))
         else:
-            category = tl.load(Pixels + rows[:, None] * V + variable.to(tl.int32), (rows < B)[:, None] & valid_id, other=0).to(tl.int64)
-            valid = valid_id & (category >= 0) & (category < C)
-            x = tl.load(Tables + (bank.to(tl.int32) * C + category.to(tl.int32)) * U + cols[None, :], (rows < B)[:, None] & valid & (cols < U)[None, :], other=0.0)
-            x = tl.where(valid, x, float("nan"))
+            x = _categorical_values(Pixels, Tables, Variables, Banks, root, rows, cols, B, V, C, BANKS, U, LOOKUP)
         if MODE.startswith("scaled"):
             shift = tl.max(tl.where(cols[None, :] < U, x, float("-inf")), 1)
             shift = tl.where(shift == float("-inf"), 0.0, shift)

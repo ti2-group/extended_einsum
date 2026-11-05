@@ -13,8 +13,8 @@ import torch
 
 from extended_einsum.backend_translation import translate_to_backend_program
 from extended_einsum.backend_translation.runtime import run_program
-from extended_einsum.backends.categorical import CategoricalInput
 from extended_einsum.backends.torch import TorchBackendFunctions
+from extended_einsum.inputs import CategoricalInput
 from extended_einsum.language.rich_instruction import RichInstruction
 from extended_einsum.language.rich_operators import OperatorEinsum, OperatorExp, OperatorLog, OperatorSelect, OperatorTake
 from extended_einsum.language.rich_program import RichProgram

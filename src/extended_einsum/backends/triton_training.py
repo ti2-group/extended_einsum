@@ -11,26 +11,7 @@ import triton as tr
 import triton.language as tl
 from torch.autograd.function import once_differentiable
 
-
-@tr.jit
-def _rna(x, PRECISION: tl.constexpr):
-    if PRECISION == "tf32":
-        return tl.inline_asm_elementwise("cvt.rna.tf32.f32 $0, $1;", constraints="=f,f", args=[x], dtype=tl.float32, is_pure=True, pack=1)
-    return x
-
-
-@tr.jit
-def _leaves(Pixels, Variables, LogCat, Nodes, B: tl.constexpr, V: tl.constexpr, F: tl.constexpr, C: tl.constexpr, U: tl.constexpr, M: tl.constexpr, P: tl.constexpr):
-    f = tl.program_id(1)
-    b = tl.program_id(0) * M + tl.arange(0, M)
-    u = tl.arange(0, P)
-    variable = tl.load(Variables + f).to(tl.int64)
-    valid_variable = (variable >= 0) & (variable < V)
-    c = tl.load(Pixels + b * V + variable.to(tl.int32), (b < B) & valid_variable, other=0).to(tl.int64)
-    valid = valid_variable & (c >= 0) & (c < C)
-    value = tl.load(LogCat + (f * C + c.to(tl.int32)[:, None]) * U + u[None, :], (b < B)[:, None] & valid[:, None] & (u < U)[None, :], other=0.0)
-    value = tl.where(valid[:, None], value, float("nan"))
-    tl.store(Nodes + (f * B + b[:, None]) * U + u[None, :], value, (b < B)[:, None] & (u < U)[None, :])
+from extended_einsum.backends.triton_inputs import _categorical_backward, _leaves, _rna
 
 
 @tr.jit
@@ -281,61 +262,6 @@ def _weight_backward(
         tl.store(LogW + pos, logp, mask)
     else:
         tl.store(GradW + pos, grad, mask)
-
-
-@tr.jit
-def _categorical_backward(
-    Pixels,
-    Variables,
-    Flow,
-    LogCat,
-    GradCat,
-    Model,
-    Momentum,
-    Bias,
-    B: tl.constexpr,
-    V: tl.constexpr,
-    F: tl.constexpr,
-    C: tl.constexpr,
-    U: tl.constexpr,
-    P: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    STAGES: tl.constexpr,
-    PRECISION: tl.constexpr,
-    UPDATE: tl.constexpr,
-    ALPHA: tl.constexpr,
-    MOM: tl.constexpr,
-):
-    f = tl.program_id(1)
-    u = tl.program_id(0) * N + tl.arange(0, N)
-    c = tl.arange(0, P)
-    kk = tl.arange(0, K)
-    acc = tl.full((P, N), 0.0, tl.float32)
-    for panel in tl.range(tr.cdiv(B, K), num_stages=STAGES):
-        b = panel * K + kk
-        variable = tl.load(Variables + f).to(tl.int64)
-        valid = (variable >= 0) & (variable < V)
-        cat = tl.load(Pixels + b * V + variable.to(tl.int32), (b < B) & valid, other=-1).to(tl.int64)
-        indicator = ((c[:, None] == cat[None, :]) & (b < B)[None, :] & (c < C)[:, None]).to(tl.float32)
-        flow = tl.load(Flow + (f * B + b[:, None]) * U + u[None, :], (b < B)[:, None] & (u < U)[None, :], other=0.0)
-        acc = tl.dot(indicator, _rna(flow, PRECISION), acc, input_precision=PRECISION)
-    pos = (f * C + c[:, None]) * U + u[None, :]
-    mask = (c < C)[:, None] & (u < U)[None, :]
-    if UPDATE:
-        data = -acc
-        if MOM > 0.0:
-            running = MOM * tl.load(Momentum + pos, mask, other=0.0) + (1.0 - MOM) * data
-            tl.store(Momentum + pos, running, mask)
-            data = running / tl.load(Bias)
-        mf = tl.load(Model + f * U + u, u < U, other=0.0)
-        w = tl.exp(tl.load(LogCat + pos, mask, other=float("-inf")))
-        numerator = tl.maximum((1.0 - ALPHA) * w * mf[None, :] + ALPHA * data, 1.1754943508222875e-38)
-        numerator = tl.where((c < C)[:, None], numerator, 0.0)
-        logp = tl.log(numerator) - tl.log(tl.sum(numerator, 0))[None, :]
-        tl.store(LogCat + pos, logp, mask)
-    else:
-        tl.store(GradCat + pos, acc, mask)
 
 
 @dataclass(frozen=True)
