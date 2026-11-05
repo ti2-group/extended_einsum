@@ -33,7 +33,7 @@ Optional Triton tree kernels provide fused categorical lookup, stable inference,
 custom backward and EM/Anemone updates. Softmax Adam combines custom circuit
 kernels with Torch normalization and fused Adam. Dispatch preserves the selected
 stability mode and exposes its backend/reason; unsupported setups fall back to
-Torch. See [the API, limitations and benchmark evidence](docs/custom-kernels.md).
+Torch. See [the API and supported configurations](docs/custom-kernels.md).
 
 ```bash
 pip install "extended-einsum[cuda]"

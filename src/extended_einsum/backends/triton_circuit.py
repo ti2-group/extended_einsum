@@ -1,6 +1,6 @@
 """Register-based Triton kernels for regular positive binary circuits.
 
-Inference-only benchmark prototype. Log modes retain log-valued frontiers;
+Inference kernels. Log modes retain log-valued frontiers;
 scaled modes carry normalized values and a separate per-row log scale.
 """
 

@@ -35,7 +35,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-helion = ["helion>=1.5.2,<1.6"]
 cuda = ["triton>=3.7,<3.8; platform_system == 'Linux'"]
 jax = ["jax>=0.10.1"]
 jax-cuda = ["jax[cuda13]>=0.10.1"]
