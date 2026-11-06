@@ -3,6 +3,10 @@ from importlib.metadata import PackageNotFoundError, version
 from extended_einsum.backend_translation import BackendCompiler as BackendCompiler
 from extended_einsum.backend_translation import BackendFunctions as BackendFunctions
 from extended_einsum.backends.registry import register_backend as register_backend
+from extended_einsum.backends.registry import register_compiled_backend as register_compiled_backend
+from extended_einsum.compiled import CompiledBackend as CompiledBackend
+from extended_einsum.compiled import UnsupportedProgramError as UnsupportedProgramError
+from extended_einsum.compiled import compile_program as compile_program
 from extended_einsum.interface import TensorExpression as TensorExpression
 from extended_einsum.interface import array as array
 from extended_einsum.interface import cos as cos
@@ -28,6 +32,10 @@ except PackageNotFoundError:
 __all__ = [
     "BackendCompiler",
     "BackendFunctions",
+    "CompiledBackend",
+    "UnsupportedProgramError",
+    "compile_program",
+    "register_compiled_backend",
     "TensorExpression",
     "__version__",
     "array",

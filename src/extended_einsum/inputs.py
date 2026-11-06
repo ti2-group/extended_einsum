@@ -7,6 +7,8 @@ from math import prod
 
 import torch
 
+from extended_einsum.compiled import UnsupportedProgramError
+
 
 @dataclass(frozen=True)
 class CategoricalInput:
@@ -116,11 +118,10 @@ class CirkitInput:
 
     Parameters are read live from the layer on every call. Categorical logits
     are unnormalized log values, as in Cirkit. Constants/evidence broadcast
-    rather than materializing repeated batch rows. Complex/unsupported inputs
-    preserve Cirkit's Torch behavior. Compile again after moving the layer.
+    rather than materializing repeated batch rows. Unsupported inputs are rejected. Compile again after moving the layer.
     """
 
-    def __init__(self, layer, *, backend="auto", tile=None, num_warps=4, table_layout="native", backward_units=None, backward_categories=None, output_layout=None):
+    def __init__(self, layer, *, backend="triton", tile=None, num_warps=4, table_layout="native", backward_units=None, backward_categories=None, output_layout=None):
         from cirkit.backend.torch.layers.input import (
             TorchBinomialLayer,
             TorchCategoricalLayer,
@@ -131,7 +132,7 @@ class CirkitInput:
             TorchPolynomialLayer,
         )
 
-        if backend not in ("auto", "torch", "triton") or table_layout not in ("native", "units") or output_layout not in (None, "units", "batch"):
+        if backend != "triton" or table_layout not in ("native", "units") or output_layout not in (None, "units", "batch"):
             raise ValueError("Unsupported input backend/layout")
         if tile is not None and (len(tile) != 2 or any(n < 1 or n & (n - 1) for n in tile)):
             raise ValueError("Input tiles must be two positive powers of two")
@@ -185,7 +186,7 @@ class CirkitInput:
                 indices = entry.in_fold_idx[0]
                 if not indices.is_inference() and torch.equal(indices, torch.arange(parameter.num_folds, dtype=indices.dtype, device=indices.device)):
                     self._direct_parameters[name] = (parameter, nodes[0], indices, indices._version, parameter.address_book._entry_in_fold_idx_targets[-1][0])
-        self.selection = InputSelection("torch", "Not yet evaluated", {})
+        self.selection = InputSelection("triton", "Not yet evaluated", {})
 
     def reference(self, data, routes=None):
         if self.kind in ("constant", "evidence"):
@@ -195,6 +196,12 @@ class CirkitInput:
         return self.layer(folded)
 
     def __call__(self, data):
+        if not self.real_semiring:
+            raise UnsupportedProgramError("Triton inputs require a real linear or log semiring")
+        if self.kind in ("constant", "evidence"):
+            params = tuple(self.layer.parameters())
+            if any(p.device.type != "cuda" or p.dtype != torch.float32 for p in params):
+                raise UnsupportedProgramError("Triton inputs require real FP32 CUDA parameters")
         if self.kind == "constant":
             self.selection = InputSelection("torch-view", "Broadcast constant without batch-sized writes", {})
             value = self._read("value")
@@ -204,8 +211,7 @@ class CirkitInput:
         if self.kind == "evidence":
             batch = data if isinstance(data, int) else data.shape[0]
             if self.inner.kind in ("polynomial", "unsupported", "constant", "evidence"):
-                self.selection = InputSelection("torch", "Preserve wrapped Cirkit input behavior", {})
-                return self.reference(data)
+                raise UnsupportedProgramError("Unsupported Triton evidence composition")
             observation = self._read("observation")
             y = self.inner._call(observation.T.contiguous(), self.evidence_routes)
             self.selection = self.inner.selection
@@ -232,11 +238,7 @@ class CirkitInput:
         if data.ndim != 2 or data.shape[0] < 1 or data.shape[1] < 1:
             raise ValueError("Expected nonempty raw data [batch,variables]")
         if self.kind == "unsupported":
-            self.selection = InputSelection("torch", "Unsupported Cirkit input type", {})
-            return self.reference(data, routes)
-        if self.backend == "torch" or (self.backend == "auto" and (not self.real_semiring or data.device.type != "cuda")):
-            self.selection = InputSelection("torch", "Cirkit reference for this dtype/device/semiring", {})
-            return self.reference(data, routes)
+            raise UnsupportedProgramError("Unsupported Triton input type")
         params = self._parameters()
         supported = (
             self.real_semiring
@@ -250,17 +252,12 @@ class CirkitInput:
             and data.numel() < 2**31
             and not (self.kind == "polynomial" and data.shape[0] == 1)
         )
-        if self.backend == "torch" or not supported:
-            if self.backend == "triton" and not supported:
-                raise ValueError("Custom inputs require real FP32 CUDA parameters and a supported batch shape")
-            self.selection = InputSelection("torch", "Cirkit reference for this dtype/device/semiring", {})
-            return self.reference(data, routes)
+        if not supported:
+            raise UnsupportedProgramError("Triton inputs require real FP32 CUDA parameters and a supported batch shape/semiring")
         from importlib.util import find_spec
 
         if not find_spec("triton"):
-            if self.backend == "triton":
-                raise ModuleNotFoundError("Install extended-einsum[cuda] for input kernels")
-            return self.reference(data, routes)
+            raise ModuleNotFoundError("Install extended-einsum[cuda] for input kernels")
         data = data.contiguous()
         if self.kind in ("categorical_logits", "categorical_probs", "embedding", "binomial_logits", "binomial_probs"):
             data = data.detach()

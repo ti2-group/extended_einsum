@@ -13,6 +13,7 @@ import triton as tr
 import triton.language as tl
 
 from extended_einsum.backends.triton_inputs import _categorical_values
+from extended_einsum.inputs import CategoricalInput
 
 _USE_RECIPROCAL = tl.constexpr(os.environ.get("XE_TRITON_NORMALIZATION", "division") == "reciprocal")
 
@@ -171,8 +172,10 @@ def _tl_prepare(
         else:
             x = left + right
     elif FIRST:
-        if LOOKUP == 2:
+        if LOOKUP == 2 or LOOKUP == 3:
             x = tl.load(Prev + (root * B + rows[:, None]) * U + cols[None, :], (rows < B)[:, None] & (cols < U)[None, :], other=0.0)
+            if LOOKUP == 3:
+                x = tl.log(x)
         else:
             x = _categorical_values(Pixels, Tables, Variables, Banks, root, rows, cols, B, V, C, BANKS, U, LOOKUP)
         if MODE.startswith("scaled"):
@@ -318,10 +321,12 @@ def _tl_kernel(
 class TritonCircuit:
     """Fused categorical lookup and two-level register subtrees (TF32)."""
 
-    def __init__(self, binding, weights, *, stability="logspace_max", block_size=32, num_warps=16, pipeline_stages=3, reduction_block_size=32, online_weights=False):
+    def __init__(self, binding, weights, *, stability="logspace_max", block_size=32, num_warps=16, pipeline_stages=3, reduction_block_size=32, online_weights=False, input_log=True):
         self.shape, self.device = binding.shape, binding.device
         f, _, u = self.shape
-        if self.device.type != "cuda" or binding.logits or not binding.log_values:
+        self.categorical = isinstance(binding, CategoricalInput)
+        self.input_log = input_log
+        if self.device.type != "cuda" or (self.categorical and (binding.logits or not binding.log_values)):
             raise ValueError("Requires CUDA log-valued categorical probabilities")
         if f < 2 or f & (f - 1):
             raise ValueError("Requires a complete binary tree")
@@ -332,7 +337,7 @@ class TritonCircuit:
         self.mode, self.m, self.warps, self.stages = stability, block_size, num_warps, pipeline_stages
         self.k = reduction_block_size
         self.online = online_weights
-        self.specs = tuple((x.shape, x.dtype) for x in binding.tensors)
+        self.specs = tuple((x.shape, x.dtype) for x in (binding.tensors if self.categorical else (binding,)))
         self.compiled = []
         self._check_weights(weights)
 
@@ -344,13 +349,15 @@ class TritonCircuit:
             raise ValueError("Weights must be contiguous FP32 [fold,output,input] tensors per level")
 
     def __call__(self, binding, weights):
-        if binding.shape != self.shape or binding.device != self.device or binding.logits or not binding.log_values or tuple((x.shape, x.dtype) for x in binding.tensors) != self.specs:
+        tensors = binding.tensors if self.categorical else (binding,)
+        if binding.shape != self.shape or binding.device != self.device or tuple((x.shape, x.dtype) for x in tensors) != self.specs:
             raise ValueError("Evidence metadata differs from construction")
         self._check_weights(weights)
         if torch.is_grad_enabled() and (binding.requires_grad or any(w.requires_grad for w in weights)):
             raise ValueError("Triton circuit is inference only")
         f, b, u = self.shape
-        prev = scales = binding.tables
+        prev = scales = binding.tables if self.categorical else binding
+        pointers = binding.tensors if self.categorical else (binding,) * 4
         kernels = []
         with torch.cuda.device(self.device):
             for level in range(0, len(weights), 2):
@@ -360,16 +367,16 @@ class TritonCircuit:
                 outscale = torch.empty((roots, b), device=self.device, dtype=torch.float32) if self.mode.startswith("scaled") else out
                 kernels.append(
                     _tl_kernel[(tr.cdiv(b, self.m), roots)](
-                        *binding.tensors,
+                        *pointers,
                         prev,
                         scales,
                         tuple(weights[level : level + h]),
                         out,
                         outscale,
                         b,
-                        binding.pixels.shape[1],
-                        binding.tables.shape[1],
-                        binding.tables.shape[0],
+                        binding.pixels.shape[1] if self.categorical else 1,
+                        binding.tables.shape[1] if self.categorical else 1,
+                        binding.tables.shape[0] if self.categorical else 1,
                         u,
                         self.m,
                         max(16, min(self.k, tr.next_power_of_2(u))),
@@ -377,7 +384,7 @@ class TritonCircuit:
                         level == 0,
                         level + h == len(weights),
                         self.mode,
-                        0,
+                        0 if self.categorical else (2 if self.input_log else 3),
                         self.stages,
                         "samples",
                         STORAGE=("standard",) * h,

@@ -5,7 +5,9 @@ import copy
 import pytest
 import torch
 
+from extended_einsum.compiled import UnsupportedProgramError
 from extended_einsum.tree import Projection, TreeCircuit, balanced_tree, compile_training
+from tests.torch_tree_reference import reference_training
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -17,13 +19,8 @@ def test_cpu_training_modes(trainer, mode):
     x = torch.randint(7, (17, 7))
     ref = m.loss(x)
     torch.testing.assert_close(m.loss(x, stability=mode), ref)
-    runner = compile_training(m, 17, trainer=trainer, stability=mode)
-    assert runner.selection.backend == "torch"
-    runner.step(x)
-    assert torch.isfinite(m.loss(x))
-    if trainer != "adam":
-        for p in m.parameters():
-            torch.testing.assert_close(p.exp().sum(1 if p is m.categorical else -1), torch.ones_like(p.sum(1 if p is m.categorical else -1)))
+    with pytest.raises(UnsupportedProgramError):
+        compile_training(m, 17, trainer=trainer, stability=mode)
 
 
 def test_topology_rejects_sharing_and_unused_parameters():
@@ -44,7 +41,7 @@ def test_custom_loss_backward_updates_and_routing(trainer, units, batch):
     ref.variable_ids.copy_(torch.tensor([8, 3, 1, 0, 5, 6, 2], device="cuda"))
     custom.variable_ids.copy_(ref.variable_ids)
     x = torch.randint(7, (batch, 9), device="cuda", generator=torch.Generator(device="cuda").manual_seed(941))
-    a = compile_training(ref, batch, trainer=trainer, backend="torch")
+    a = reference_training(ref, batch, trainer=trainer)
     b = compile_training(custom, batch, trainer=trainer, backend="triton", precision="tf32x3")
     la, lb = a.loss(x), b.loss(x)
     torch.testing.assert_close(lb, la, atol=3e-5, rtol=1e-6)
@@ -92,7 +89,7 @@ def test_cuda_graph_updates_and_checkpoint(trainer):
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     reference = copy.deepcopy(model)
-    ref = compile_training(reference, 32, trainer=trainer, backend="torch")
+    ref = reference_training(reference, 32, trainer=trainer)
     ref.load_state_dict(copy.deepcopy(runner.state_dict()))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

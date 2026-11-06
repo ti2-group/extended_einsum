@@ -20,6 +20,7 @@ from cirkit.backend.torch.parameters.nodes import TorchTensorParameter
 from cirkit.backend.torch.parameters.parameter import TorchParameter
 from cirkit.backend.torch.semiring import ComplexLSESumSemiring, LSESumSemiring, SumProductSemiring
 
+from extended_einsum.compiled import UnsupportedProgramError
 from extended_einsum.inputs import compile_input
 
 
@@ -81,14 +82,12 @@ KINDS = [
 
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("log", [False, True])
-def test_torch_input_adapter(kind, log):
+def test_cpu_input_is_rejected(kind, log):
     layer = make_layer(kind, log=log)
     data = torch.ones(17, 5)
     program = compile_input(layer)
-    actual = program(data)
-    torch.testing.assert_close(actual, program.reference(data))
-    if kind in ("constant", "evidence_gaussian", "evidence_categorical_logits"):
-        assert actual.stride(1) == 0
+    with pytest.raises(UnsupportedProgramError):
+        program(data)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -103,7 +102,7 @@ def test_custom_forward_and_backward(kind, log, layout):
     data.requires_grad_(not discrete)
     other = data.detach().clone().requires_grad_(not discrete)
     program = compile_input(layer, backend="triton", output_layout=layout)
-    expected = compile_input(reference, backend="torch")(other)
+    expected = compile_input(reference).reference(other)
     actual = program(data)
     torch.testing.assert_close(actual, expected, atol=3e-5, rtol=2e-5)
     upstream = torch.linspace(-0.7, 1.3, actual.numel(), device="cuda").reshape(actual.shape)
@@ -129,15 +128,15 @@ def test_lookup_packed_layout_and_dynamic_parameters():
     assert torch.isfinite(next(layer.parameters()).grad).all()
 
 
-def test_complex_input_preserves_cirkit():
+def test_complex_input_is_rejected():
     layer = make_layer("embedding", log=False)
     layer.semiring = ComplexLSESumSemiring
     with torch.no_grad():
         next(layer.parameters()).neg_()
     runner = compile_input(layer)
     x = torch.ones(17, 5)
-    torch.testing.assert_close(runner(x), runner.reference(x))
-    assert runner.selection.backend == "torch"
+    with pytest.raises(UnsupportedProgramError):
+        runner(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

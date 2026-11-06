@@ -8,8 +8,11 @@ from extended_einsum.backend_translation.backend import BackendCompiler, Backend
 from extended_einsum.backend_translation.runtime import DefaultCompiler
 from extended_einsum.backends.numpy import NumpyBackendFunctions, NumpyCompiler
 from extended_einsum.backends.torch import TorchBackendFunctions, TorchCompiler
+from extended_einsum.backends.triton import TritonBackend
+from extended_einsum.compiled import CompiledBackend
 from extended_einsum.language.types import Backend
 
+BACKEND_TO_COMPILED: dict[Backend, CompiledBackend] = {}
 BACKEND_TO_FUNCTIONS: dict[Backend, BackendFunctions] = {}
 BACKEND_TO_COMPILER: dict[Backend, BackendCompiler] = {}
 BACKEND_TO_IS_ARRAY: dict[Backend, Callable[[object], bool]] = {}
@@ -59,13 +62,36 @@ def register_backend(
     elif not callable(getattr(compiler, "compile", None)):
         raise TypeError(f"The compiler for backend {name!r} must provide a callable compile method.")
 
+    BACKEND_TO_COMPILED.pop(name, None)
     BACKEND_TO_FUNCTIONS[name] = functions
     BACKEND_TO_COMPILER[name] = compiler
     if is_array is not None:
         BACKEND_TO_IS_ARRAY[name] = is_array
 
 
+def register_compiled_backend(name: Backend, backend: CompiledBackend) -> None:
+    """Register a compiler consuming RichProgram, with no eager operations.
+
+    Registration does not install array detection: Torch tensors continue to
+    select Torch unless the caller explicitly chooses this backend.
+    """
+    if not name:
+        raise ValueError("The backend name must be a non-empty string.")
+    if not callable(getattr(backend, "compile", None)):
+        raise TypeError("A compiled backend must provide a callable compile method.")
+    BACKEND_TO_FUNCTIONS.pop(name, None)
+    BACKEND_TO_COMPILER.pop(name, None)
+    BACKEND_TO_IS_ARRAY.pop(name, None)
+    BACKEND_TO_COMPILED[name] = backend
+
+
+def get_compiled_backend(backend: Backend) -> CompiledBackend | None:
+    return BACKEND_TO_COMPILED.get(backend)
+
+
 def get_backend_functions(backend: Backend) -> BackendFunctions:
+    if backend in BACKEND_TO_COMPILED:
+        raise TypeError(f"Backend {backend!r} is compiled-only; use compile_program or TensorExpression.materialize.")
     try:
         return BACKEND_TO_FUNCTIONS[backend]
     except KeyError:
@@ -73,6 +99,8 @@ def get_backend_functions(backend: Backend) -> BackendFunctions:
 
 
 def get_backend_compiler(backend: Backend) -> BackendCompiler:
+    if backend in BACKEND_TO_COMPILED:
+        raise TypeError(f"Backend {backend!r} compiles RichProgram directly; use compile_program.")
     try:
         return BACKEND_TO_COMPILER[backend]
     except KeyError:
@@ -90,7 +118,8 @@ def get_backend_of_array(array: BackendArray) -> Backend:
 def _unknown_backend_error(backend: Backend) -> Exception:
     if backend == "jax":
         return ModuleNotFoundError("The JAX backend is optional. Install it with `pip install 'extended-einsum[jax]'`.")
-    return ValueError(f"No backend is registered under the name {backend!r}. Registered backends: {sorted(BACKEND_TO_FUNCTIONS)}. Register custom backends with register_backend.")
+    names = sorted(BACKEND_TO_FUNCTIONS.keys() | BACKEND_TO_COMPILED.keys())
+    return ValueError(f"No backend is registered under the name {backend!r}. Registered backends: {names}. Register custom backends with register_backend.")
 
 
 def _is_numpy_array(array: object) -> bool:
@@ -118,3 +147,7 @@ else:
         return isinstance(array, jax.Array)
 
     register_backend("jax", JaxBackendFunctions(), JaxCompiler(), is_array=_is_jax_array)
+
+
+# The adapter imports no Triton runtime until compilation is requested.
+register_compiled_backend("triton", TritonBackend())

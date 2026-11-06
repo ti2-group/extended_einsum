@@ -10,7 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
-from extended_einsum.cuda import MODES, Selection
+from extended_einsum.backends.triton import MODES, Selection
+from extended_einsum.compiled import UnsupportedProgramError
 
 
 @dataclass(frozen=True)
@@ -221,58 +222,14 @@ def balanced_tree(*, pixels, units, categories=256, device="cpu", parameterizati
     return TreeCircuit(cat, weights, projections, parameterization=parameterization)
 
 
-class TorchAnemone:
-    def __init__(self, model, batch_size, *, alpha=0.4, momentum=0.9, stability="logspace_max"):
-        self.model, self.b, self.alpha, self.momentum, self.stability = model, batch_size, alpha, momentum, stability
-        self.running = tuple(torch.zeros_like(p) for p in model.parameters())
-        self.step_count = torch.zeros((), dtype=torch.int32, device=model.device)
-        self.selection = Selection("torch", "Torch reference/fallback for this stability, device, or topology", {})
-
-    def loss(self, images):
-        self.model.check_images(images, self.b)
-        return self.model.loss(images, stability=self.stability)
-
-    def step(self, images):
-        params = tuple(self.model.parameters())
-        loss = self.loss(images)
-        data = torch.autograd.grad(loss, params)
-        model = torch.autograd.grad(self.model.partition(stability=self.stability), params)
-        self._apply_update(params, data, model)
-        return loss.detach()
-
-    def _apply_update(self, params, data, model):
-        with torch.no_grad():
-            self.step_count.add_(1)
-            bias = 1 - self.momentum**self.step_count
-            for p, g, m, r in zip(params, data, model, self.running, strict=True):
-                r.mul_(self.momentum).add_(g, alpha=-(1 - self.momentum))
-                numerator = ((1 - self.alpha) * m + self.alpha * r / bias).clamp_min(torch.finfo(p.dtype).tiny)
-                axis = 1 if p is self.model.categorical else -1
-                log = numerator.log()
-                p.copy_(log - log.logsumexp(axis, keepdim=True))
-
-    def state_dict(self):
-        return dict(steps=self.step_count.detach().clone(), momentum_flows=[x.detach().clone() for x in self.running])
-
-    @torch.no_grad()
-    def load_state_dict(self, state):
-        if len(state["momentum_flows"]) != len(self.running) or any(x.shape != y.shape for x, y in zip(self.running, state["momentum_flows"], strict=True)):
-            raise ValueError("Momentum parameter metadata differs")
-        self.step_count.copy_(state["steps"])
-        for x, y in zip(self.running, state["momentum_flows"], strict=True):
-            x.copy_(y)
-
-
 class AdamTrainer:
-    def __init__(self, model, batch_size, *, runner=None, stability="logspace_max", lr=0.01):
+    def __init__(self, model, batch_size, *, runner, stability="logspace_max", lr=0.01):
         self.model, self.b, self.runner, self.stability = model, batch_size, runner, stability
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=model.device.type == "cuda", capturable=model.device.type == "cuda")
-        self.selection = runner.selection if runner else Selection("torch", "Torch softmax Adam fallback", {})
+        self.selection = runner.selection
 
     def loss(self, images):
         self.model.check_images(images, self.b)
-        if self.runner is None:
-            return self.model.loss(images, stability=self.stability)
         # Normalization and its Jacobian use Torch's optimized log_softmax.
         # Custom circuit backward returns log-probability gradients; autograd
         # applies the exact log_softmax chain rule to the original logits.
@@ -284,8 +241,7 @@ class AdamTrainer:
         loss = self.loss(images)
         loss.backward()
         self.optimizer.step()
-        if self.runner is not None:
-            self.runner.parameters = tuple(p.detach() for p in self.runner.parameters)
+        self.runner.parameters = tuple(p.detach() for p in self.runner.parameters)
         return loss.detach()
 
     def state_dict(self):
@@ -295,37 +251,31 @@ class AdamTrainer:
         self.optimizer.load_state_dict(state)
 
 
-def compile_training(model, batch_size, *, trainer="anemone", stability="logspace_max", backend="auto", precision="tf32x3", alpha=0.4, momentum=0.9, lr=0.01):
-    """Choose custom circuit forward/backward or a differentiable Torch fallback.
+def compile_training(model, batch_size, *, trainer="anemone", stability="logspace_max", backend="triton", precision="tf32x3", alpha=0.4, momentum=0.9, lr=0.01):
+    """Compile custom tree forward/backward; unsupported setups are rejected.
 
     EM is Anemone with alpha=1 and momentum=0. Normalized log weights must
     already be normalized by the caller; they are never softmaxed per step.
-    Scaled training retains scaled arithmetic through the Torch fallback.
+    Scaled training is not yet supported by the Triton kernels.
     """
-    if trainer not in ("adam", "em", "anemone") or backend not in ("auto", "torch", "triton") or stability not in MODES or precision not in ("tf32", "tf32x3", "ieee"):
-        raise ValueError("Unsupported training setup")
+    if trainer not in ("adam", "em", "anemone") or backend != "triton" or stability not in MODES or precision not in ("tf32", "tf32x3", "ieee"):
+        raise UnsupportedProgramError("Unsupported Triton training setup")
     if batch_size < 1 or not 0 <= alpha <= 1 or not 0 <= momentum < 1:
         raise ValueError("Invalid batch size or Anemone coefficients")
     if (trainer == "adam") != (model.parameterization == "logits"):
         raise ValueError("Adam requires logits; EM/Anemone require normalized_log parameters")
+    if model.device.type != "cuda" or stability != "logspace_max":
+        raise UnsupportedProgramError("Triton training requires CUDA and logspace_max; scaled training is not supported")
+    if torch.cuda.get_device_capability(model.device)[0] < 8:
+        raise UnsupportedProgramError("Triton training requires SM80 or newer")
     if trainer == "em":
         alpha, momentum = 1.0, 0.0
-    custom = model.device.type == "cuda" and stability == "logspace_max"
-    if backend == "triton" and not custom:
-        raise ValueError("Custom training requires CUDA and logspace_max; scaled training uses Torch")
-    selected = backend == "triton"
-    if backend == "auto" and custom:
-        from importlib.util import find_spec
+    from extended_einsum.backends.triton_training import TritonAnemone
 
-        selected = bool(find_spec("triton")) and torch.cuda.get_device_capability(model.device) == (8, 6) and model.units in (32, 256) and batch_size in (128, 256) and precision == "tf32"
-    runner = None
-    if selected:
-        from extended_einsum.backends.triton_training import TritonAnemone
-
-        options = dict(block_size=32, num_warps=8, pipeline_stages=2, weight_rows=32, categorical_stages=1, cache_inputs=True)
-        options.update(dict(child_units=128, weight_warps=16, categorical_units=64) if model.units >= 128 else dict(child_units=32))
-        runner = TritonAnemone(model, batch_size, precision=precision, alpha=alpha, momentum=momentum, **options)
-        runner.selection = Selection("triton", "Custom tree forward/backward; fused normalized updates or Torch softmax + fused Adam", options)
+    options = dict(block_size=32, num_warps=8, pipeline_stages=2, weight_rows=32, categorical_stages=1, cache_inputs=True)
+    options.update(dict(child_units=128, weight_warps=16, categorical_units=64) if model.units >= 128 else dict(child_units=32))
+    runner = TritonAnemone(model, batch_size, precision=precision, alpha=alpha, momentum=momentum, **options)
+    runner.selection = Selection("triton", "Custom tree forward/backward; normalized updates or explicit Torch softmax + Adam", options)
     if trainer == "adam":
         return AdamTrainer(model, batch_size, runner=runner, stability=stability, lr=lr)
-    return runner if runner else TorchAnemone(model, batch_size, alpha=alpha, momentum=momentum, stability=stability)
+    return runner

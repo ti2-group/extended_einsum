@@ -4,43 +4,86 @@ Install `extended-einsum[cuda]` for Triton. Importing the base package or the
 public CUDA APIs does not import Triton. CPU installations still work.
 These APIs are experimental and explicitly opt in to custom execution.
 
+## Compiled-only backend
+
+`register_compiled_backend(name, compiler)` registers a compiler that receives
+`RichProgram` and example inputs directly, before lowering into eager array
+operations. Its `compile(program, inputs, **options)` returns a callable taking
+an input sequence. A compiled backend does not implement `BackendFunctions`.
+Example inputs specialize shapes, dtypes, devices and storage layouts; their
+values remain dynamic unless explicitly declared constant.
+
+Use `compile_program(program, inputs, backend="triton", precision="tf32", ...)`
+with an extracted or preprocessed program. This is the same `RichProgram` used
+by the Cirkit demo. Supported patterns compile into fused kernels; other
+programs raise `UnsupportedProgramError`. There is no graph partitioning,
+Torch fallback, or eager Triton execution. Existing Torch/JAX/NumPy backends
+retain their primitive lowering and compiler interfaces.
+
+Expressions whose arrays use `backend="triton"` also compile this way through
+`expression.materialize(stability_mode=..., precision="tf32", ...)`. Torch
+tensors still detect as the Torch backend by default; Triton must be selected
+explicitly. Registration and imports do not load the optional Triton runtime.
+
 ## Tree inference
+
+The initial compiler recognizes complete binary trees with a leaf projection,
+equal unit counts, even/odd sibling routing, and a final root selection and log.
+It accepts either positive dense inputs, `exp(dense_log_inputs)`, or
+`exp(CategoricalInput(...))`. Other folded graphs are rejected. The compiler
+matches existing IR; it does not construct a replacement tree program.
 
 ```python
 import torch
-from extended_einsum.cuda import CategoricalInput, compile_circuit
+import extended_einsum as xe
+from extended_einsum.interface.tensor_expression import Parameter
 
-# pixels[B,V] integers; log_tables[banks,categories,U] FP32.
-# Routes map each leaf to a pixel and a categorical parameter bank.
-evidence = CategoricalInput(pixels, log_tables, variable_ids, table_ids)
-# One contiguous [F >> level, output_unit, input_unit] tensor per level,
-# including the leaf projection. F is a power of two, root output width is U.
-runner = compile_circuit(evidence, weights, stability="scaled_max",
-                         precision="tf32", backend="auto")
-print(runner.selection)  # backend, reason and launch options
+# Two folded leaves, batch B, units U. W_leaf[2,U,U], W_root[1,U,U].
+x = xe.array(log_inputs, backend="triton")  # log_inputs[2,B,U]
+w0 = Parameter(xe.array(W_leaf, backend="triton"))
+w1 = Parameter(xe.array(W_root, backend="triton"))
+left_ids = torch.tensor([0], device=log_inputs.device)
+right_ids = torch.tensor([1], device=log_inputs.device)
+leaf = xe.einsum("fbi,foi->fbo", xe.exp(x), w0)
+left = xe.take(leaf, xe.array(left_ids, backend="triton"))
+right = xe.take(leaf, xe.array(right_ids, backend="triton"))
+root = xe.einsum("fbi,fbi,foi->fbo", left, right, w1)
+expression = xe.log(xe.select(root, 0))
+program, wrapped_inputs = xe.extract_program(expression, stability_mode="scaled_max")
+inputs = [value.backend_array for value in wrapped_inputs]
+constant_ids = [i for i, value in enumerate(inputs)
+                if value is left_ids or value is right_ids]
 with torch.no_grad():
-    log_scores = runner(evidence, weights)
+    runner = xe.compile_program(program, inputs, backend="triton",
+                                precision="tf32", constant_inputs=constant_ids)
+    log_scores = runner(inputs)
+print(runner.selection)
 ```
+
+Sibling routing inputs must be explicitly listed in `constant_inputs`. Their
+values are checked at compilation, then their identity and version are guarded
+on each call. Recompile after changing them. Construct these tensors outside
+`torch.inference_mode()` so they have version counters. Capture CUDA graphs
+only after compilation/warmup; changing compiled constants requires recapture.
+
+`CategoricalInput` lives in `extended_einsum.inputs`. Its pixel, variable-route,
+category-bank, table and weight contents remain dynamic. Every inference call
+includes raw categorical selection. Dense inputs must be contiguous; adapter
+outputs may require `.contiguous()` before compilation. No normalized or packed
+weight cache is retained. Tables are log probabilities, weights are nonnegative
+linear probabilities (positive for scaled_min). Normalization is the caller's
+responsibility.
 
 `logspace_max`, `logspace_min`, `scaled_max`, `scaled_sum`, and `scaled_min`
 remain separate algorithms. Scaled modes retain values and row log scales;
-logspace modes retain log values. Every call includes raw categorical selection.
-Pixel, variable-route, category-bank, table and weight contents may change between calls.
-There is no implicit cache of normalized or packed weights. Tables are log
-probabilities, weights are nonnegative probabilities (positive for scaled_min).
-Parameter normalization is the caller's responsibility.
+logspace modes retain log values. Launch settings use the measured unit-dependent
+profiles, with no timing experiment or global precision change at compilation.
 
-Auto selects a measured Triton profile on SM86 for the tested unit/batch range,
-with conservative Torch fallback elsewhere. It does not run timing experiments
-or change precision/global Torch flags. Profiles are starting points, not a
-claim of universal optimality. `backend="triton"` or `"torch"` provides an explicit override. An existing inference runner uses
-Torch when a later call requests gradients, so gradients are never dropped.
-
-Regular Triton inference currently requires explicit `precision="tf32"`.
-`tf32x3` (default) and `ieee` use Torch. Precision options govern custom
-kernels; Torch fallback respects the caller's Torch precision settings. TF32 rounds matrix operands and
-accumulates in FP32; approximate exp/log intrinsics are used. Likelihood-relative
-errors accumulate with depth. Validate precision on your own model.
+Inference currently requires real FP32 inputs on SM80+ CUDA and explicit
+`precision="tf32"`. Unsupported precision, CPU execution and autograd requests
+are rejected at compilation and on subsequent calls. Use the separate Torch
+backend when needed. TF32 rounds matrix operands and accumulates in FP32;
+approximate exp/log intrinsics are used. Likelihood errors accumulate with depth.
 
 ## Training without a dependency on a research experiment
 
@@ -61,13 +104,15 @@ parameter element has one owner; shared DAGs require accumulating flows and
 are rejected. Arbitrary pixel routing (including repeated pixels) is supported
 through `model.variable_ids`; categorical parameter banks are separate per leaf.
 
-| Setup | Parameters | Automatic path on profiled CUDA shapes |
+| Setup | Parameters | Execution |
 |---|---|---|
 | Logspace Anemone | normalized log probabilities | custom forward/backward and fused Eq. 19 update |
 | Logspace EM | normalized log probabilities | same kernels, alpha=1 and momentum=0 |
 | Logspace softmax Adam | logits | custom circuit forward/backward, Torch log_softmax/Jacobian and fused Adam |
-| Scaled training | either parameterization | differentiable Torch scaled algorithm |
-| CPU, unsupported hardware/shape or stricter auto precision | either | Torch |
+| Scaled training, CPU, unsupported hardware/configuration | either | rejected |
+
+Training requires SM80+ CUDA and `logspace_max`. Its matrix kernels support
+`tf32`, `tf32x3` (default) and `ieee`. There is no automatic backend switch.
 
 For Adam use `parameterization="logits"` and `trainer="adam"`; the original
 logits remain the optimizer parameters. The custom backward returns gradients
@@ -115,8 +160,8 @@ FP32 CUDA input evaluation fuses raw-variable selection with the distribution or
 function calculation. Custom first-order backward reduces input-parameter flows;
 continuous input gradients accumulate correctly for repeated variable routes.
 The adapter reads parameter values on every call. It bypasses only provable
-identity gathers on direct tensor parameters; changed fold routing falls back
-to Cirkit's parameter graph. Recapture CUDA graphs after changing parameter-fold
+identity gathers on direct tensor parameters; changed fold routing uses
+the original Cirkit parameter graph. Recapture CUDA graphs after changing parameter-fold
 routing or replacing parameters. Raw data, parameter values and variable-scope
 indices can change in place between replays. General parameter transforms stay owned by Cirkit.
 
@@ -129,12 +174,12 @@ operation requires it.
 The selected tiles depend on the input family and unit count. `tile`,
 `output_layout`, `table_layout`, `backward_units` and `backward_categories` offer
 explicit overrides. No parameter pack is cached; a requested packed table is
-rebuilt on every call. CPU, complex semirings and unsupported precision/shape
-setups preserve Cirkit's Torch execution. Custom kernels assume valid
-parameter domains, for example positive Gaussian standard deviations.
-Polynomial singleton batches retain the installed Cirkit implementation's
-behavior via Torch. Custom backward supports batches up to 512; larger training
-batches fall back to Torch.
+rebuilt on every call. CPU, complex semirings, polynomial singleton batches,
+unsupported compositions and unsupported precision/shape setups are rejected.
+Custom kernels assume valid parameter domains, for example positive Gaussian
+standard deviations. Custom backward supports batches up to 512; larger
+training batches are rejected. `input_fn.reference(data)` is an explicit native
+Cirkit reference for validation; execution never switches to it automatically.
 
 This adapter can supply tensors to existing extended-einsum expressions. The
 specialized `TreeCircuit` trainer above continues to model categorical leaves;

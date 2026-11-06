@@ -4,8 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable, Generic, cast, override
 
-from extended_einsum.backend_translation import BackendCompiler, BackendProgram, translate_to_backend_program
-from extended_einsum.backends.registry import get_backend_compiler, get_backend_functions
+from extended_einsum.compiled import compile_program
 from extended_einsum.language.rich_instruction import RichInstruction, map_instruction_arguments
 from extended_einsum.language.rich_operators import (
     OperatorAdd,
@@ -90,7 +89,6 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
         # these only exist once the tensor has materialized
         self._rich_program: RichProgram | None = None
         self._input_arguments: list[TArray] | None = None
-        self._backend_program: BackendProgram[TArray] | None = None
         self._backend_code: Callable[[Sequence[TArray]], TArray] | None = None
 
     @property
@@ -108,18 +106,12 @@ class TensorExpression(HasShape, HasBackend, HasFormat, Generic[TArray]):
     def format(self) -> TensorFormat:
         return self._format
 
-    def materialize(self, stability_mode: StabilityMode = "unstable") -> TArray:
+    def materialize(self, stability_mode: StabilityMode = "unstable", **compile_options) -> TArray:
         # Paper "Frontend": record the complete expression DAG as an
         # extended-einsum program before choosing any backend operations.
         self._rich_program, self._input_arguments = extract_program(self, stability_mode)
-        backend_functions = get_backend_functions(self.backend)
-        # Paper "Automatic Numerical Stability" (sec:numerical-stability):
-        # translate the backend-independent IR using the selected unstable,
-        # log-space, or scaled representation.
-        self._backend_program = translate_to_backend_program(self._rich_program, backend_functions)
-        compiler: BackendCompiler[TArray] = get_backend_compiler(self.backend)
         backend_inputs = [argument.backend_array for argument in self._input_arguments]
-        self._backend_code = compiler.compile(self._backend_program, backend_inputs)
+        self._backend_code = compile_program(self._rich_program, backend_inputs, backend=self.backend, **compile_options)
         backend_array = self._backend_code(backend_inputs)
 
         # Import locally to avoid the module cycle between the expression and

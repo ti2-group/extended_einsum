@@ -32,9 +32,9 @@ The `jax-cuda` extra follows JAX's CUDA 13 installation. PyTorch device support 
 Optional Triton tree kernels provide fused categorical lookup, stable inference,
 custom backward and EM/Anemone updates. Cirkit input adapters provide separate
 input evaluation and gradient kernels for its supported input families. Softmax Adam combines custom circuit
-kernels with Torch normalization and fused Adam. Dispatch preserves the selected
-stability mode and exposes its backend/reason; unsupported setups fall back to
-Torch. See [the API and supported configurations](docs/custom-kernels.md).
+kernels with Torch normalization and fused Adam. Triton is registered as a
+compiled-only backend consuming whole programs; unsupported setups are rejected.
+The existing Torch backend remains a separate, explicit choice. See [the API and supported configurations](docs/custom-kernels.md).
 
 ```bash
 pip install "extended-einsum[cuda]"
